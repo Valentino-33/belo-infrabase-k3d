@@ -1,0 +1,40 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: kaniko-build-push
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: image
+    description: "imagen completa destino: docker.io/user/app:tag"
+    type: string
+  - name: context
+    description: "subdirectorio del workspace donde está el Dockerfile"
+    default: "src"
+    type: string
+  workspaces:
+  - name: source
+  steps:
+  - name: build-and-push
+    image: gcr.io/kaniko-project/executor:latest
+    env:
+    - name: DOCKER_CONFIG
+      value: /kaniko/.docker
+    command:
+    - /kaniko/executor
+    args:
+    - --dockerfile=$(workspaces.source.path)/$(params.context)/Dockerfile
+    - --context=$(workspaces.source.path)/$(params.context)
+    - --destination=$(params.image)
+    - --cache=true
+    - --cache-ttl=24h
+    volumeMounts:
+    - name: docker-config
+      mountPath: /kaniko/.docker
+  volumes:
+  - name: docker-config
+    secret:
+      secretName: dockerhub-credentials
+      items:
+      - key: .dockerconfigjson
+        path: config.json

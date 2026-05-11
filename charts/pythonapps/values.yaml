@@ -1,0 +1,45 @@
+# Defaults del chart — sobreescribir con build-time/app.yaml + <env>/values.yaml
+# helm template <name> charts/pythonapps/ -f apps/<app>/build-time/app.yaml -f apps/<app>/dev/values.yaml
+
+image:
+  repository: docker.io/valentinobruno/api01
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+rollout:
+  strategy: rollingupdate  # bluegreen | canary | rollingupdate
+
+replicas: 1
+
+app:
+  name: webserver-api01
+  pathPrefix: api01
+  metricsPath: /api01/metrics
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+hpa:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+ingress:
+  enabled: true
+  hostname: ""
+  ingressClassName: nginx
+  annotations: {}
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+
+tekton:
+  dockerhubUser: valentinobruno
+  gitopsRepoUrl: https://github.com/Valentino-33/belo-infrabase-k3d

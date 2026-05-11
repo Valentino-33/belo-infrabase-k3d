@@ -1,0 +1,19 @@
+app:
+  name: webserver-api02
+  pathPrefix: api02
+  metricsPath: /api02/metrics
+
+rollout:
+  strategy: canary
+
+image:
+  repository: docker.io/valentinobruno/api02
+  pullPolicy: IfNotPresent
+
+tekton:
+  dockerhubUser: valentinobruno
+  gitopsRepoUrl: https://github.com/Valentino-33/belo-infrabase-k3d
+
+serviceMonitor:
+  enabled: true
+  interval: 30s

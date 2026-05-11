@@ -1,0 +1,13 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: github-tag-binding
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: repo-url
+    value: $(body.repository.clone_url)
+  - name: app-name
+    value: $(body.repository.name)
+  - name: image-tag
+    value: $(extensions.image_tag)

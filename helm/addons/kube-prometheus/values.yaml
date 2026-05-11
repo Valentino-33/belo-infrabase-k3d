@@ -1,0 +1,30 @@
+prometheus:
+  prometheusSpec:
+    nodeSelector:
+      role: statefulls
+    tolerations:
+    - key: workload
+      operator: Equal
+      value: statefulls
+      effect: NoSchedule
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          resources:
+            requests:
+              storage: 10Gi
+grafana:
+  nodeSelector:
+    role: stateless
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+    - grafana.localhost
+  adminPassword: "belo-challenge"
+  sidecar:
+    dashboards:
+      enabled: true
+alertmanager:
+  enabled: false

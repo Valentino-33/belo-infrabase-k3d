@@ -1,0 +1,33 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: webserver-api02-dev
+  namespace: argocd
+  labels:
+    app: webserver-api02
+    environment: dev
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Valentino-33/belo-infrabase-k3d
+    targetRevision: main
+    path: charts/pythonapps
+    helm:
+      valueFiles:
+      - apps/webserver-api02/build-time/app.yaml
+      - apps/webserver-api02/dev/values-webserver-api02-dev.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    - RespectIgnoreDifferences=true
+  ignoreDifferences:
+  - group: argoproj.io
+    kind: Rollout
+    jsonPointers:
+    - /spec/replicas

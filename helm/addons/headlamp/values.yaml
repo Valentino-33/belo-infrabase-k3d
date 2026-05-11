@@ -1,0 +1,13 @@
+replicaCount: 1
+nodeSelector:
+  role: stateless
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  hosts:
+  - host: headlamp.localhost
+    paths:
+    - path: /
+      type: Prefix
+config:
+  pluginsDir: /headlamp/plugins

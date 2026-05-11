@@ -1,0 +1,24 @@
+replicas: 1
+minimumMasterNodes: 1
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "1000m"
+    memory: "1.5Gi"
+volumeClaimTemplate:
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+nodeSelector:
+  role: statefulls
+tolerations:
+- key: workload
+  operator: Equal
+  value: statefulls
+  effect: NoSchedule
+podAnnotations:
+  co.elastic.logs/enabled: "false"
+esJavaOpts: "-Xmx512m -Xms512m"

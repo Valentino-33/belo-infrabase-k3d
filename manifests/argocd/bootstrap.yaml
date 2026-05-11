@@ -1,0 +1,27 @@
+# Application raíz — spawnea gitops-core-dev desde gitops/
+# Aplicar con: make bootstrap (requiere ArgoCD instalado)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: apps-of-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Valentino-33/belo-infrabase-k3d
+    targetRevision: main
+    path: gitops
+    directory:
+      recurse: false
+      include: "*.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

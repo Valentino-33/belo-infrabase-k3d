@@ -1,0 +1,95 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: pythonapps-pipeline
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: repo-url
+    type: string
+  - name: revision
+    type: string
+    default: main
+  - name: app-name
+    type: string
+  - name: image-tag
+    type: string
+  - name: image-full
+    type: string
+    description: "imagen completa: docker.io/user/app:tag"
+  - name: environment
+    type: string
+    default: dev
+  - name: strategy
+    type: string
+    default: rollingupdate
+  - name: gitops-repo-url
+    type: string
+  - name: base-url
+    type: string
+    default: ""
+  - name: preview-url
+    type: string
+    default: ""
+  workspaces:
+  - name: source
+  - name: gitops
+  tasks:
+  - name: clone
+    taskRef:
+      name: git-clone-app
+    workspaces:
+    - name: output
+      workspace: source
+    params:
+    - name: url
+      value: $(params.repo-url)
+    - name: revision
+      value: $(params.revision)
+
+  - name: build-push
+    taskRef:
+      name: kaniko-build-push
+    runAfter: [clone]
+    workspaces:
+    - name: source
+      workspace: source
+    params:
+    - name: image
+      value: $(params.image-full)
+    - name: context
+      value: src
+
+  - name: load-test
+    taskRef:
+      name: run-load-test
+    runAfter: [build-push]
+    workspaces:
+    - name: source
+      workspace: source
+    params:
+    - name: app-name
+      value: $(params.app-name)
+    - name: strategy
+      value: $(params.strategy)
+    - name: preview-url
+      value: $(params.preview-url)
+    - name: base-url
+      value: $(params.base-url)
+
+  - name: bump-gitops
+    taskRef:
+      name: bump-gitops-image
+    runAfter: [load-test]
+    workspaces:
+    - name: gitops
+      workspace: gitops
+    params:
+    - name: gitops-repo-url
+      value: $(params.gitops-repo-url)
+    - name: app-name
+      value: $(params.app-name)
+    - name: environment
+      value: $(params.environment)
+    - name: image-tag
+      value: $(params.image-tag)

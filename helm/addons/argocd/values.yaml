@@ -1,0 +1,13 @@
+global:
+  nodeSelector:
+    role: stateless
+configs:
+  params:
+    server.insecure: "true"
+server:
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hostname: argocd.localhost
+    annotations:
+      nginx.ingress.kubernetes.io/backend-protocol: "HTTP"

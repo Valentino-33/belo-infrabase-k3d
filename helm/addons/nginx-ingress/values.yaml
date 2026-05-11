@@ -1,0 +1,9 @@
+# k3d: NodePort en lugar de LoadBalancer — el puerto 8888 está mapeado en k3d/config.yaml
+controller:
+  service:
+    type: NodePort
+    nodePorts:
+      http: 30080
+      https: 30443
+  metrics:
+    enabled: true

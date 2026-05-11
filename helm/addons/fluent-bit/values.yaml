@@ -1,0 +1,21 @@
+config:
+  outputs: |
+    [OUTPUT]
+        Name  es
+        Match *
+        Host  elasticsearch-master.logging.svc.cluster.local
+        Port  9200
+        Logstash_Format On
+        Logstash_Prefix k8s
+        Replace_Dots On
+        Retry_Limit False
+  filters: |
+    [FILTER]
+        Name kubernetes
+        Match kube.*
+        Merge_Log On
+        Keep_Log Off
+        K8S-Logging.Parser On
+        K8S-Logging.Exclude On
+nodeSelector:
+  role: stateless

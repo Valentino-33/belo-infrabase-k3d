@@ -1,0 +1,53 @@
+# Corre scripts k6 según la strategy. Si no existen los scripts, genera WARN y continúa.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: run-load-test
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: app-name
+    type: string
+  - name: strategy
+    type: string
+    default: rollingupdate
+  - name: preview-url
+    default: ""
+    type: string
+  - name: base-url
+    default: ""
+    type: string
+  workspaces:
+  - name: source
+  steps:
+  - name: run-k6
+    image: grafana/k6:latest
+    script: |
+      #!/bin/sh
+      APP="$(params.app-name)"
+      STRATEGY="$(params.strategy)"
+      echo "=== Load test: $APP (strategy: $STRATEGY) ==="
+
+      case "$STRATEGY" in
+        BlueGreen|bluegreen)
+          SCRIPT="load-bluegreen.js"
+          EXTRA="-e PREVIEW_URL=$(params.preview-url)"
+          ;;
+        Canary|canary)
+          SCRIPT="load-canary.js"
+          EXTRA="-e BASE_URL=$(params.base-url)"
+          ;;
+        *)
+          SCRIPT="smoke.js"
+          EXTRA="-e BASE_URL=$(params.base-url)"
+          ;;
+      esac
+
+      SCRIPT_PATH="$(workspaces.source.path)/src/loadtest/$SCRIPT"
+      if [ ! -f "$SCRIPT_PATH" ]; then
+        echo "WARN: $SCRIPT_PATH no existe — saltando load test (el pipeline continúa)"
+        exit 0
+      fi
+
+      k6 run $EXTRA "$SCRIPT_PATH"
+      echo "=== Load test OK ==="

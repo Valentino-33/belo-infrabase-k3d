@@ -1,0 +1,61 @@
+# Actualiza el tag de imagen en el values del ambiente y hace commit + push.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: bump-gitops-image
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: gitops-repo-url
+    type: string
+  - name: app-name
+    type: string
+  - name: environment
+    type: string
+  - name: image-tag
+    type: string
+  - name: git-user-name
+    default: "tekton-bot"
+    type: string
+  - name: git-user-email
+    default: "tekton@belo-challenge.dev"
+    type: string
+  workspaces:
+  - name: gitops
+  steps:
+  - name: clone-gitops
+    image: alpine/git:latest
+    script: |
+      #!/bin/sh
+      set -e
+      git clone "$(params.gitops-repo-url)" "$(workspaces.gitops.path)/gitops"
+      echo "Gitops clonado"
+
+  - name: bump-tag
+    image: mikefarah/yq:latest
+    script: |
+      #!/bin/sh
+      set -e
+      VALUES_FILE="$(workspaces.gitops.path)/gitops/charts/pythonapps/apps/$(params.app-name)/$(params.environment)/values-$(params.app-name)-$(params.environment).yaml"
+      if [ ! -f "$VALUES_FILE" ]; then
+        echo "WARN: $VALUES_FILE no encontrado, skipping bump"
+        exit 0
+      fi
+      yq e ".image.tag = \"$(params.image-tag)\"" -i "$VALUES_FILE"
+      echo "Tag actualizado: $VALUES_FILE → $(params.image-tag)"
+
+  - name: commit-and-push
+    image: alpine/git:latest
+    script: |
+      #!/bin/sh
+      set -e
+      cd "$(workspaces.gitops.path)/gitops"
+      git config user.name "$(params.git-user-name)"
+      git config user.email "$(params.git-user-email)"
+      git add .
+      if git diff --staged --quiet; then
+        echo "Sin cambios que commitear"
+        exit 0
+      fi
+      git commit -m "bump $(params.app-name) a $(params.image-tag) en $(params.environment)"
+      git push origin main

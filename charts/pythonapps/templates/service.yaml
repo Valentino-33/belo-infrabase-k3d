@@ -1,0 +1,50 @@
+{{- $fullname := include "pythonapps.fullname" . -}}
+{{- if or (eq .Values.rollout.strategy "bluegreen") (eq .Values.rollout.strategy "canary") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-stable
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "pythonapps.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-preview
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "pythonapps.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+{{- else }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "pythonapps.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+{{- end }}

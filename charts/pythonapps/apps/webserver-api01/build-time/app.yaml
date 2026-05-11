@@ -1,0 +1,19 @@
+app:
+  name: webserver-api01
+  pathPrefix: api01
+  metricsPath: /api01/metrics
+
+rollout:
+  strategy: bluegreen
+
+image:
+  repository: docker.io/valentinobruno/api01
+  pullPolicy: IfNotPresent
+
+tekton:
+  dockerhubUser: valentinobruno
+  gitopsRepoUrl: https://github.com/Valentino-33/belo-infrabase-k3d
+
+serviceMonitor:
+  enabled: true
+  interval: 30s

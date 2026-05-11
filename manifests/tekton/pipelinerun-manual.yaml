@@ -1,0 +1,57 @@
+# PipelineRun manual para demo sin webhook de GitHub.
+# Usar: make pipeline-run APP=webserver-api01 TAG=v0.1.0
+# O con envsubst: APP=webserver-api01 TAG=v0.1.0 DOCKERHUB_USER=user envsubst < pipelinerun-manual.yaml | kubectl apply -f -
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: ${APP}-manual-run-
+  namespace: tekton-pipelines
+spec:
+  pipelineRef:
+    name: pythonapps-pipeline
+  podTemplate:
+    tolerations:
+    - key: workload
+      value: cicd
+      operator: Equal
+      effect: NoSchedule
+    nodeSelector:
+      role: cicd
+  params:
+  - name: repo-url
+    value: https://github.com/Valentino-33/belo-infrabase-k3d
+  - name: revision
+    value: main
+  - name: app-name
+    value: ${APP}
+  - name: image-tag
+    value: ${TAG}
+  - name: image-full
+    value: docker.io/${DOCKERHUB_USER}/${APP}:${TAG}
+  - name: environment
+    value: dev
+  - name: strategy
+    value: bluegreen
+  - name: gitops-repo-url
+    value: https://github.com/Valentino-33/belo-infrabase-k3d
+  - name: base-url
+    value: "http://${APP}-stable.dev.svc.cluster.local:8000"
+  - name: preview-url
+    value: "http://${APP}-preview.dev.svc.cluster.local:8000"
+  workspaces:
+  - name: source
+    volumeClaimTemplate:
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 2Gi
+  - name: gitops
+    volumeClaimTemplate:
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi

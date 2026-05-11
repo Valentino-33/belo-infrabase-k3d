@@ -1,0 +1,17 @@
+elasticsearchHosts: "http://elasticsearch-master.logging.svc.cluster.local:9200"
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+nodeSelector:
+  role: stateless
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  hosts:
+  - host: kibana.localhost
+    paths:
+    - path: /

@@ -1,0 +1,74 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "pythonapps.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "pythonapps.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pythonapps.selectorLabels" . | nindent 8 }}
+    spec:
+      nodeSelector:
+        role: stateless
+      containers:
+      - name: {{ .Release.Name }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        env:
+        - name: APP_VERSION
+          value: "{{ .Values.image.tag }}"
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
+  {{- if eq .Values.rollout.strategy "bluegreen" }}
+  strategy:
+    blueGreen:
+      activeService: {{ include "pythonapps.fullname" . }}-stable
+      previewService: {{ include "pythonapps.fullname" . }}-preview
+      autoPromotionEnabled: false
+      scaleDownDelaySeconds: 30
+  {{- else if eq .Values.rollout.strategy "canary" }}
+  strategy:
+    canary:
+      stableService: {{ include "pythonapps.fullname" . }}-stable
+      canaryService: {{ include "pythonapps.fullname" . }}-preview
+      trafficRouting:
+        nginx:
+          stableIngress: {{ include "pythonapps.fullname" . }}-stable
+      steps:
+      - setWeight: 5
+      - pause: {}
+      - setWeight: 25
+      - pause: {}
+      - setWeight: 50
+      - pause: {}
+  {{- else }}
+  strategy:
+    canary:
+      steps:
+      - setWeight: 100
+  {{- end }}

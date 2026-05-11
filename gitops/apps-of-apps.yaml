@@ -1,0 +1,24 @@
+# Root Applications — generan las apps por ambiente desde gitops-core-*/
+# Aplicar con: make bootstrap (o directamente: kubectl apply -f gitops/apps-of-apps.yaml -n argocd)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitops-core-dev
+  namespace: argocd
+  labels:
+    environment: dev
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Valentino-33/belo-infrabase-k3d
+    targetRevision: main
+    path: gitops/gitops-core-dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
