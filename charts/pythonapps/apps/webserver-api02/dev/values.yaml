@@ -1,23 +1,18 @@
 app:
   name: "webserver-api02"
   namespace: "webserver-api02-dev"
-
 image:
   repository: docker.io/valentinobruno/webserver-api02
-  tag: "v0.1.0"
+  tag: "v0.2.0"
   pullPolicy: IfNotPresent
-
 rollout:
   strategy: canary
-
 # replicas: 3 — necesario para que el load test ramp hasta 500 VUs no sature
 # antes de que HPA reaccione. En canary los pods se distribuyen entre stable
 # y canary RSes según setWeight.
 replicas: 3
-
 ports:
   containerPort: 8000
-
 resources:
   requests:
     cpu: "100m"
@@ -25,7 +20,6 @@ resources:
   limits:
     cpu: "300m"
     memory: "256Mi"
-
 # Probes apuntan a /api02/health — el código de api02 NO expone /health a la raíz.
 livenessProbe:
   httpGet:
@@ -34,7 +28,6 @@ livenessProbe:
   initialDelaySeconds: 10
   periodSeconds: 10
   failureThreshold: 3
-
 readinessProbe:
   httpGet:
     path: /api02/health
@@ -42,21 +35,18 @@ readinessProbe:
   initialDelaySeconds: 5
   periodSeconds: 5
   failureThreshold: 3
-
 hpa:
   enabled: true
   minReplicas: 3
   maxReplicas: 7
   # Target 50% — ver comentario en api01.
   targetCPUUtilizationPercentage: 50
-
 ingress:
   enabled: true
   hostname: api02.localhost
   ingressClassName: nginx
   # Sin rewrite-target — la app tiene rutas explícitas bajo /api02/*.
   annotations: {}
-
 serviceMonitor:
   enabled: true
   interval: 30s
