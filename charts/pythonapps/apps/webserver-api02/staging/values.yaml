@@ -1,59 +1,59 @@
-app:
-  name: "webserver-api02"
-  namespace: "webserver-api02-staging"
+# app:
+#   name: "webserver-api02"
+#   namespace: "webserver-api02-staging"
 
-image:
-  repository: docker.io/valentinobruno/api02
-  tag: "latest"
-  pullPolicy: IfNotPresent
+# image:
+#   repository: docker.io/valentinobruno/api02
+#   tag: "latest"
+#   pullPolicy: IfNotPresent
 
-rollout:
-  strategy: canary
+# rollout:
+#   strategy: canary
 
-replicas: 2
+# replicas: 2
 
-ports:
-  containerPort: 8000
+# ports:
+#   containerPort: 8000
 
-resources:
-  requests:
-    cpu: "150m"
-    memory: "192Mi"
-  limits:
-    cpu: "500m"
-    memory: "384Mi"
+# resources:
+#   requests:
+#     cpu: "150m"
+#     memory: "192Mi"
+#   limits:
+#     cpu: "500m"
+#     memory: "384Mi"
 
-livenessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-  initialDelaySeconds: 10
-  periodSeconds: 10
-  failureThreshold: 3
+# livenessProbe:
+#   httpGet:
+#     path: /health
+#     port: 8000
+#   initialDelaySeconds: 10
+#   periodSeconds: 10
+#   failureThreshold: 3
 
-readinessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-  initialDelaySeconds: 5
-  periodSeconds: 5
-  failureThreshold: 3
+# readinessProbe:
+#   httpGet:
+#     path: /health
+#     port: 8000
+#   initialDelaySeconds: 5
+#   periodSeconds: 5
+#   failureThreshold: 3
 
-hpa:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 5
-  targetCPUUtilizationPercentage: 65
+# hpa:
+#   enabled: true
+#   minReplicas: 2
+#   maxReplicas: 5
+#   targetCPUUtilizationPercentage: 65
 
-ingress:
-  enabled: true
-  hostname: api02.staging.localhost
-  ingressClassName: nginx
-  annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
+# ingress:
+#   enabled: true
+#   hostname: api02.staging.localhost
+#   ingressClassName: nginx
+#   annotations:
+#     nginx.ingress.kubernetes.io/rewrite-target: /
 
-serviceMonitor:
-  enabled: true
-  interval: 30s
-  pathPrefix: api02
-  metricsPath: /api02/metrics
+# serviceMonitor:
+#   enabled: true
+#   interval: 30s
+#   pathPrefix: api02
+#   metricsPath: /api02/metrics

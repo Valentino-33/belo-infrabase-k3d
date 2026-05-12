@@ -1,59 +1,59 @@
-app:
-  name: "webserver-api01"
-  namespace: "webserver-api01-staging"
+# app:
+#   name: "webserver-api01"
+#   namespace: "webserver-api01-staging"
 
-image:
-  repository: docker.io/valentinobruno/api01
-  tag: "latest"
-  pullPolicy: IfNotPresent
+# image:
+#   repository: docker.io/valentinobruno/api01
+#   tag: "latest"
+#   pullPolicy: IfNotPresent
 
-rollout:
-  strategy: bluegreen
+# rollout:
+#   strategy: bluegreen
 
-replicas: 2
+# replicas: 2
 
-ports:
-  containerPort: 8000
+# ports:
+#   containerPort: 8000
 
-resources:
-  requests:
-    cpu: "150m"
-    memory: "192Mi"
-  limits:
-    cpu: "500m"
-    memory: "384Mi"
+# resources:
+#   requests:
+#     cpu: "150m"
+#     memory: "192Mi"
+#   limits:
+#     cpu: "500m"
+#     memory: "384Mi"
 
-livenessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-  initialDelaySeconds: 10
-  periodSeconds: 10
-  failureThreshold: 3
+# livenessProbe:
+#   httpGet:
+#     path: /health
+#     port: 8000
+#   initialDelaySeconds: 10
+#   periodSeconds: 10
+#   failureThreshold: 3
 
-readinessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-  initialDelaySeconds: 5
-  periodSeconds: 5
-  failureThreshold: 3
+# readinessProbe:
+#   httpGet:
+#     path: /health
+#     port: 8000
+#   initialDelaySeconds: 5
+#   periodSeconds: 5
+#   failureThreshold: 3
 
-hpa:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 5
-  targetCPUUtilizationPercentage: 65
+# hpa:
+#   enabled: true
+#   minReplicas: 2
+#   maxReplicas: 5
+#   targetCPUUtilizationPercentage: 65
 
-ingress:
-  enabled: true
-  hostname: api01.staging.localhost
-  ingressClassName: nginx
-  annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
+# ingress:
+#   enabled: true
+#   hostname: api01.staging.localhost
+#   ingressClassName: nginx
+#   annotations:
+#     nginx.ingress.kubernetes.io/rewrite-target: /
 
-serviceMonitor:
-  enabled: true
-  interval: 30s
-  pathPrefix: api01
-  metricsPath: /api01/metrics
+# serviceMonitor:
+#   enabled: true
+#   interval: 30s
+#   pathPrefix: api01
+#   metricsPath: /api01/metrics

@@ -1,59 +1,59 @@
-app:
-  name: "webserver-api01"
-  namespace: "webserver-api01-test"
+# app:
+#   name: "webserver-api01"
+#   namespace: "webserver-api01-test"
 
-image:
-  repository: docker.io/valentinobruno/api01
-  tag: "latest"
-  pullPolicy: IfNotPresent
+# image:
+#   repository: docker.io/valentinobruno/api01
+#   tag: "latest"
+#   pullPolicy: IfNotPresent
 
-rollout:
-  strategy: bluegreen
+# rollout:
+#   strategy: bluegreen
 
-replicas: 1
+# replicas: 1
 
-ports:
-  containerPort: 8000
+# ports:
+#   containerPort: 8000
 
-resources:
-  requests:
-    cpu: "100m"
-    memory: "128Mi"
-  limits:
-    cpu: "300m"
-    memory: "256Mi"
+# resources:
+#   requests:
+#     cpu: "100m"
+#     memory: "128Mi"
+#   limits:
+#     cpu: "300m"
+#     memory: "256Mi"
 
-livenessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-  initialDelaySeconds: 10
-  periodSeconds: 10
-  failureThreshold: 3
+# livenessProbe:
+#   httpGet:
+#     path: /health
+#     port: 8000
+#   initialDelaySeconds: 10
+#   periodSeconds: 10
+#   failureThreshold: 3
 
-readinessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-  initialDelaySeconds: 5
-  periodSeconds: 5
-  failureThreshold: 3
+# readinessProbe:
+#   httpGet:
+#     path: /health
+#     port: 8000
+#   initialDelaySeconds: 5
+#   periodSeconds: 5
+#   failureThreshold: 3
 
-hpa:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 2
-  targetCPUUtilizationPercentage: 70
+# hpa:
+#   enabled: false
+#   minReplicas: 1
+#   maxReplicas: 2
+#   targetCPUUtilizationPercentage: 70
 
-ingress:
-  enabled: true
-  hostname: api01.test.localhost
-  ingressClassName: nginx
-  annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
+# ingress:
+#   enabled: true
+#   hostname: api01.test.localhost
+#   ingressClassName: nginx
+#   annotations:
+#     nginx.ingress.kubernetes.io/rewrite-target: /
 
-serviceMonitor:
-  enabled: true
-  interval: 30s
-  pathPrefix: api01
-  metricsPath: /api01/metrics
+# serviceMonitor:
+#   enabled: true
+#   interval: 30s
+#   pathPrefix: api01
+#   metricsPath: /api01/metrics
