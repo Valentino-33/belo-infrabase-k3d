@@ -145,13 +145,16 @@ spec:
           || echo "?"
       }
 
-      BASELINE=$(get_replicas)
-      [ -z "$BASELINE" ] && BASELINE=1
-      printf "%s" "$BASELINE" > "$(results.baseline-replicas.path)"
-
       HPA_TARGET=$(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.metrics[0].resource.target.averageUtilization}')
       HPA_MIN=$(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.minReplicas}')
       HPA_MAX=$(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.maxReplicas}')
+
+      # Usamos HPA_MIN como baseline (no el current count) — si un burn
+      # anterior dejó el HPA escalado, el current no representa el "estado
+      # base". minReplicas es el suelo invariante.
+      BASELINE=$HPA_MIN
+      [ -z "$BASELINE" ] && BASELINE=1
+      printf "%s" "$BASELINE" > "$(results.baseline-replicas.path)"
 
       echo "  Baseline replicas: $BASELINE"
       echo "  HPA target CPU:    ${HPA_TARGET}%"
