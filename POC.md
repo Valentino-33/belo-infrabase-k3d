@@ -1,16 +1,20 @@
-# POC — Comandos paso a paso para la demo
+# POC — Playbook completo de la demo
 
-Playbook ejecutable end-to-end. Cada sección tiene los comandos exactos, qué esperar como output, y qué hacer si algo no anda.
+Comandos paso a paso, validados end-to-end.
 
-**Pre-condición**: cluster k3d `belo-challenge` corriendo, secretos aplicados, ArgoCD bootstraped.
+## Estado validado (2026-05-12)
 
-**Estado validado al cierre de esta iteración (2026-05-12)**:
-- api01 v0.5.1 corriendo Healthy con código bajo `/api01/*`
-- api02 v0.1.0 corriendo Healthy con código bajo `/api02/*` + catálogo + echo
-- EFK ingestando logs JSON al índice `k8s-YYYY.MM.DD` (índice creado, 9.7k+ docs)
-- Index pattern `k8s-*` creado en Kibana
-- 4 dashboards en Grafana: `belo-api01`, `belo-api02`, `belo-pipeline`, `belo-dev-cluster`
-- EventListener con 2 triggers: `github-tag-release` + `github-tag-burn`
+| Componente | Estado |
+|---|---|
+| **api01 release pipeline v0.7.0** | ✅ 6 stages Succeeded (clone → build → bump → wait-argocd → load-test → promote-rollback) |
+| **api02 release pipeline v0.2.0** | ✅ 6 stages Succeeded |
+| **Burn pipeline** | ✅ HPA escaló api01 de 3 → 7 replicas durante el burn |
+| **Apps healthy** | api01 v0.7.0 (3 replicas) + api02 v0.2.0 (3 replicas) |
+| **EFK ingestando** | ~15k+ docs/día en `k8s-YYYY.MM.DD`, JSON parseado a campos top-level |
+| **Kibana** | 5 saved searches + dashboard `belo-cluster-overview` |
+| **Grafana** | 4 dashboards (api01, api02, dev-cluster, pipeline — todos con datos reales) |
+| **Tekton metrics** | Scrapeado por Prometheus (`tekton_pipelines_controller_*`) |
+| **Argo Rollouts metrics** | Scrapeado (`rollout_info`, `rollout_phase`, `rollout_reconcile_*`) |
 
 ---
 
@@ -21,27 +25,30 @@ cd C:/Users/tadeo/OneDrive/Escritorio/bellochallenge-k3d/belo-infrabase-k3d
 make pipeline-check
 ```
 
-**Esperás ver**:
+Tiene que mostrar:
 - Pipelines: `pythonapps-pipeline` + `pythonapps-burn-pipeline`
-- EventListener triggers: `github-tag-release` Y `github-tag-burn`
-- Pod del EventListener Running
+- Triggers: `github-tag-release` + `github-tag-burn`
+- EventListener pod Running
 
 Si falta algo: `make tekton-apply`.
 
-Verificar apps healthy:
 ```bash
-kubectl get rollout -A | grep -E "Healthy|Paused"
+# Apps healthy
 curl -s http://api01.localhost:8888/api01/version
-curl -s http://api02.localhost:8888/api02/version
-```
+# {"service":"webserver-api01","version":"v0.7.0","strategy":"bluegreen"}
 
-**Esperás**: `{"service":"webserver-api01","version":"v0.5.1",...}` y `{"service":"webserver-api02","version":"v0.1.0",...}`.
+curl -s http://api02.localhost:8888/api02/version
+# {"service":"webserver-api02","version":"v0.2.0",...}
+
+# HPA enabled (min:3 max:7 target:50%)
+kubectl get hpa -A | grep webserver
+```
 
 ---
 
-## 1. Demo Blue/Green — api01 (5 min)
+## 1. Demo Blue/Green — api01 (~5 min)
 
-Abrí 3 pestañas/terminales antes de empezar:
+Abrí 3 terminales/pestañas antes:
 
 ```
 Terminal A:  kubectl get rollout webserver-api01-dev -n webserver-api01-dev -o wide -w
@@ -49,117 +56,79 @@ Terminal B:  kubectl get pods -n webserver-api01-dev -w
 Browser:     http://tekton.localhost:8888/#/pipelineruns
 ```
 
-### Disparar el release
+### Disparar release
 
 ```bash
 cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api01
-git tag release/v0.6.0/dev
-git push origin release/v0.6.0/dev
+git tag release/v0.8.0/dev
+git push origin release/v0.8.0/dev
 ```
 
-> Esto dispara el webhook GitHub → EventListener trigger `github-tag-release` → crea PipelineRun `webserver-api01-pipelinerun-v0.6.0`.
-
-### Qué va a pasar (~3 min total)
+### Stages esperados (~3-4 min total)
 
 | Stage | Duración | Qué hace |
 |---|---|---|
-| 1. clone | ~10s | git clone de `webserver-api01` en la ref del tag |
-| 2. build-push | ~30s | Kaniko build + push `valentinobruno/webserver-api01:v0.6.0` |
-| 3. bump-gitops | ~10s | yq `image.tag = v0.6.0` en `apps/webserver-api01/dev/values.yaml` + git push |
-| 4. wait-argocd | ~20s | force-refresh ArgoCD + esperar sync.revision == commit-sha + Rollout phase=Paused |
-| 5. load-test | ~3 min | k6 ramp hasta 1000 VUs contra preview svc (`load-bluegreen.js`) |
-| 6. promote-rollback | ~10s | `kubectl patch status.pauseConditions=null` → switchover blue→green |
+| 1. clone | ~10s | git clone @ tag |
+| 2. build-push | ~30s | Kaniko build + push `webserver-api01:v0.8.0` |
+| 3. bump-gitops | ~10s | yq image.tag + git push al gitops repo |
+| 4. wait-argocd | ~20s | force-refresh ArgoCD + esperar sync + Rollout Paused |
+| 5. load-test | ~3min | k6 ramp hasta 500 VUs contra preview svc |
+| 6. promote-rollback | ~10s | patch status.pauseConditions=null → switchover blue→green |
 
-### Verificación en vivo
+### Verificación durante Stage 4-5
 
-Durante Stage 4-5, en Terminal A vas a ver:
-```
-Phase: Paused
-stableRS: 7df8587555 (v0.5.1 — blue)
-currentPodHash: <nuevo hash> (v0.6.0 — green)
-activeSelector: 7df8587555 (blue todavía)
-previewSelector: <nuevo hash> (green)
-```
+Terminal A va a mostrar el Rollout Paused con blue (v0.7.0 activo) y green (v0.8.0 preview):
 
-Mientras el k6 corre, en otra terminal:
 ```bash
-curl http://preview-api01.localhost:8888/api01/version    # green (v0.6.0)
-curl http://api01.localhost:8888/api01/version             # stable (v0.5.1)
+# Vivo, mientras el k6 corre:
+curl http://preview-api01.localhost:8888/api01/version   # → v0.8.0 (green RS preview)
+curl http://api01.localhost:8888/api01/version            # → v0.7.0 (blue todavía activo)
 ```
 
-Después del Stage 6, `api01.localhost` devuelve v0.6.0.
-
-### Si falla
-
-- Stage 5 da errors > 10%: la app tiene capacidad chica. Cambiá `replicas: 3` en `dev/values.yaml` y re-tagueá.
-- Stage 4 timeout: ArgoCD no syncó. `kubectl annotate app webserver-api01-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite`.
-- Stage 6 abort por outcome=failed: ver logs `tkn pipelinerun logs <run-name> -n tekton-pipelines | grep -A30 "STAGE 5"`.
+Después del Stage 6, ambos URLs devuelven v0.8.0.
 
 ---
 
-## 2. Demo Canary — api02 (5 min)
-
-```
-Terminal A:  kubectl get rollout webserver-api02-dev -n webserver-api02-dev -o wide -w
-Browser:     http://tekton.localhost:8888/#/pipelineruns
-```
-
-### Disparar el release
+## 2. Demo Canary — api02 (~5 min)
 
 ```bash
 cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api02
-git tag release/v0.2.0/dev
-git push origin release/v0.2.0/dev
+git tag release/v0.3.0/dev
+git push origin release/v0.3.0/dev
 ```
 
-### Qué va a pasar
-
-El Rollout de api02 tiene strategy=canary con 3 steps:
-- setWeight 5 → pausa
-- setWeight 25 → pausa
-- setWeight 50 → pausa
-- (Stage 6 patcha `promoteFull=true` que salta a 100%)
-
-### Mostrar el split de tráfico
-
-Mientras está paused en setWeight=5 o 25, en otra terminal:
+Durante el canary paused (setWeight 5 o 25), mostrar el split de tráfico:
 
 ```bash
-# Hacé 30 requests, contá cuántos respondió cada versión
 for i in $(seq 1 30); do curl -s http://api02.localhost:8888/api02/version | jq -r .version; done | sort | uniq -c
+# Esperás algo como:
+#   27 v0.2.0   ← stable
+#    3 v0.3.0   ← canary 10% (aprox)
 ```
 
-**Esperás** algo como:
-```
-  27 v0.1.0   ← stable
-   3 v0.2.0   ← canary (5%)
-```
-
-### Endpoint nuevo solo en api02
+Endpoints exclusivos de api02 (api01 no los tiene):
 
 ```bash
-curl http://api02.localhost:8888/api02/items | jq .total
+curl http://api02.localhost:8888/api02/items | jq
 curl http://api02.localhost:8888/api02/items/3
-curl "http://api02.localhost:8888/api02/echo?msg=hola"
+curl "http://api02.localhost:8888/api02/echo?msg=demo"
 ```
 
 ---
 
-## 3. Burn pipeline — HPA capacity test (4 min)
+## 3. Burn pipeline — HPA capacity test (~3-4 min)
 
 Pipeline **separado** del release. Demuestra que el HPA escala bajo carga.
 
-### Disparar vía tag (webhook)
-
 ```bash
 cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api01
+# Si ya pusheaste burn/dev antes, borrarlo primero:
+git tag -d burn/dev 2>/dev/null && git push --delete origin burn/dev 2>/dev/null
 git tag burn/dev
 git push origin burn/dev
 ```
 
-> Tag formato `burn/<env>` → trigger `github-tag-burn` → pipeline `pythonapps-burn-pipeline`.
-
-### O disparar manual (sin webhook)
+O sin webhook:
 
 ```bash
 make burn-test APP=webserver-api01 ENV=dev
@@ -168,163 +137,99 @@ make burn-test APP=webserver-api01 ENV=dev
 ### Observar en vivo
 
 ```bash
-# Terminal A: HPA
+# Terminal A:
 kubectl get hpa webserver-api01-dev -n webserver-api01-dev -w
 
-# Terminal B: replicas
-kubectl get rollout webserver-api01-dev -n webserver-api01-dev -w
-```
-
-**Vas a ver**:
-```
-NAME                  REFERENCE                       TARGETS    MIN  MAX  REPLICAS  AGE
-webserver-api01-dev   Rollout/webserver-api01-dev     5%/70%      2    5    2          ← baseline
-webserver-api01-dev   Rollout/webserver-api01-dev     189%/70%    2    5    2          ← burn empieza
-webserver-api01-dev   Rollout/webserver-api01-dev     245%/70%    2    5    4          ← HPA escaló
-webserver-api01-dev   Rollout/webserver-api01-dev     80%/70%     2    5    4          ← más capacidad
+# Vas a ver:
+# REPLICAS  AGE
+# 3                              ← baseline (minReplicas)
+# 3   (burn empieza, CPU sube)
+# 5   ← HPA escaló (target 50% cruzado)
+# 7   ← HPA escaló al máximo
+# (cooldown 5 min después del fin del burn)
+# 3   ← vuelve a baseline
 ```
 
 ### Ver resultado
 
 ```bash
-RUN=$(kubectl get pipelinerun -n tekton-pipelines -l pipeline=burn --sort-by='.metadata.creationTimestamp' -o jsonpath='{.items[-1].metadata.name}')
-kubectl get pipelinerun $RUN -n tekton-pipelines -o jsonpath='{range .status.results[*]}{.name}={.value}{"\n"}{end}'
-# Esperás:
-# outcome=passed
-# baseline-replicas=2
-# max-replicas=4
-```
-
-Para burn de api02:
-```bash
-cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api02
-git tag -d burn/dev 2>/dev/null && git push --delete origin burn/dev 2>/dev/null  # cleanup si ya existía
-git tag burn/dev
-git push origin burn/dev
-# O: make burn-test APP=webserver-api02 ENV=dev
+RUN=$(kubectl get pipelinerun -n tekton-pipelines -l pipeline=burn,app=webserver-api01 --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
+kubectl get pipelinerun $RUN -n tekton-pipelines -o yaml | grep -A2 "name: outcome\|name: max-replicas\|name: baseline"
+# Esperás: outcome=passed, baseline-replicas=3, max-replicas=>=4
 ```
 
 ---
 
-## 4. Observabilidad — Kibana + Grafana (5 min)
+## 4. Kibana — logs reales con saved searches preconfiguradas
 
-### Kibana — logs reales de los APIs
+http://kibana.localhost:8888
 
-URL: http://kibana.localhost:8888
+### Dashboard preferido
 
-1. **Discover** (icono brújula en la izquierda)
-2. Seleccionar data view **`k8s-*`** (ya está creado)
-3. Time range: **Last 15 minutes**
+**Analytics → Dashboard → "Belo — Cluster DEV (logs + saved searches)"**
 
-**Queries útiles** (KQL):
+Una sola vista con 5 paneles:
+1. **Logs cluster DEV** — todos los logs ordenados por @timestamp desc, columnas: `level + kubernetes.pod_name + kubernetes.namespace_name + log`
+2. **api01 requests** — solo `/api01/hello`, columnas: `status + method + path + version + pod_name`
+3. **api02 requests** — solo endpoints de negocio (no probes)
+4. **ERRORES** — `status >= 400 or level: (error or warning)`
+5. **Tekton Pipeline logs** — logs de cualquier stage de cualquier PipelineRun
+
+### Saved searches sueltas (Analytics → Discover → Open)
+
+| Nombre | Query | Columnas |
+|---|---|---|
+| `Logs cluster DEV (level + pod + log)` | (vacío) | level, pod_name, namespace, log |
+| `api01 — requests con status` | namespace=api01-dev + path=/hello | status, method, path, version, pod |
+| `api02 — requests con status` | namespace=api02-dev sin health | status, method, path, version, pod |
+| `ERRORES — solo 4xx/5xx o error/warning` | status>=400 or level=error/warning | status, level, pod, log |
+| `Tekton Pipeline logs` | namespace=tekton-pipelines | pod, container, log |
+
+### KQL queries útiles (Discover libre)
 
 ```
 kubernetes.namespace_name : "webserver-api01-dev" and path : "/api01/hello"
-```
-→ Todos los hits al endpoint de negocio de api01 durante el load test.
-
-```
-kubernetes.namespace_name : "webserver-api02-dev" and status : 200
-```
-→ Requests exitosos a api02.
-
-```
-kubernetes.labels.app_kubernetes_io/instance : "webserver-api01-dev" and (status >= 500 or level : "error")
-```
-→ Solo errores (vacío en estado normal).
-
-```
+event : "request" and status >= 400
+kubernetes.namespace_name : "tekton-pipelines" and kubernetes.pod_name : *pipelinerun-v0.7.0*
 event : "startup"
-```
-→ Cada vez que un pod arrancó, con su versión. Útil para ver qué versión está activa.
-
-> Si Kibana dice "No results found" pero hay docs, ampliá el time range a "Last 1 hour" o "Today".
-
-### Grafana — dashboards
-
-URL: http://grafana.localhost:8888 (admin / belo-challenge)
-
-**4 dashboards provisionados** (Browse → tag `belo-challenge`):
-
-| Dashboard | UID | Qué muestra |
-|---|---|---|
-| **belo — DEV cluster overview** | `belo-dev-cluster` | Vista centralizada del ambiente dev: replicas, RPS, error rate, p95/p99, HPA, recursos por pod y nodo, Tekton TaskRuns |
-| webserver-api01 | `belo-api01` | Específico de api01: RPS por endpoint, p95/p99, HPA, CPU/mem |
-| webserver-api02 | `belo-api02` | Específico de api02: mismo set |
-| belo — pipeline & rollouts | `belo-pipeline` | Tekton runs, durations, rollout phases |
-
-**Para la demo**: empezá con `belo-dev-cluster` (vista de cluster), después zoom-in a `belo-api01` o `belo-api02` cuando quieras detalle.
-
-### URLs directas (copy-paste en browser)
-
-```
-http://grafana.localhost:8888/d/belo-dev-cluster
-http://grafana.localhost:8888/d/belo-api01
-http://grafana.localhost:8888/d/belo-api02
-http://grafana.localhost:8888/d/belo-pipeline
-http://kibana.localhost:8888/app/discover
-http://tekton.localhost:8888/#/pipelineruns
-http://argocd.localhost:8888
 ```
 
 ---
 
-## 5. Rollback automático (opcional, 3 min)
+## 5. Grafana — dashboards con datos reales
 
-Demuestra que un release con bug se rollbackea solo.
+http://grafana.localhost:8888 (admin / belo-challenge)
 
-```bash
-cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api01
-# Editar app/main.py: comentar el endpoint /api01/health (probe va a fallar)
-# git commit -m "intentional break"
-git tag release/v0.6.99/dev
-git push origin release/v0.6.99/dev
+| Dashboard | URL | Qué muestra |
+|---|---|---|
+| **belo — DEV cluster overview** | http://grafana.localhost:8888/d/belo-dev-cluster | Vista centralizada: replicas, RPS, error rate, p95/p99 de ambas apps lado a lado, HPA current vs desired, CPU/mem por pod y por nodo, Tekton durations |
+| webserver-api01 | http://grafana.localhost:8888/d/belo-api01 | RPS por endpoint, p95/p99, HPA |
+| webserver-api02 | http://grafana.localhost:8888/d/belo-api02 | Mismo para api02 |
+| **belo — pipeline & rollouts** | http://grafana.localhost:8888/d/belo-pipeline | Tabla rollouts (namespace/strategy/phase), TaskRun duration p95, PipelineRun count por status, Argo reconcile durations |
+
+---
+
+## 6. Tour final (lo que mostrar)
+
 ```
-
-**Qué va a pasar**:
-- Stage 4 espera el Rollout en Paused — pero los pods nuevos no pasan readinessProbe (no hay /api01/health) → pod queda en NotReady
-- Eventualmente Stage 4 timeout O Stage 5 falla con thresholds
-- Stage 6 emite `kubectl patch spec.abort=true`
-- Green RS se destruye, stable (v0.6.0) queda intacto sirviendo
-
-Verificación: `curl http://api01.localhost:8888/api01/version` sigue devolviendo v0.6.0.
+1. Tekton Dashboard:    http://tekton.localhost:8888/#/pipelineruns
+2. ArgoCD:              http://argocd.localhost:8888  (admin / make argocd-password)
+3. Grafana DEV cluster: http://grafana.localhost:8888/d/belo-dev-cluster
+4. Grafana pipeline:    http://grafana.localhost:8888/d/belo-pipeline
+5. Kibana dashboard:    http://kibana.localhost:8888/app/dashboards#/view/belo-cluster-overview
+6. Apps:                http://api01.localhost:8888/api01/info  +  http://api02.localhost:8888/api02/items
+```
 
 ---
 
 ## Comandos de emergencia
 
-### Si el cluster se rompe
+### Reset completo de un rollout pausado/roto
 
 ```bash
-make cluster-status
-make pipeline-check
-make burn-check
-```
-
-### Forzar re-sync de ArgoCD (sin esperar polling de 3min)
-
-```bash
-kubectl annotate app webserver-api01-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite
-kubectl annotate app webserver-api02-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite
-```
-
-### Promover Rollout BG manual
-
-```bash
-kubectl patch rollout webserver-api01-dev -n webserver-api01-dev \
-  --subresource=status --type=merge -p '{"status":{"pauseConditions":null}}'
-```
-
-### Promover canary --full manual
-
-```bash
-kubectl patch rollout webserver-api02-dev -n webserver-api02-dev \
-  --subresource=status --type=merge -p '{"status":{"promoteFull":true}}'
-```
-
-### Abort cualquier Rollout
-
-```bash
+# Si el rollout queda Paused y querés tirarlo abajo:
+kubectl patch rollout <name> -n <ns> --subresource=status --type=merge -p '{"status":{"pauseConditions":null}}'
+# o forzar rollback:
 kubectl patch rollout <name> -n <ns> --type=merge -p '{"spec":{"abort":true}}'
 ```
 
@@ -334,51 +239,66 @@ kubectl patch rollout <name> -n <ns> --type=merge -p '{"spec":{"abort":true}}'
 kubectl delete pipelinerun --all -n tekton-pipelines
 ```
 
-### Re-tagueo de un tag burn
+### Forzar ArgoCD sync
+
+```bash
+kubectl annotate app webserver-api01-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite
+kubectl annotate app webserver-api02-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite
+```
+
+### Re-pushear el mismo tag (burn o release fallido)
 
 ```bash
 cd /ruta/al/app
-git tag -d burn/dev && git push --delete origin burn/dev
-git tag burn/dev && git push origin burn/dev
+git tag -d <tag>
+git push --delete origin <tag>
+git tag <tag>
+git push origin <tag>
+# Y borrar el PipelineRun si era release (deterministic name):
+kubectl delete pipelinerun <app>-pipelinerun-<tag> -n tekton-pipelines
 ```
 
-### Recrear el index pattern de Kibana si desapareciera
+### Recrear Kibana saved objects (si desaparecen)
 
 ```bash
 KIBANA_POD=$(kubectl get pod -n logging -l app=kibana -o jsonpath='{.items[0].metadata.name}')
+DATA_VIEW_ID="929e12ce-6546-499e-b76b-d7e600d83f69"
+
+# data view
 kubectl exec -n logging $KIBANA_POD -- curl -s -X POST "http://localhost:5601/api/data_views/data_view" \
   -H "kbn-xsrf: true" -H "Content-Type: application/json" \
-  -d '{"data_view":{"title":"k8s-*","name":"k8s logs","timeFieldName":"@timestamp"}}'
+  -d '{"data_view":{"id":"'$DATA_VIEW_ID'","title":"k8s-*","name":"k8s logs","timeFieldName":"@timestamp"}}'
+
+# Re-aplicar saved searches: ver los comandos al final de esta sesion en el git log
+# o copiar de docs/logging-efk.md
 ```
 
-### Re-aplicar Tekton + dashboards + fluent-bit después de un git pull
+### Verificar end-to-end metrics flow
+
+```bash
+# Tekton metrics
+kubectl exec -n monitoring prometheus-kube-prometheus-kube-prome-prometheus-0 -c prometheus -- \
+  promtool query instant http://localhost:9090 'up{job=~".*tekton.*"}'
+
+# Argo Rollouts metrics
+kubectl exec -n monitoring prometheus-kube-prometheus-kube-prome-prometheus-0 -c prometheus -- \
+  promtool query instant http://localhost:9090 'rollout_info'
+
+# App metrics
+kubectl exec -n monitoring prometheus-kube-prometheus-kube-prome-prometheus-0 -c prometheus -- \
+  promtool query instant http://localhost:9090 'sum(rate(api01_requests_total[1m]))'
+```
+
+### Re-aplicar TODO sobre un cluster ya levantado
 
 ```bash
 make refresh
+# Ejecuta: tekton-apply + dashboards-apply + helm upgrade fluent-bit + ArgoCD app refresh
 ```
 
 ---
 
-## Flujo completo end-to-end (15-20 min total)
-
-1. `make pipeline-check` (1 min)
-2. **Demo BG api01**: `git tag release/v0.6.0/dev` desde repo api01 (5 min)
-3. **Demo Canary api02**: `git tag release/v0.2.0/dev` desde repo api02 (5 min)
-4. **Burn pipeline**: `git tag burn/dev` o `make burn-test ...` (4 min)
-5. **Tour de observabilidad**: Grafana `belo-dev-cluster` + Kibana queries (3 min)
-6. **Opcional**: rollback con tag que falla (3 min)
-
----
-
-## Cosas que NO mostrar en la demo (saben fallar o son lentas)
-
-- **Pipeline en producción** (env=production): tiene gate manual, no autoprometia
-- **Re-pushear el MISMO release tag**: falla con AlreadyExists (intencional). Para re-correr: `kubectl delete pipelinerun <name> -n tekton-pipelines`
-- **Rollout abort durante un BG paused**: el scaleDownDelaySeconds=30 hace que blue tarde 30s en irse — paciencia
-
----
-
-## URLs + credenciales (cheat sheet)
+## URLs + credenciales
 
 | Servicio | URL | Cred |
 |---|---|---|
@@ -387,11 +307,24 @@ make refresh
 | Kibana | http://kibana.localhost:8888 | sin auth |
 | Tekton Dashboard | http://tekton.localhost:8888 | sin auth |
 | Headlamp | http://headlamp.localhost:8888 | `kubectl create token headlamp -n kube-system` |
-| api01 stable | http://api01.localhost:8888 | — |
-| api01 preview | http://preview-api01.localhost:8888 | — |
-| api02 stable | http://api02.localhost:8888 | — |
-| api02 preview | http://preview-api02.localhost:8888 | — |
+| api01 stable | http://api01.localhost:8888/api01/ | — |
+| api01 preview | http://preview-api01.localhost:8888/api01/ | — |
+| api02 stable | http://api02.localhost:8888/api02/ | — |
+| api02 preview | http://preview-api02.localhost:8888/api02/ | — |
 
-> Verificá `C:\Windows\System32\drivers\etc\hosts` tiene todos esos hostnames apuntando a 127.0.0.1.
+---
 
-Suerte.
+## Lo que evitar mostrar
+
+- **Re-pushear el mismo release tag**: falla con AlreadyExists (intencional — disciplina semver)
+- **Pipeline en producción**: tiene gate manual, no autoprueba
+- **Pipelines viejos con `generateName`**: si hay runs anteriores con nombres random, limpialos antes (`kubectl delete pipelinerun --all -n tekton-pipelines`)
+- **Burn justo después de otro burn**: HPA cooldown de 5min — esperá o el `max-replicas` puede no superar el baseline
+
+## Flujo total para la demo (~20 min)
+
+1. `make pipeline-check` (1 min)
+2. `git tag release/v0.8.0/dev` en api01 (5 min — pipeline corre solo)
+3. `git tag release/v0.3.0/dev` en api02 (5 min)
+4. `git tag burn/dev` o `make burn-test APP=webserver-api01 ENV=dev` (4 min)
+5. Tour: Tekton Dashboard → ArgoCD → Grafana dev-cluster → Grafana pipeline → Kibana dashboard (5 min)
