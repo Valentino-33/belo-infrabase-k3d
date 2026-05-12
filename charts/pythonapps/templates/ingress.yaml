@@ -2,8 +2,9 @@
 {{- $fullname := include "pythonapps.fullname" . -}}
 {{/*
   Topología invariante: stable + preview siempre existen.
-  - stable: hostname principal (api01.localhost). ArgoRollouts agrega annotations de canary-weight aquí.
-  - preview: acceso directo a la nueva versión (preview-api01.localhost) antes del promote.
+  - stable: hostname principal. ArgoRollouts agrega annotations de canary-weight aquí.
+  - preview: acceso directo a la nueva versión antes del promote.
+  Backend apunta al service port (8080 fijo).
 */}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -28,7 +29,7 @@ spec:
           service:
             name: {{ $fullname }}-stable
             port:
-              number: 8000
+              number: 8080
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -51,5 +52,5 @@ spec:
           service:
             name: {{ $fullname }}-preview
             port:
-              number: 8000
+              number: 8080
 {{- end }}

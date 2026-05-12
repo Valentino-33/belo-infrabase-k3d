@@ -25,24 +25,25 @@ spec:
       set -e
       PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
-      NS="$PRIMARY_ENV"
+      # namespace y nombre de rollout = app-name + env
+      NS="${APP}-${PRIMARY_ENV}"
+      ROLLOUT="${APP}-${PRIMARY_ENV}"
       STRATEGY="$(params.strategy)"
       OUTCOME="$(params.outcome)"
-      echo "=== promote-or-rollback: app=$APP env=$NS strategy=$STRATEGY outcome=$OUTCOME ==="
+      echo "=== promote-or-rollback: rollout=$ROLLOUT ns=$NS strategy=$STRATEGY outcome=$OUTCOME ==="
 
-      # Production gate: no auto-promote. Leave annotation and exit.
-      if [ "$NS" = "production" ]; then
+      # Production gate: no auto-promote. Anotar ArgoCD app y salir.
+      if [ "$PRIMARY_ENV" = "production" ]; then
         if [ "$OUTCOME" = "passed" ]; then
           echo "PRODUCTION GATE: tests passed. Manual sync and promote required."
-          echo "  1. ArgoCD: sync webserver application in production namespace"
-          echo "  2. After Rollout is Paused: kubectl argo rollouts promote $APP -n production"
+          echo "  1. ArgoCD: sync ${APP}-production manually"
+          echo "  2. After Rollout is Paused: kubectl argo rollouts promote $ROLLOUT -n $NS"
           kubectl annotate application "${APP}-production" -n argocd \
             belo/pending-promote="true" \
             belo/promote-reason="load-test-passed" \
             --overwrite 2>/dev/null || true
         else
-          echo "PRODUCTION GATE: tests FAILED. Gitops values NOT reverted automatically."
-          echo "  Review and manually revert if needed."
+          echo "PRODUCTION GATE: tests FAILED. Revert gitops values manually if needed."
           kubectl annotate application "${APP}-production" -n argocd \
             belo/pending-promote="false" \
             belo/promote-reason="load-test-failed" \
@@ -64,7 +65,7 @@ spec:
         rollingupdate)
           if [ "$OUTCOME" = "failed" ]; then
             echo "RollingUpdate: FAILED — rolling back"
-            kubectl argo rollouts undo "$APP" -n "$NS" || true
+            kubectl argo rollouts undo "$ROLLOUT" -n "$NS" || true
           else
             echo "RollingUpdate: PASSED — completes automatically"
           fi
@@ -72,19 +73,19 @@ spec:
         bluegreen)
           if [ "$OUTCOME" = "failed" ]; then
             echo "BlueGreen: FAILED — aborting (keeping stable blue)"
-            kubectl argo rollouts abort "$APP" -n "$NS"
+            kubectl argo rollouts abort "$ROLLOUT" -n "$NS"
           else
             echo "BlueGreen: PASSED — promoting green to stable"
-            kubectl argo rollouts promote "$APP" -n "$NS"
+            kubectl argo rollouts promote "$ROLLOUT" -n "$NS"
           fi
           ;;
         canary)
           if [ "$OUTCOME" = "failed" ]; then
             echo "Canary: FAILED — aborting"
-            kubectl argo rollouts abort "$APP" -n "$NS"
+            kubectl argo rollouts abort "$ROLLOUT" -n "$NS"
           else
             echo "Canary: PASSED — promoting to 100%"
-            kubectl argo rollouts promote "$APP" -n "$NS" --full
+            kubectl argo rollouts promote "$ROLLOUT" -n "$NS" --full
           fi
           ;;
         *)

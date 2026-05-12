@@ -1,8 +1,12 @@
-# Defaults del chart — sobreescribir con build-time/app.yaml + <env>/values.yaml
-# helm template <name> charts/pythonapps/ -f apps/<app>/build-time/app.yaml -f apps/<app>/dev/values.yaml
+# Defaults del chart — cada app DEBE sobreescribir con su <env>/values.yaml
+# helm template <release> charts/pythonapps/ -f apps/<app>/<env>/values.yaml
+
+app:
+  name: ""           # REQUIRED: definido en <env>/values.yaml
+  namespace: ""      # REQUIRED: <appname>-<env> — debe coincidir con destination.namespace en ArgoCD
 
 image:
-  repository: docker.io/valentinobruno/api01
+  repository: ""     # REQUIRED: docker.io/<user>/<app>
   tag: "latest"
   pullPolicy: IfNotPresent
 
@@ -11,10 +15,8 @@ rollout:
 
 replicas: 1
 
-app:
-  name: webserver-api01
-  pathPrefix: api01
-  metricsPath: /api01/metrics
+ports:
+  containerPort: 8080   # puerto en el que escucha el contenedor — sobreescribir por app
 
 resources:
   requests:
@@ -24,10 +26,26 @@ resources:
     cpu: "500m"
     memory: "256Mi"
 
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3
+
 hpa:
-  enabled: true
+  enabled: false
   minReplicas: 1
-  maxReplicas: 4
+  maxReplicas: 3
   targetCPUUtilizationPercentage: 70
 
 ingress:
@@ -37,10 +55,12 @@ ingress:
   annotations: {}
 
 serviceMonitor:
-  enabled: true
+  enabled: false
   interval: 30s
+  pathPrefix: ""
+  metricsPath: /metrics
 
 tekton:
-  enabled: false   # true only via make tekton-apply — evita que ArgoCD intente poseer estos recursos desde ambas apps
+  enabled: false   # true solo via make tekton-apply — evita que ArgoCD gestione estos recursos
   dockerhubUser: valentinobruno
   gitopsRepoUrl: https://github.com/Valentino-33/belo-infrabase-k3d

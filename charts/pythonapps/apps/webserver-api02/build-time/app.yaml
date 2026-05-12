@@ -1,19 +1,5 @@
-app:
-  name: webserver-api02
-  pathPrefix: api02
-  metricsPath: /api02/metrics
-
-rollout:
-  strategy: canary
-
-image:
-  repository: docker.io/valentinobruno/api02
-  pullPolicy: IfNotPresent
-
+# Settings usados por: make tekton-apply (helm template --set tekton.enabled=true)
+# Todo lo demás (strategy, image.repository, replicas, etc.) va en <env>/values.yaml
 tekton:
   dockerhubUser: valentinobruno
   gitopsRepoUrl: https://github.com/Valentino-33/belo-infrabase-k3d
-
-serviceMonitor:
-  enabled: true
-  interval: 30s

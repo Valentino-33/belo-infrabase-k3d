@@ -14,11 +14,10 @@ spec:
     path: charts/pythonapps
     helm:
       valueFiles:
-      - apps/webserver-api01/build-time/app.yaml
       - apps/webserver-api01/dev/values.yaml
   destination:
     server: https://kubernetes.default.svc
-    namespace: dev
+    namespace: webserver-api01-dev
   syncPolicy:
     automated:
       prune: true

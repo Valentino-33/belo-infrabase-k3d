@@ -1,8 +1,8 @@
 {{- $fullname := include "pythonapps.fullname" . -}}
 {{/*
   Topología invariante: stable + preview existen siempre, sin importar la strategy activa.
-  Esto permite cambiar de BlueGreen a Canary entre deploys sin tocar la capa de red.
-  ArgoRollouts gestiona los selectores de pods en cada service según la strategy del Rollout.
+  service.port es fijo (8080) para que el load test y el ingress usen siempre el mismo puerto.
+  service.targetPort = ports.containerPort (configurable por app en values.yaml).
 */}}
 apiVersion: v1
 kind: Service
@@ -16,8 +16,8 @@ spec:
     {{- include "pythonapps.selectorLabels" . | nindent 4 }}
   ports:
   - name: http
-    port: 8000
-    targetPort: 8000
+    port: 8080
+    targetPort: {{ .Values.ports.containerPort }}
     protocol: TCP
 ---
 apiVersion: v1
@@ -32,6 +32,6 @@ spec:
     {{- include "pythonapps.selectorLabels" . | nindent 4 }}
   ports:
   - name: http
-    port: 8000
-    targetPort: 8000
+    port: 8080
+    targetPort: {{ .Values.ports.containerPort }}
     protocol: TCP

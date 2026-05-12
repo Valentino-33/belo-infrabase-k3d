@@ -28,10 +28,14 @@ spec:
       PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
       STRATEGY="$(params.strategy)"
+      # namespace y nombre de release = app-name + env
+      NS="${APP}-${PRIMARY_ENV}"
+      RELEASE="${APP}-${PRIMARY_ENV}"
       echo "=== Load test: $APP env=$PRIMARY_ENV strategy=$STRATEGY ==="
 
-      BASE_URL="http://${APP}-stable.${PRIMARY_ENV}.svc.cluster.local:8000"
-      PREVIEW_URL="http://${APP}-preview.${PRIMARY_ENV}.svc.cluster.local:8000"
+      # service port es siempre 8080 (service.yaml lo define fijo)
+      BASE_URL="http://${RELEASE}-stable.${NS}.svc.cluster.local:8080"
+      PREVIEW_URL="http://${RELEASE}-preview.${NS}.svc.cluster.local:8080"
 
       case "$STRATEGY" in
         bluegreen)

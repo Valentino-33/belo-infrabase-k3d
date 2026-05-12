@@ -23,7 +23,7 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         ports:
         - name: http
-          containerPort: 8000
+          containerPort: {{ .Values.ports.containerPort }}
           protocol: TCP
         env:
         - name: APP_VERSION
@@ -31,19 +31,9 @@ spec:
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
         livenessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 10
-          periodSeconds: 10
-          failureThreshold: 3
+          {{- toYaml .Values.livenessProbe | nindent 10 }}
         readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 5
-          periodSeconds: 5
-          failureThreshold: 3
+          {{- toYaml .Values.readinessProbe | nindent 10 }}
   {{- if eq .Values.rollout.strategy "bluegreen" }}
   strategy:
     blueGreen:
@@ -67,12 +57,6 @@ spec:
       - setWeight: 50
       - pause: {}
   {{- else }}
-  {{/*
-    rollingupdate: canary con 100% de peso inmediato y sin pauses.
-    Referencia stable/preview services para mantener la topología invariante
-    y que los demás stages del pipeline puedan alcanzar ambos services via DNS.
-    El Rollout completa directamente (fase Healthy, no Paused).
-  */}}
   strategy:
     canary:
       stableService: {{ include "pythonapps.fullname" . }}-stable

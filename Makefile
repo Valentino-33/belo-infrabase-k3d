@@ -14,10 +14,12 @@ K3D_CONTEXT := k3d-belo-challenge
 
 K3D_CLUSTER   := belo-challenge
 DOCKERHUB_USER ?= valentinobruno
-NAMESPACE      := dev
 APP            ?= webserver-api01
 TAG            ?= latest
-ENVS           ?= dev
+ENVS          ?= dev
+# Namespace = app + env (e.g. webserver-api01-dev). Override: make rollout-status APP=webserver-api02 ENV=staging
+ENV           ?= dev
+NAMESPACE     := $(APP)-$(ENV)
 
 GREEN  := \033[0;32m
 YELLOW := \033[0;33m
@@ -39,7 +41,8 @@ help:  ## Mostrar todos los targets
 	  | sort \
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-22s$(NC) %s\n", $$1, $$2}'
 	@echo ""
-	@echo "Override-ables: APP ($(APP))  TAG ($(TAG))  DOCKERHUB_USER ($(DOCKERHUB_USER))"
+	@echo "Override-ables: APP ($(APP))  ENV ($(ENV))  TAG ($(TAG))  DOCKERHUB_USER ($(DOCKERHUB_USER))"
+	@echo "  Namespace resuelto: $(NAMESPACE)  (APP-ENV)"
 	@echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -76,8 +79,9 @@ cluster-status:  ## Estado del cluster: nodos + apps + rollouts
 	kubectl get nodes -L role,workload
 	@echo "$(YELLOW)→ ArgoCD Applications:$(NC)"
 	kubectl -n argocd get applications 2>/dev/null || echo "ArgoCD no instalado aún"
-	@echo "$(YELLOW)→ Rollouts (namespace $(NAMESPACE)):$(NC)"
-	kubectl -n $(NAMESPACE) get rollouts 2>/dev/null || kubectl -n $(NAMESPACE) get deployments 2>/dev/null || true
+	@echo "$(YELLOW)→ Rollouts en namespaces de dev:$(NC)"
+	kubectl get rollouts -n webserver-api01-dev 2>/dev/null || true
+	kubectl get rollouts -n webserver-api02-dev 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helm repos y addons
@@ -262,21 +266,22 @@ release:  ## Crear y pushear tag de release: make release APP=webserver-api01 TA
 # Demos
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: demo-bluegreen
-demo-bluegreen:  ## Guía interactiva de demo Blue/Green (api01)
+demo-bluegreen:  ## Guía interactiva de demo Blue/Green (api01) — ENV=dev por default
 	@echo ""
-	@echo "$(GREEN)=== Demo Blue/Green — webserver-api01 ===$(NC)"
+	@echo "$(GREEN)=== Demo Blue/Green — webserver-api01-$(ENV) ===$(NC)"
 	@echo ""
-	@echo "Estado actual del rollout:"
-	kubectl argo rollouts get rollout webserver-api01 -n $(NAMESPACE) 2>/dev/null || \
+	@echo "Estado actual del rollout (namespace: webserver-api01-$(ENV)):"
+	kubectl argo rollouts get rollout webserver-api01-$(ENV) -n webserver-api01-$(ENV) 2>/dev/null || \
 	  echo "  (rollout no encontrado — ejecutá make bootstrap primero)"
 	@echo ""
 	@echo "$(YELLOW)Pasos para promover una nueva versión:$(NC)"
 	@echo ""
-	@echo "  1. Disparar pipeline con nuevo tag:"
-	@echo "     make pipeline-run APP=webserver-api01 TAG=v1.1.0"
+	@echo "  1. Crear tag de release desde el repo de la app:"
+	@echo "     git tag release/v1.1.0/$(ENV)"
+	@echo "     git push origin release/v1.1.0/$(ENV)"
 	@echo ""
 	@echo "  2. El pipeline construye la imagen, corre k6 contra el preview service,"
-	@echo "     actualiza image.tag en charts/pythonapps/apps/webserver-api01/dev/ y hace push."
+	@echo "     actualiza image.tag en charts/pythonapps/apps/webserver-api01/$(ENV)/values.yaml."
 	@echo ""
 	@echo "  3. ArgoCD detecta el commit → actualiza el Rollout → aparece el pod GREEN."
 	@echo ""
@@ -284,62 +289,62 @@ demo-bluegreen:  ## Guía interactiva de demo Blue/Green (api01)
 	@echo "     curl http://preview-api01.localhost:8888/version"
 	@echo ""
 	@echo "  5. Promover (switchear tráfico a green):"
-	@echo "     kubectl argo rollouts promote webserver-api01 -n $(NAMESPACE)"
+	@echo "     kubectl argo rollouts promote webserver-api01-$(ENV) -n webserver-api01-$(ENV)"
 	@echo ""
 	@echo "  6. Verificar que el stable (ahora green) sirve 100% del tráfico:"
 	@echo "     curl http://api01.localhost:8888/version"
-
 	@echo ""
 	@echo "  7. Rollback (si fuera necesario):"
-	@echo "     kubectl argo rollouts abort webserver-api01 -n $(NAMESPACE)"
+	@echo "     kubectl argo rollouts abort webserver-api01-$(ENV) -n webserver-api01-$(ENV)"
 	@echo ""
 
 .PHONY: demo-canary
-demo-canary:  ## Guía interactiva de demo Canary (api02)
+demo-canary:  ## Guía interactiva de demo Canary (api02) — ENV=dev por default
 	@echo ""
-	@echo "$(GREEN)=== Demo Canary — webserver-api02 ===$(NC)"
+	@echo "$(GREEN)=== Demo Canary — webserver-api02-$(ENV) ===$(NC)"
 	@echo ""
-	@echo "Estado actual del rollout:"
-	kubectl argo rollouts get rollout webserver-api02 -n $(NAMESPACE) 2>/dev/null || \
+	@echo "Estado actual del rollout (namespace: webserver-api02-$(ENV)):"
+	kubectl argo rollouts get rollout webserver-api02-$(ENV) -n webserver-api02-$(ENV) 2>/dev/null || \
 	  echo "  (rollout no encontrado — ejecutá make bootstrap primero)"
 	@echo ""
 	@echo "$(YELLOW)Pasos para avanzar el canary:$(NC)"
 	@echo ""
-	@echo "  1. Disparar pipeline:"
-	@echo "     make pipeline-run APP=webserver-api02 TAG=v1.1.0"
+	@echo "  1. Crear tag de release desde el repo de la app:"
+	@echo "     git tag release/v1.1.0/$(ENV)"
+	@echo "     git push origin release/v1.1.0/$(ENV)"
 	@echo ""
 	@echo "  2. ArgoCD actualiza el Rollout → canary arranca con 5% del tráfico."
 	@echo ""
 	@echo "  3. Monitorear distribución en tiempo real:"
-	@echo "     kubectl argo rollouts get rollout webserver-api02 -n $(NAMESPACE) --watch"
+	@echo "     kubectl argo rollouts get rollout webserver-api02-$(ENV) -n webserver-api02-$(ENV) --watch"
 	@echo ""
 	@echo "  4. Avanzar al siguiente step (25%):"
-	@echo "     kubectl argo rollouts promote webserver-api02 -n $(NAMESPACE)"
+	@echo "     kubectl argo rollouts promote webserver-api02-$(ENV) -n webserver-api02-$(ENV)"
 	@echo ""
 	@echo "  5. Avanzar a 50%:"
-	@echo "     kubectl argo rollouts promote webserver-api02 -n $(NAMESPACE)"
+	@echo "     kubectl argo rollouts promote webserver-api02-$(ENV) -n webserver-api02-$(ENV)"
 	@echo ""
 	@echo "  6. Promover completo (100%):"
-	@echo "     kubectl argo rollouts promote webserver-api02 -n $(NAMESPACE)"
+	@echo "     kubectl argo rollouts promote webserver-api02-$(ENV) -n webserver-api02-$(ENV)"
 	@echo ""
 	@echo "  7. Rollback a stable:"
-	@echo "     kubectl argo rollouts abort webserver-api02 -n $(NAMESPACE)"
+	@echo "     kubectl argo rollouts abort webserver-api02-$(ENV) -n webserver-api02-$(ENV)"
 	@echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Rollout status
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: rollout-status
-rollout-status:  ## Ver estado del rollout: make rollout-status APP=webserver-api01
-	kubectl argo rollouts get rollout $(APP) -n $(NAMESPACE) --watch
+rollout-status:  ## Ver estado del rollout: make rollout-status APP=webserver-api01 ENV=dev
+	kubectl argo rollouts get rollout $(APP)-$(ENV) -n $(NAMESPACE) --watch
 
 .PHONY: rollout-promote
-rollout-promote:  ## Promover rollout: make rollout-promote APP=webserver-api01
-	kubectl argo rollouts promote $(APP) -n $(NAMESPACE)
+rollout-promote:  ## Promover rollout: make rollout-promote APP=webserver-api01 ENV=dev
+	kubectl argo rollouts promote $(APP)-$(ENV) -n $(NAMESPACE)
 
 .PHONY: rollout-abort
-rollout-abort:  ## Abortar rollout (rollback): make rollout-abort APP=webserver-api01
-	kubectl argo rollouts abort $(APP) -n $(NAMESPACE)
+rollout-abort:  ## Abortar rollout (rollback): make rollout-abort APP=webserver-api01 ENV=dev
+	kubectl argo rollouts abort $(APP)-$(ENV) -n $(NAMESPACE)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Build local de imágenes (sin k3d)
