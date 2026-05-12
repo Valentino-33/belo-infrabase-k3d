@@ -274,6 +274,52 @@ kubectl patch rollout NAME -n NS --type=merge \
 
 Estos son los mismos patches que el plugin emite internamente (según [`promote.go`](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)), aplicados directo. Persisten correctamente.
 
+### Burn pipeline corre verde pero `outcome=failed` ("HPA no escaló")
+
+**Síntoma**: `<app>-burn-<env>-XXXXX` termina Succeeded pero el result `outcome` dice `failed` y `max-replicas` queda igual a `baseline-replicas`.
+
+**Causas probables**:
+1. **HPA no está habilitado**: `kubectl get hpa <app>-<env> -n <app>-<env>` no devuelve nada → habilitar con `hpa.enabled: true` en `charts/pythonapps/apps/<app>/<env>/values.yaml`.
+2. **`targetCPUUtilizationPercentage` muy alto**: si está en 90% y el cluster no llega, no escala. Ver dashboard de Grafana → "HPA CPU utilization vs target".
+3. **`resources.requests.cpu` muy alto**: el HPA calcula utilización contra el `request`, no el `limit`. Si request=300m y el pod usa 150m, utilización = 50% (debajo del target 70%) → no escala. Bajar `requests.cpu` a 100m fuerza utilización alta más rápido.
+4. **`maxReplicas: 1`**: el HPA querría escalar pero el max no se lo permite. Subir a 3-5.
+5. **Cluster sin capacidad**: si los nodos no tienen CPU libre, los pods nuevos quedan `Pending`. `kubectl describe nodes` para verificar.
+
+**Fix típico** para una POC:
+```yaml
+# charts/pythonapps/apps/webserver-api01/dev/values.yaml
+hpa:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+resources:
+  requests:
+    cpu: "100m"   # bajo a propósito — el burn lleva utilización arriba rápido
+    memory: "128Mi"
+  limits:
+    cpu: "300m"
+    memory: "256Mi"
+```
+
+### Burn pipeline tag se ignora
+
+**Síntoma**: `git push origin burn/dev` no dispara nada en Tekton, no aparece run en el dashboard.
+
+**Causas**:
+1. **EventListener no se aplicó después del cambio**: corré `make tekton-apply` para re-renderizar los triggers.
+2. **El tag tiene segmentos extra**: `burn/dev/extra` no matchea (el filter exige exactamente 4 segmentos `refs/tags/burn/<env>`).
+3. **Webhook sin path correcto**: el ngrok tunnel apunta a `tekton-webhook.localhost` y nginx-ingress lo enruta al EventListener. Verificar el delivery en GitHub → Webhooks → Recent Deliveries.
+
+**Verificación**:
+```bash
+# Listar runs del burn pipeline
+kubectl get pipelinerun -n tekton-pipelines -l pipeline=burn
+
+# Logs del EventListener
+kubectl -n tekton-pipelines logs -l eventlistener=github-tag-listener --tail=30
+```
+
 ### Stage 6 falla con `kubectl: command not found`
 
 **Síntoma**: el step `promote-or-abort` falla con:
@@ -446,7 +492,12 @@ make tunnel
 
 **Síntoma**: GitHub muestra 202 en delivery, pero `kubectl get pipelineruns` no muestra runs nuevos.
 
-**Causa probable**: tag con formato incorrecto. El CEL interceptor descarta tags que no cumplan `refs/tags/release/<sha>/<envs>`.
+**Causa probable**: tag con formato incorrecto. El EventListener tiene dos triggers con CEL filters:
+
+- `release/<semver>/<envs>` → release pipeline (6 stages). Ejemplo: `release/v1.0.0/dev` o `release/v1.0.0/dev,staging`.
+- `burn/<env>` → burn pipeline (2 stages, HPA capacity test). Ejemplo: `burn/dev`.
+
+Cualquier otro formato es descartado por el CEL filter.
 
 **Fix**: ver logs del EventListener:
 ```bash
@@ -458,7 +509,11 @@ Si el CEL filter rechazó el evento, vas a ver algo como:
 event 12345 didn't pass interceptor cel (filter)
 ```
 
-Solución: usar el formato correcto: `release/v1.0.0/dev` o `release/v1.0.0/dev,staging`.
+Solución: usar uno de los formatos válidos:
+```bash
+git tag release/v1.0.0/dev && git push origin release/v1.0.0/dev   # release
+git tag burn/dev && git push origin burn/dev                       # burn (HPA test)
+```
 
 ---
 

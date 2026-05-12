@@ -278,6 +278,86 @@ make pipeline-run APP=webserver-api02 TAG=v1.2.0
 
 ---
 
+## Demo 5 — Burn pipeline (HPA capacity test)
+
+**Objetivo**: validar que el HPA escala el Rollout cuando el CPU supera el target. Es un pipeline **separado** del release — corre on-demand y no afecta el flujo de promote/rollback.
+
+### Prerequisito — HPA habilitado
+
+`charts/pythonapps/apps/<app>/<env>/values.yaml` debe tener:
+```yaml
+hpa:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+```
+
+(ya viene habilitado por defecto para api01 y api02 en dev).
+
+### Paso 1 — Disparar el burn
+
+**Vía webhook** (desde el repo de la app):
+```bash
+cd /ruta/a/webserver-api01
+git tag burn/dev
+git push origin burn/dev
+```
+
+**Manual** (sin webhook):
+```bash
+make burn-test APP=webserver-api01 ENV=dev
+```
+
+### Paso 2 — Observar el HPA escalando en vivo
+
+En otra terminal:
+```bash
+kubectl get hpa webserver-api01-dev -n webserver-api01-dev -w
+```
+
+Vas a ver algo como:
+```
+NAME                  REFERENCE                        TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+webserver-api01-dev   Rollout/webserver-api01-dev      12%/70%   1         5         1          5m   ← baseline
+webserver-api01-dev   Rollout/webserver-api01-dev      89%/70%   1         5         1          5m   ← burn empieza
+webserver-api01-dev   Rollout/webserver-api01-dev      95%/70%   1         5         3          6m   ← HPA escaló
+webserver-api01-dev   Rollout/webserver-api01-dev      45%/70%   1         5         3          7m   ← carga distribuida
+```
+
+### Paso 3 — Ver el resultado del PipelineRun
+
+```bash
+# Listar burn runs
+kubectl get pipelinerun -n tekton-pipelines -l pipeline=burn
+
+# Ver results del último
+kubectl get pipelinerun -n tekton-pipelines -l pipeline=burn \
+  -o jsonpath='{.items[-1].status.results}'
+# Esperado:
+# outcome=passed
+# baseline-replicas=1
+# max-replicas=3
+```
+
+O visualmente en `http://tekton.localhost:8888/#/pipelineruns` filtrado por `pipeline=burn`.
+
+### Paso 4 — Re-correr
+
+A diferencia del release pipeline (deterministic name), el burn usa `generateName` — cada run es independiente, no falla con AlreadyExists. Pero el tag git sí existe ya. Para re-pushear:
+```bash
+git tag -d burn/dev && git push --delete origin burn/dev
+git tag burn/dev && git push origin burn/dev
+```
+
+O simplemente:
+```bash
+make burn-test APP=webserver-api01 ENV=dev
+```
+(no requiere borrar nada — el manual usa generateName del manifest local).
+
+---
+
 ## Dashboard tour (después del deploy)
 
 ### Tekton Dashboard
@@ -313,8 +393,12 @@ http://grafana.localhost:8888
 User: admin / Pass: belo-challenge
 ```
 
-- Dashboard "Kubernetes / Pods" → ver CPU/Memory de los pods durante el rollout
-- Métricas de la app: `api01_requests_total`, `api01_request_duration_seconds`
+Dashboards provisionados automáticamente (via sidecar de kube-prometheus-stack):
+- **webserver-api01 — request, latency, HPA** (uid `belo-api01`): RPS, p95/p99, error rate, pod count, HPA replicas vs target, CPU/mem por pod.
+- **webserver-api02 — request, latency, HPA** (uid `belo-api02`): mismo set para api02.
+- **belo — pipeline & rollouts overview** (uid `belo-pipeline`): Tekton TaskRun duration p95, Rollout phase transitions.
+
+Para agregar uno nuevo: ver [docs/grafana-dashboards.md](grafana-dashboards.md).
 
 ### Kibana
 
@@ -324,8 +408,8 @@ http://kibana.localhost:8888
 ```
 
 - Management → Index Patterns → crear `k8s-*`
-- Discover → filtrar por `kubernetes.labels.app_name: webserver-api01`
-- Los logs son JSON estructurado (structlog)
+- Discover → filtrar por `kubernetes.namespace_name: "webserver-api01-dev"`
+- Los logs son JSON estructurado (structlog). Queries útiles en [docs/logging-efk.md](logging-efk.md).
 
 ### Headlamp
 
@@ -367,6 +451,10 @@ kubectl patch rollout <ROLLOUT> -n <NS> \
 make load-test-smoke APP=webserver-api01
 make load-test-bluegreen
 make load-test-canary
+
+# Burn pipeline (HPA capacity test, on-demand)
+make burn-test APP=webserver-api01 ENV=dev
+make burn-test APP=webserver-api02 ENV=dev
 
 # Ver pipelines
 kubectl -n tekton-pipelines get pipelineruns

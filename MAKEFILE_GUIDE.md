@@ -20,19 +20,15 @@ make secrets-apply DOCKERHUB_USER=<user> DOCKERHUB_TOKEN=<token> GITHUB_TOKEN=<t
 docker login -u <user> --password-stdin <<< "<token>"
 make images-initial DOCKERHUB_USER=<user>
 
-# 4. Bootstrap ArgoCD + aplicar pipeline Tekton
+# 4. Bootstrap ArgoCD + aplicar pipeline Tekton + dashboards Grafana
 make bootstrap
 
-# 5. Instalar Tekton Dashboard (UI visual de PipelineRuns — tipo OpenShift)
-kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
-kubectl apply -f manifests/tekton/dashboard-ingress.yaml
-
-# 6. (Opcional) Exponer el EventListener a internet para recibir webhooks
+# 5. (Opcional) Exponer el EventListener a internet para recibir webhooks
 make tunnel
 ```
 
-> `make all` hace cluster-up + bootstrap en un solo comando, pero **omite** los pasos 2, 3 y 5.
-> Corré `make secrets-apply`, `make images-initial` y la instalación del Dashboard **antes** del primer pipeline.
+> `make all` hace cluster-up + bootstrap en un solo comando, pero **omite** los pasos 2 y 3.
+> Corré `make secrets-apply` y `make images-initial` **antes** del primer pipeline-run.
 
 ---
 
@@ -40,13 +36,10 @@ make tunnel
 
 ```bash
 make cluster-down   # elimina cluster y volúmenes Docker
-make cluster-up     # levanta de cero — los addons se reinstalan automáticamente
+make cluster-up     # levanta de cero — los addons (incluyendo Tekton Dashboard) se reinstalan automáticamente
 make secrets-apply DOCKERHUB_USER=<user> DOCKERHUB_TOKEN=<token> GITHUB_TOKEN=<token>
 make images-initial DOCKERHUB_USER=<user>
-make bootstrap
-# Re-instalar Tekton Dashboard (no se persiste con cluster-down)
-kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
-kubectl apply -f manifests/tekton/dashboard-ingress.yaml
+make bootstrap      # ArgoCD root app + Tekton pipeline + dashboards Grafana
 ```
 
 > **Importante después de cualquier reinstalación de Tekton**: el namespace `tekton-pipelines` vuelve a `pod-security.kubernetes.io/enforce=restricted`. Hay que bajarlo a `baseline` para que kaniko funcione:
@@ -89,8 +82,12 @@ kubectl apply -f manifests/tekton/dashboard-ingress.yaml
 | `make push` | Push de imagen a DockerHub | Testing sin CI |
 | `make build-push` | Build + push en un paso | Ídem |
 | `make load-test-smoke` | Smoke test k6 (clona el repo de la app a `/tmp` y corre k6) | Validar que la app responde |
-| `make load-test-bluegreen` | Load test contra preview service (api01) | Testing BlueGreen |
-| `make load-test-canary` | Load test de canary (api02) | Testing Canary |
+| `make load-test-bluegreen` | Load test 1000 VUs contra preview service (api01) | Testing BlueGreen |
+| `make load-test-canary` | Load test 1000 VUs contra stable durante canary (api02) | Testing Canary |
+| `make burn-test` | Dispara burn pipeline (HPA capacity test) | On-demand validation del HPA |
+| `make burn-release-tag` | Imprime instrucciones del tag git para disparar burn vía webhook | Referencia |
+| `make dashboards-apply` | Aplica ConfigMaps de Grafana dashboards (sidecar los auto-carga) | Refresh dashboards sin re-deploy |
+| `make refresh` | Re-aplica Tekton tasks/pipelines + fluent-bit values + dashboards sobre cluster ya levantado | Después de un `git pull` con cambios en infra (no requiere cluster-down) |
 
 ---
 

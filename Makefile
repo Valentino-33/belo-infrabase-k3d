@@ -155,10 +155,12 @@ addons: helm-repos  ## Instalar todos los addons en el cluster k3d
 	  --namespace argo-rollouts \
 	  --wait --timeout 2m
 
-	@echo "$(YELLOW)→ 5/8 Tekton Pipelines + Triggers...$(NC)"
+	@echo "$(YELLOW)→ 5/8 Tekton Pipelines + Triggers + Dashboard...$(NC)"
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/release.yaml
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/interceptors.yaml
+	kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
+	kubectl apply -f $(ROOT_DIR)manifests/tekton/dashboard-ingress.yaml
 	kubectl -n tekton-pipelines rollout status deployment/tekton-pipelines-controller --timeout=3m
 
 	@echo "$(YELLOW)→ 6/8 EFK stack (local-path, TLS deshabilitado para dev)...$(NC)"
@@ -212,6 +214,18 @@ dashboards-apply:  ## Aplicar dashboards Grafana (ConfigMaps con label grafana_d
 	kubectl create namespace monitoring 2>/dev/null || true
 	kubectl apply -f $(ROOT_DIR)manifests/grafana/
 	@echo "$(GREEN)✓ Dashboards aplicados — aparecen en Grafana en ~30s vía sidecar$(NC)"
+
+.PHONY: refresh
+refresh: tekton-apply dashboards-apply  ## Re-aplicar Tekton + dashboards sobre un cluster ya levantado (sin recrear nada)
+	@echo "$(YELLOW)→ Actualizando fluent-bit (cambios en config de logging)...$(NC)"
+	helm upgrade --install fluent-bit fluent/fluent-bit \
+	  --namespace logging \
+	  --values $(ROOT_DIR)helm/addons/fluent-bit/values.yaml \
+	  --wait --timeout 2m 2>/dev/null || echo "  (fluent-bit no instalado o helm repo no agregado — saltando)"
+	@echo "$(GREEN)✓ Cluster actualizado. ArgoCD auto-sincroniza cambios en charts/pythonapps/apps/.$(NC)"
+	@echo "$(YELLOW)Si querés forzar el sync de las apps en lugar de esperar el polling:$(NC)"
+	@echo "  kubectl annotate app webserver-api01-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite"
+	@echo "  kubectl annotate app webserver-api02-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite"
 	@echo ""
 	@echo "ArgoCD sincronizará gitops/ → crea webserver-api01-dev y webserver-api02-dev"
 	@echo "Monitoreá en: http://argocd.localhost:8888  (user: admin)"

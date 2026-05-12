@@ -105,6 +105,34 @@ Esta fase resolvió todos los problemas que aparecieron al intentar validar el f
 - [x] Re-pushear el mismo tag falla con `AlreadyExists` — comportamiento intencional para forzar disciplina de semver
 - [x] Identificación visual instantánea en `kubectl get pipelinerun`, en el Tekton Dashboard, en logs y events — el deploy correspondiente a cada run es obvio sin necesidad de inspeccionar params
 
+### Fase 14 — Burn pipeline separado + dashboards Grafana + EFK docs (nuevo)
+
+Después de validar el pipeline de release, se identificaron tres mejoras importantes:
+
+1. **Capacity test (burn-to-scale) no debería ir en el pipeline de release**:
+   - Es lento (~3min de CPU saturada), la config del HPA cambia raramente.
+   - Si se mete antes de promote en BG, el HPA promedia CPU entre stable+preview RSes → dilución impide ver scale-up.
+   - Si se mete después de promote, una falla del HPA deja la versión nueva sirviendo trafico con HPA roto → rollback manual.
+   - **Enterprise pattern**: capacity tests viven en pipeline aparte que el platform team gatilla on-demand.
+
+2. **Observabilidad estaba documentada parcialmente** — no había dashboards listos ni guía para crear nuevos, ni doc de verificación de EFK.
+
+3. **Load tests eran light** — 5-10 VUs no representaban condiciones reales.
+
+Lo que se hizo:
+
+- [x] **Pipeline burn separado** (`pythonapps-burn-pipeline`): 2 stages (clone + burn-to-scale). Trigger por tag `refs/tags/burn/<env>` (segundo trigger del EventListener) o `make burn-test APP=x ENV=y`. PipelineRun con `generateName` (re-runs sin AlreadyExists).
+- [x] **Task `run-burn-to-scale`**: sidecar k6 genera 200 VUs sostenidos sin sleep contra el stable svc; step principal kubectl monitorea `rollout.status.replicas` cada 10s durante 180s. Outcome=passed si max-replicas > baseline.
+- [x] **HPA habilitado** en `dev/values.yaml` de api01 y api02 (`hpa.enabled: true, maxReplicas: 5`).
+- [x] **Load tests rediseñados**: api01/api02 con ramp 50→1000 VUs sostenidos, thresholds p95<2s/p99<3s/errors<5% (laxos para k3d, solo fallan en regresión real). Custom metrics `version_mismatch` (api01) y `canary_hits` (api02) para garantizar que el test corre contra la versión nueva.
+- [x] **Grafana dashboards provisionados**: ConfigMaps en `manifests/grafana/` con label `grafana_dashboard=1` (sidecar de kube-prometheus-stack los auto-carga). Tres dashboards: `belo-api01`, `belo-api02`, `belo-pipeline`. Target `make dashboards-apply`.
+- [x] **EFK tuning**: `Merge_Log_Trim On` + `Labels On` en fluent-bit (campos JSON quedan al raíz del documento, kubernetes.labels disponibles para filtrar).
+- [x] **Docs nuevos**:
+  - `docs/pipeline-stages.md`: stage-by-stage + garantías de correctness + sección completa del burn pipeline.
+  - `docs/logging-efk.md`: formato JSON, flujo end-to-end, queries KQL útiles, troubleshooting.
+  - `docs/grafana-dashboards.md`: guía completa para agregar dashboards nuevos + PromQL queries.
+- [x] **`.tekton/` borrado** de los app repos: era código muerto (el TriggerTemplate del infra repo genera el PipelineRun en vivo). Centralización completa de YAMLs de Tekton.
+
 ### Fase 13 — Source-of-truth de loadtest scripts + fail-fast (nuevo)
 - [x] **Eliminado** `belo-infrabase-k3d/apps/<app>/loadtest/` (era una copia inerte que el pipeline NO usaba — solo confundía)
 - [x] Los scripts k6 ahora viven **únicamente en el repo de cada app** (`loadtest/` en la raíz del repo)

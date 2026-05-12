@@ -1,6 +1,11 @@
 # Pipeline internals
 
-Detalle técnico de cada Task del pipeline `pythonapps-pipeline` y cómo se cablean entre sí. Esta doc complementa el [overview en architecture.md](architecture.md#3-flujo-cicd-completo-con-race-condition-fix); se enfoca en **decisiones de diseño no obvias** y comandos exactos.
+Detalle técnico de cada Task de los pipelines de Tekton y cómo se cablean entre sí. Esta doc complementa el [overview de stages](pipeline-stages.md); se enfoca en **decisiones de diseño no obvias** y comandos exactos.
+
+Hay **dos pipelines** que comparten Tasks:
+
+- `pythonapps-pipeline` (release, 6 stages) — clonado → build → bump → wait → load test → promote
+- `pythonapps-burn-pipeline` (HPA capacity, 2 stages, on-demand) — clonado → burn-to-scale
 
 Todos los archivos viven en `charts/pythonapps/templates/pipeline-templates/`.
 
@@ -8,16 +13,17 @@ Todos los archivos viven en `charts/pythonapps/templates/pipeline-templates/`.
 
 ## Stack de imágenes por Task
 
-| Task | Image | Usuario | Notas |
-|------|-------|---------|-------|
-| `git-clone-app` | `alpine/git:latest` | UID 65532 (nonroot) | HOME=/tekton/home para `git config` |
-| `kaniko-build-push` | `gcr.io/kaniko-project/executor:latest` | **root** (UID 0) | Único Task que necesita root → el NS está en PSA `baseline` |
-| `bump-gitops-image` | `alpine/git:latest` + `mikefarah/yq:latest` | UID 65532 | 3 steps: clone-gitops, bump-all-envs (yq), commit-and-push |
-| `wait-argocd-sync` | `bitnami/kubectl:latest` | UID 65532 | 2 steps: wait-argocd, detect-strategy-and-wait-rollout |
-| `run-load-test` | `grafana/k6:latest` | UID 65532 | Llama scripts en `loadtest/` del repo de la app |
-| `promote-or-rollback` | `bitnami/kubectl:latest` | UID 65532 | Patches directos al Rollout (sin plugin) |
+| Task | Usado por | Image | Usuario | Notas |
+|------|-----------|-------|---------|-------|
+| `git-clone-app` | release + burn | `alpine/git:latest` | UID 65532 (nonroot) | HOME=/tekton/home para `git config` |
+| `kaniko-build-push` | release | `gcr.io/kaniko-project/executor:latest` | **root** (UID 0) | Único Task que necesita root → el NS está en PSA `baseline` |
+| `bump-gitops-image` | release | `alpine/git:latest` + `mikefarah/yq:latest` | UID 65532 | 3 steps: clone-gitops, bump-all-envs (yq), commit-and-push |
+| `wait-argocd-sync` | release | `bitnami/kubectl:latest` | UID 65532 | 2 steps: wait-argocd, detect-strategy-and-wait-rollout |
+| `run-load-test` | release | `grafana/k6:latest` | UID 65532 | Llama scripts en `loadtest/` del repo de la app |
+| `promote-or-rollback` | release | `bitnami/kubectl:latest` | UID 65532 | Patches directos al Rollout (sin plugin) |
+| `run-burn-to-scale` | burn | sidecar `grafana/k6:latest` + step `bitnami/kubectl:latest` | UID 65532 | Sidecar genera carga, step monitorea HPA replicas |
 
-> **Nota PSA**: el namespace `tekton-pipelines` está labeleado `pod-security.kubernetes.io/enforce=baseline` (no `restricted`) porque kaniko no puede correr restricted. Las 5 Tasks no-kaniko declaran su propio `stepTemplate.securityContext` compliant con `restricted` (defense in depth). Ver [security-and-rbac.md](security-and-rbac.md).
+> **Nota PSA**: el namespace `tekton-pipelines` está labeleado `pod-security.kubernetes.io/enforce=baseline` (no `restricted`) porque kaniko no puede correr restricted. Las Tasks no-kaniko declaran su propio `stepTemplate.securityContext` compliant con `restricted` (defense in depth). Ver [security-and-rbac.md](security-and-rbac.md).
 
 ---
 

@@ -106,19 +106,17 @@ make images-initial DOCKERHUB_USER=<tu-usuario-dockerhub>
 ```
 
 ```bash
-# 5. Bootstrap: aplicar root Application de ArgoCD + manifests de Tekton
+# 5. Bootstrap: aplicar root Application de ArgoCD + manifests de Tekton + dashboards Grafana
 make bootstrap
-
-# 6. Instalar Tekton Dashboard (UI visual de los PipelineRuns — tipo OpenShift Pipelines)
-kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
-kubectl apply -f manifests/tekton/dashboard-ingress.yaml
 ```
 
 ```bash
-# 7. Verificar el estado (esperar ~2 min después del bootstrap)
+# 6. Verificar el estado (esperar ~2 min después del bootstrap)
 make cluster-status
 make cluster-info
 ```
+
+> El Tekton Dashboard (UI visual de los PipelineRuns) y los dashboards de Grafana ya quedan instalados como parte de `make addons` + `make bootstrap`. No hay paso manual extra.
 
 Después de `make bootstrap`, ArgoCD sincroniza las apps automáticamente. En ~2 minutos todos los pods deben estar corriendo:
 
@@ -618,6 +616,7 @@ make load-test-bluegreen                     # load test 1000 VUs contra preview
 make load-test-canary                        # load test 1000 VUs canary
 make burn-test APP=webserver-api01 ENV=dev   # burn pipeline (HPA capacity test)
 make dashboards-apply                        # aplicar/recargar dashboards Grafana
+make refresh                                 # re-aplicar Tekton + fluent-bit + dashboards sobre cluster ya up
 make tunnel                                  # ngrok → exponer EventListener
 make port-forward                            # port-forward de fallback
 ```

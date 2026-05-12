@@ -1,10 +1,13 @@
-# PipelineRun manual para demo sin webhook de GitHub.
+# PipelineRun manual del release pipeline (sin webhook GitHub).
 # Usar: make pipeline-run APP=webserver-api01 TAG=v0.1.0
-# O con envsubst: APP=webserver-api01 TAG=v0.1.0 DOCKERHUB_USER=user envsubst < pipelinerun-manual.yaml | kubectl create -f -
+# O con envsubst: APP=... TAG=... DOCKERHUB_USER=... envsubst < pipelinerun-manual.yaml | kubectl create -f -
 #
-# El nombre del PipelineRun es determinístico: <app>-pipelinerun-<tag>
-# Re-correr con el mismo TAG falla con AlreadyExists — usar otro TAG
-# o eliminar el run anterior con: kubectl delete pipelinerun <name> -n tekton-pipelines
+# Los params son los que pythonapps-pipeline declara — no más, no menos.
+# Mantener sincronizado con charts/pythonapps/templates/pipeline-templates/pipeline-pythonapps.yaml.
+#
+# Nombre determinístico: <app>-pipelinerun-<tag>. Re-correr con el mismo TAG
+# falla con AlreadyExists — usar otro TAG o eliminar el run anterior con:
+#   kubectl delete pipelinerun <name> -n tekton-pipelines
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -34,16 +37,10 @@ spec:
     value: ${TAG}
   - name: image-full
     value: docker.io/${DOCKERHUB_USER}/${APP}:${TAG}
-  - name: environment
+  - name: environments
     value: dev
-  - name: strategy
-    value: bluegreen
   - name: gitops-repo-url
     value: https://github.com/Valentino-33/belo-infrabase-k3d
-  - name: base-url
-    value: "http://${APP}-stable.dev.svc.cluster.local:8000"
-  - name: preview-url
-    value: "http://${APP}-preview.dev.svc.cluster.local:8000"
   workspaces:
   - name: source
     volumeClaimTemplate:
