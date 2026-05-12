@@ -7,7 +7,10 @@ image:
   pullPolicy: IfNotPresent
 rollout:
   strategy: bluegreen
-replicas: 1
+# minReplicas 2 a propósito: el load test de 1000 VUs satura 1 pod (300m CPU
+# limit) antes de que HPA reaccione → 5xx mientras escala. Arrancar con 2
+# pods da capacidad de baseline; HPA escala desde ahí si hace falta.
+replicas: 2
 ports:
   containerPort: 8000
 resources:
@@ -17,31 +20,33 @@ resources:
   limits:
     cpu: "300m"
     memory: "256Mi"
+# Probes apuntan a /api01/health — el código de api01 NO expone /health a la raíz.
 livenessProbe:
   httpGet:
-    path: /health
+    path: /api01/health
     port: 8000
   initialDelaySeconds: 10
   periodSeconds: 10
   failureThreshold: 3
 readinessProbe:
   httpGet:
-    path: /health
+    path: /api01/health
     port: 8000
   initialDelaySeconds: 5
   periodSeconds: 5
   failureThreshold: 3
 hpa:
   enabled: true
-  minReplicas: 1
+  minReplicas: 2
   maxReplicas: 5
   targetCPUUtilizationPercentage: 70
 ingress:
   enabled: true
   hostname: api01.localhost
   ingressClassName: nginx
-  annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
+  # Sin rewrite-target — la app tiene rutas explícitas bajo /api01/*.
+  # Si se rewriteara a /, todo caería en 404 (no hay rutas en raíz).
+  annotations: {}
 serviceMonitor:
   enabled: true
   interval: 30s

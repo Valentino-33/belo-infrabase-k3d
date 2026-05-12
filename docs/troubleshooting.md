@@ -274,6 +274,52 @@ kubectl patch rollout NAME -n NS --type=merge \
 
 Estos son los mismos patches que el plugin emite internamente (según [`promote.go`](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)), aplicados directo. Persisten correctamente.
 
+### Pipeline BG falla en Stage 5 — k6 reportó >5% errors
+
+**Síntoma**: Stage 5 termina con `outcome=failed`, k6 imprime algo como `WARN[xxxx] http_req_failed.....: rate=0.07` (7% errors). Stage 6 aborta el rollout. Después del run, ves los pods `stable` (blue) sirviendo bien pero el `preview` (green) destruyéndose.
+
+**Causa raíz**: 1000 VUs contra 1 sólo pod (limit 300m CPU) satura uvicorn antes de que el HPA reaccione. Mientras HPA escala (~30-40s entre detection + nuevo pod ready), el pod existente responde con 5xx por overload. Si en esa ventana se acumulan >5% de errores → Stage 5 fail.
+
+**Fix aplicado** en `charts/pythonapps/apps/<app>/dev/values.yaml`:
+- `replicas: 2` y `hpa.minReplicas: 2` → arrancamos con 2 pods de baseline → 600m CPU combinado
+- `http_req_failed` threshold subido a `rate<0.10` en los load tests (era 0.05) — ventana de scale-up tolerada
+
+**Verificación**:
+```bash
+kubectl get rollout webserver-api01-dev -n webserver-api01-dev \
+  -o jsonpath='{"replicas: "}{.spec.replicas}{"\n"}'
+# Debe imprimir replicas: 2
+
+kubectl get hpa webserver-api01-dev -n webserver-api01-dev \
+  -o jsonpath='{"min: "}{.spec.minReplicas}{" max: "}{.spec.maxReplicas}{"\n"}'
+# Debe imprimir min: 2 max: 5
+```
+
+### Quedaron 2 pods después de un release (stable + preview, mismo image-tag)
+
+**Síntoma**: después de un release pipeline, `kubectl get pods` muestra dos pods de la misma versión. Uno está en el RS "stable", el otro en "preview".
+
+**Causa**: el `scaleDownDelaySeconds: 30` en la spec del BG mantiene blue corriendo 30s después del switchover. **Es comportamiento esperado** — sirve como rollback ventana si la nueva versión falla justo después del promote.
+
+Si pasados 30s siguen los 2 pods, entonces el switchover NO ocurrió. Ver:
+```bash
+kubectl argo rollouts get rollout <app>-dev -n <app>-dev
+# Buscar:
+#   Status:   ॥ Paused              ← problema: nunca promovió
+#   Message:  BlueGreenPause
+```
+
+**Fix manual**:
+```bash
+# Para BG, promote manual:
+kubectl patch rollout <app>-dev -n <app>-dev \
+  --subresource=status --type=merge -p '{"status":{"pauseConditions":null}}'
+
+# O si fue un release que falló y querés volver a stable:
+kubectl patch rollout <app>-dev -n <app>-dev \
+  --type=merge -p '{"spec":{"abort":true}}'
+```
+
 ### Burn pipeline corre verde pero `outcome=failed` ("HPA no escaló")
 
 **Síntoma**: `<app>-burn-<env>-XXXXX` termina Succeeded pero el result `outcome` dice `failed` y `max-replicas` queda igual a `baseline-replicas`.

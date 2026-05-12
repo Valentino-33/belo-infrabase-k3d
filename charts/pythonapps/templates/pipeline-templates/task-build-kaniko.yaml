@@ -5,17 +5,37 @@ metadata:
   name: kaniko-build-push
   namespace: tekton-pipelines
 spec:
+  description: |
+    Stage 2 — Kaniko build + push a Docker Hub. La imagen sale del MISMO
+    commit que clonó Stage 1 — bit-exacta.
   params:
   - name: image
-    description: "imagen completa destino: docker.io/user/app:tag"
+    description: "Imagen destino: docker.io/user/app:tag"
     type: string
   - name: context
-    description: "subdirectorio del workspace donde está el Dockerfile"
+    description: "Subdirectorio del workspace donde está el Dockerfile (e.g. 'src')"
     default: "src"
     type: string
   workspaces:
   - name: source
+    description: "Workspace con el repo clonado (mismo PVC que Stage 1)"
   steps:
+  - name: announce
+    image: alpine:latest
+    script: |
+      #!/bin/sh
+      echo "================================================================"
+      echo "  STAGE 2 — kaniko-build-push"
+      echo "================================================================"
+      echo "  Image destino:  $(params.image)"
+      echo "  Build context:  $(workspaces.source.path)/$(params.context)"
+      echo "  Dockerfile:     $(workspaces.source.path)/$(params.context)/Dockerfile"
+      echo "  Build engine:   Kaniko (sin Docker daemon, root requerido)"
+      echo "  Cache:          enabled, TTL 24h"
+      echo "  Auth:           secret dockerhub-credentials montado en /kaniko/.docker"
+      echo "================================================================"
+      ls -la $(workspaces.source.path)/$(params.context)/ | head -20
+      echo "================================================================"
   - name: build-and-push
     image: gcr.io/kaniko-project/executor:latest
     env:

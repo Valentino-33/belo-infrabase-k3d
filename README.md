@@ -16,6 +16,7 @@ Para entender **qué hace cada stage del pipeline de release, cómo se garantiza
 
 ## Índice
 
+- [POC playbook end-to-end](#poc-playbook-end-to-end)
 - [Stack de tecnologías](#stack-de-tecnologías)
 - [Pre-requisitos](#pre-requisitos)
 - [Levantado desde cero](#levantado-desde-cero)
@@ -27,6 +28,108 @@ Para entender **qué hace cada stage del pipeline de release, cómo se garantiza
 - [Estructura del repo](#estructura-del-repo)
 - [Troubleshooting](#troubleshooting)
 - [Documentación adicional](#documentación-adicional)
+
+---
+
+## POC playbook end-to-end
+
+Flujo testeado para hacer la demo completa en una sesión. Asume cluster ya levantado (`make cluster-up`, secretos aplicados, `make bootstrap`).
+
+### Paso 0 — Sincronizar todo con la última versión del repo
+
+```bash
+git pull origin main
+make refresh   # re-aplica Tekton tasks/pipelines/triggers + dashboards + fluent-bit
+make pipeline-check   # verificar que los triggers github-tag-release y github-tag-burn están registrados
+```
+
+> Si `pipeline-check` no muestra los DOS triggers, algo del `make tekton-apply` no quedó aplicado. Volvé a correr `make tekton-apply`.
+
+### Paso 1 — Demo BlueGreen (api01)
+
+Desde el repo `webserver-api01`:
+
+```bash
+cd /ruta/a/webserver-api01
+git pull origin main
+# Bumpear la version local SOLO en una rama de prueba o como tag
+git tag release/v0.6.0/dev
+git push origin release/v0.6.0/dev
+```
+
+**Mientras corre**, abrí 3 cosas:
+- Tekton Dashboard: http://tekton.localhost:8888/#/namespaces/tekton-pipelines/pipelineruns/webserver-api01-pipelinerun-v0.6.0 — ver tree view de las 6 stages
+- Rollout en vivo: `kubectl argo rollouts get rollout webserver-api01-dev -n webserver-api01-dev --watch`
+- Grafana dashboard "webserver-api01 — request, latency, HPA": http://grafana.localhost:8888/d/belo-api01
+
+**Resultado esperado** (~3 min):
+- Stage 4 lleva el Rollout a `Paused` con 2 pods stable (blue) + 2 pods preview (green)
+- Stage 5 corre 1000 VUs contra preview. HPA puede escalar a 3-4 replicas
+- Stage 6 patchea `pauseConditions=null` → switchover blue → green
+- 30s después blue scale-down → solo green sirve
+- `curl http://api01.localhost:8888/api01/version` devuelve v0.6.0
+
+### Paso 2 — Demo Canary (api02)
+
+Desde el repo `webserver-api02`:
+
+```bash
+cd /ruta/a/webserver-api02
+git pull origin main
+git tag release/v0.6.0/dev
+git push origin release/v0.6.0/dev
+```
+
+**Mientras corre**:
+- Tekton Dashboard
+- Rollout: `kubectl argo rollouts get rollout webserver-api02-dev -n webserver-api02-dev --watch`
+- Mostrar el split de tráfico: `for i in $(seq 1 30); do curl -s http://api02.localhost:8888/api02/version | jq -r .version; done | sort | uniq -c`
+
+**Resultado esperado**:
+- Rollout sube canary a 5% → pausa → 25% → pausa → 50% → pausa
+- Stage 5 corre k6 contra stable (que tiene el split de tráfico) — algunos requests caen en canary, otros en stable
+- Stage 6 patchea `promoteFull=true` → canary va a 100%
+
+### Paso 3 — Burn pipeline (HPA capacity test)
+
+Después de los releases, validar que el HPA funciona bajo carga:
+
+```bash
+# Vía tag (webhook):
+cd /ruta/a/webserver-api01
+git tag burn/dev
+git push origin burn/dev
+
+# O manual sin webhook:
+make burn-test APP=webserver-api01 ENV=dev
+```
+
+**Mientras corre** (180s):
+- Observar HPA: `kubectl get hpa webserver-api01-dev -n webserver-api01-dev -w`
+- Logs del pipeline: `tkn pipelinerun logs -n tekton-pipelines -l pipeline=burn --last -f`
+- Grafana panel "HPA replicas (current vs desired)"
+
+**Resultado esperado**: HPA escala de 2 → 3-4 replicas. El PipelineRun termina con `outcome=passed`.
+
+### Paso 4 — Mostrar observabilidad
+
+- **Kibana** (http://kibana.localhost:8888): crear index pattern `k8s-*`, Discover → query `kubernetes.namespace_name : "webserver-api01-dev" and path : "/api01/hello"` → ver requests reales del load test en JSON.
+- **Grafana**: dashboards `belo-api01`, `belo-api02`, `belo-pipeline`. Mostrar p95/p99, HPA scale events, Tekton TaskRun durations.
+
+### Paso 5 — Mostrar rollback automático (opcional, si hay tiempo)
+
+Pushear un tag a una versión con bug intencional:
+
+```bash
+# En el repo de la app, romper algo (e.g. comentar el endpoint /api01/health)
+# Commit, push, tag:
+git tag release/v0.6.1/dev
+git push origin release/v0.6.1/dev
+```
+
+El probe falla → Stage 4 timeout (rollout no llega a Paused saludable) o Stage 5 falla con thresholds → Stage 6 aborta → stable queda intacto sirviendo v0.6.0.
+
+---
 
 ---
 

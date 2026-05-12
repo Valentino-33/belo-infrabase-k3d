@@ -222,10 +222,59 @@ refresh: tekton-apply dashboards-apply  ## Re-aplicar Tekton + dashboards sobre 
 	  --namespace logging \
 	  --values $(ROOT_DIR)helm/addons/fluent-bit/values.yaml \
 	  --wait --timeout 2m 2>/dev/null || echo "  (fluent-bit no instalado o helm repo no agregado — saltando)"
-	@echo "$(GREEN)✓ Cluster actualizado. ArgoCD auto-sincroniza cambios en charts/pythonapps/apps/.$(NC)"
-	@echo "$(YELLOW)Si querés forzar el sync de las apps en lugar de esperar el polling:$(NC)"
-	@echo "  kubectl annotate app webserver-api01-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite"
-	@echo "  kubectl annotate app webserver-api02-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite"
+	@echo "$(YELLOW)→ Forzando sync de las apps en ArgoCD...$(NC)"
+	@kubectl annotate app webserver-api01-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite 2>/dev/null || true
+	@kubectl annotate app webserver-api02-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite 2>/dev/null || true
+	@echo "$(GREEN)✓ Cluster actualizado.$(NC)"
+	@echo "$(YELLOW)Verificá con:$(NC)"
+	@echo "  make pipeline-check   → estado de Tekton (EventListener triggers, tasks, pipelines)"
+	@echo "  make rollout-status APP=webserver-api01 ENV=dev"
+
+.PHONY: pipeline-check
+pipeline-check:  ## Diagnóstico: muestra triggers, tasks, pipelines y estado del EventListener
+	@echo "$(YELLOW)========== Pipelines registrados ==========$(NC)"
+	@kubectl get pipelines -n tekton-pipelines 2>/dev/null || echo "(no pipelines)"
+	@echo ""
+	@echo "$(YELLOW)========== Tasks registrados ==========$(NC)"
+	@kubectl get tasks -n tekton-pipelines 2>/dev/null || echo "(no tasks)"
+	@echo ""
+	@echo "$(YELLOW)========== TriggerBindings ==========$(NC)"
+	@kubectl get triggerbindings -n tekton-pipelines 2>/dev/null || echo "(no bindings)"
+	@echo ""
+	@echo "$(YELLOW)========== TriggerTemplates ==========$(NC)"
+	@kubectl get triggertemplates -n tekton-pipelines 2>/dev/null || echo "(no templates)"
+	@echo ""
+	@echo "$(YELLOW)========== EventListener triggers ==========$(NC)"
+	@kubectl get eventlistener github-tag-listener -n tekton-pipelines \
+	  -o jsonpath='{range .spec.triggers[*]}  - {.name}: bindings={.bindings[*].ref} template={.template.ref}{"\n"}{end}' 2>/dev/null \
+	  || echo "(EventListener no existe — correr make tekton-apply)"
+	@echo ""
+	@echo "$(YELLOW)========== EventListener pod ==========$(NC)"
+	@kubectl get pods -n tekton-pipelines -l eventlistener=github-tag-listener 2>/dev/null
+	@echo ""
+	@echo "$(YELLOW)========== Últimos PipelineRuns (top 10) ==========$(NC)"
+	@kubectl get pipelineruns -n tekton-pipelines --sort-by='.metadata.creationTimestamp' 2>/dev/null | tail -11 || true
+	@echo ""
+	@echo "$(GREEN)Si NO ves los triggers `github-tag-release` y `github-tag-burn` arriba,$(NC)"
+	@echo "$(GREEN)correr: make tekton-apply$(NC)"
+
+.PHONY: burn-check
+burn-check:  ## Diagnóstico específico del burn pipeline + tags burn/<env>
+	@echo "$(YELLOW)========== Burn pipeline ==========$(NC)"
+	@kubectl get pipeline pythonapps-burn-pipeline -n tekton-pipelines 2>/dev/null || echo "✗ pythonapps-burn-pipeline NO existe — correr make tekton-apply"
+	@echo ""
+	@echo "$(YELLOW)========== Trigger burn ==========$(NC)"
+	@kubectl get triggertemplate pythonapps-burn-trigger-template -n tekton-pipelines 2>/dev/null || echo "✗ trigger template falta"
+	@kubectl get triggerbinding github-burn-binding -n tekton-pipelines 2>/dev/null || echo "✗ trigger binding falta"
+	@echo ""
+	@echo "$(YELLOW)========== EventListener — trigger 'github-tag-burn' ==========$(NC)"
+	@kubectl get eventlistener github-tag-listener -n tekton-pipelines -o jsonpath='{.spec.triggers[?(@.name=="github-tag-burn")]}' 2>/dev/null | head -c 200 && echo "" || echo "✗ trigger 'github-tag-burn' NO está en el EventListener"
+	@echo ""
+	@echo "$(YELLOW)========== Últimos burn PipelineRuns ==========$(NC)"
+	@kubectl get pipelinerun -n tekton-pipelines -l pipeline=burn --sort-by='.metadata.creationTimestamp' 2>/dev/null | tail -6 || echo "(ninguno aún)"
+	@echo ""
+	@echo "$(YELLOW)========== Últimos logs del EventListener ==========$(NC)"
+	@kubectl logs -n tekton-pipelines -l eventlistener=github-tag-listener --tail=20 2>/dev/null | head -50 || true
 	@echo ""
 	@echo "ArgoCD sincronizará gitops/ → crea webserver-api01-dev y webserver-api02-dev"
 	@echo "Monitoreá en: http://argocd.localhost:8888  (user: admin)"

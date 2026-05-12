@@ -5,6 +5,10 @@ metadata:
   name: run-load-test
   namespace: tekton-pipelines
 spec:
+  description: |
+    Stage 5 — k6 load test contra preview svc (BG/Canary) o stable svc
+    (RollingUpdate). El script viene del repo de la app (Stage 1 lo clonó).
+    Emite outcome=passed|failed para que Stage 6 decida promote vs abort.
   params:
   - name: app-name
     type: string
@@ -14,10 +18,10 @@ spec:
   - name: strategy
     type: string
     default: ""
-    description: "Auto-detected by wait-argocd — bluegreen, canary, or rollingupdate"
+    description: "Auto-detectada por wait-argocd"
   results:
   - name: outcome
-    description: "passed or failed"
+    description: "passed o failed"
   workspaces:
   - name: source
   stepTemplate:
@@ -41,12 +45,9 @@ spec:
       PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
       STRATEGY="$(params.strategy)"
-      # namespace y nombre de release = app-name + env
       NS="${APP}-${PRIMARY_ENV}"
       RELEASE="${APP}-${PRIMARY_ENV}"
-      echo "=== Load test: $APP env=$PRIMARY_ENV strategy=$STRATEGY ==="
 
-      # service port es siempre 8080 (service.yaml lo define fijo)
       BASE_URL="http://${RELEASE}-stable.${NS}.svc.cluster.local:8080"
       PREVIEW_URL="http://${RELEASE}-preview.${NS}.svc.cluster.local:8080"
 
@@ -54,38 +55,70 @@ spec:
         bluegreen)
           SCRIPT="load-bluegreen.js"
           EXTRA="-e PREVIEW_URL=$PREVIEW_URL"
+          TARGET_DESC="PREVIEW svc → green RS (versión nueva, sin tráfico real)"
+          TARGET_URL="$PREVIEW_URL"
           ;;
         canary)
           SCRIPT="load-canary.js"
           EXTRA="-e BASE_URL=$BASE_URL"
+          TARGET_DESC="STABLE svc con traffic split → mezcla stable + canary"
+          TARGET_URL="$BASE_URL"
           ;;
         *)
           SCRIPT="smoke.js"
           EXTRA="-e BASE_URL=$BASE_URL"
+          TARGET_DESC="STABLE svc → RollingUpdate ya completó"
+          TARGET_URL="$BASE_URL"
           ;;
       esac
 
-      # Los scripts de k6 viven en el REPO DE LA APP (single source of truth).
-      # El Stage 1 (clone) los deposita en /workspace/source/src/loadtest/.
       SCRIPT_PATH="$(workspaces.source.path)/src/loadtest/$SCRIPT"
+
+      echo "================================================================"
+      echo "  STAGE 5 — run-load-test"
+      echo "================================================================"
+      echo "  App:        $APP"
+      echo "  Env:        $PRIMARY_ENV"
+      echo "  Namespace:  $NS"
+      echo "  Strategy:   $STRATEGY"
+      echo "  Script:     $SCRIPT (en $SCRIPT_PATH)"
+      echo "  Target:     $TARGET_DESC"
+      echo "  Target URL: $TARGET_URL"
+      echo "  Tool:       k6 (in-cluster, grafana/k6:latest)"
+      echo "================================================================"
+
       if [ ! -f "$SCRIPT_PATH" ]; then
         # FAIL FAST — no permitimos pipelines verdes sin haber testeado.
-        # Causa más probable: el repo de la app cambió de strategy pero no
-        # tiene el script correspondiente (e.g., api01 pasó de bluegreen a
-        # canary pero no agregaron loadtest/load-canary.js).
-        echo "ERROR: $SCRIPT_PATH no encontrado en el repo de la app."
-        echo "       strategy=$STRATEGY requiere el script: $SCRIPT"
-        echo "       Agregalo al repo de la app en loadtest/$SCRIPT y re-disparar."
+        echo "  ✗ ERROR: $SCRIPT_PATH NO ENCONTRADO"
+        echo ""
+        echo "  Causa probable: el chart Helm declara strategy=$STRATEGY"
+        echo "  pero el repo de la app no tiene loadtest/$SCRIPT"
+        echo ""
+        echo "  Solución: agregar $SCRIPT al repo de la app y re-disparar."
         printf "failed" > "$(results.outcome.path)"
         exit 1
       fi
 
+      echo "→ Ejecutando: k6 run $EXTRA $SCRIPT_PATH"
+      echo "================================================================"
+
       OUTCOME="passed"
       if ! k6 run $EXTRA "$SCRIPT_PATH"; then
         OUTCOME="failed"
-        echo "=== Load test FAILED ==="
+        echo ""
+        echo "================================================================"
+        echo "  ✗ Stage 5 FAILED — k6 thresholds no se cumplieron"
+        echo "================================================================"
+        echo "  Stage 6 va a ejecutar ABORT (kubectl patch spec.abort=true)"
+        echo "  El RS nuevo será destruido; stable queda intacto."
+        echo "================================================================"
       else
-        echo "=== Load test PASSED ==="
+        echo ""
+        echo "================================================================"
+        echo "  ✓ Stage 5 PASSED — k6 thresholds OK"
+        echo "================================================================"
+        echo "  Stage 6 va a ejecutar PROMOTE para strategy=$STRATEGY"
+        echo "================================================================"
       fi
       printf "%s" "$OUTCOME" > "$(results.outcome.path)"
 {{- end }}

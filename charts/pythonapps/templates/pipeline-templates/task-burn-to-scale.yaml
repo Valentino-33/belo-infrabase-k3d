@@ -1,9 +1,10 @@
 {{- if .Values.tekton.enabled }}
-# Burn-to-scale: valida que el HPA escala el Rollout cuando el CPU sustained
-# supera targetCPUUtilizationPercentage. Corre k6 como sidecar (carga
-# continua) mientras el step principal hace polling del replica count.
-# Condición de éxito: replicas > baseline al menos una vez dentro de la
-# ventana de monitoreo.
+# Burn-to-scale — usado por pythonapps-burn-pipeline (pipeline aparte del
+# release, on-demand). Valida HPA scale-up bajo carga sostenida.
+#
+# Diseño: sidecar k6 quema CPU contra el stable svc; el step principal
+# kubectl monitorea rollout.status.replicas cada 10s durante 180s.
+# outcome=passed si MAX_REPLICAS > BASELINE en cualquier momento.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -11,9 +12,7 @@ metadata:
   namespace: tekton-pipelines
 spec:
   description: |
-    Valida HPA scale-up bajo carga sostenida. Sidecar k6 quema CPU contra
-    el stable service; el step principal monitorea replicas vía kubectl y
-    marca outcome=passed si vio scale-up dentro del timeout.
+    Burn pipeline (HPA capacity test). Sidecar k6 + step kubectl polling.
   params:
   - name: app-name
     type: string
@@ -23,21 +22,17 @@ spec:
   - name: strategy
     type: string
     default: ""
+    description: "No usado por el Task — siempre targetea stable svc"
   - name: monitor-timeout-seconds
     type: string
     default: "180"
-    description: "Ventana total de monitoreo (incluye warmup + sustained)."
   results:
   - name: outcome
-    description: "passed (scale-up detectado) o failed (replicas nunca subieron)"
+    description: "passed | failed | skipped (production)"
   - name: baseline-replicas
-    description: "Replicas observadas al inicio del burn"
   - name: max-replicas
-    description: "Máximo de replicas observado durante el burn"
   workspaces:
   - name: source
-  # Carga generada en paralelo a la observación. El sidecar arranca con el
-  # TaskRun y queda corriendo hasta que el step principal termina.
   sidecars:
   - name: loadgen
     image: grafana/k6:latest
@@ -55,32 +50,37 @@ spec:
       value: /tekton/home
     script: |
       #!/bin/sh
-      # Esperar a que el step principal arranque y capture baseline antes
-      # de empezar a generar carga.
+      # Sleep inicial para que el step principal capture baseline ANTES de
+      # generar carga.
       sleep 10
 
       PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
       NS="${APP}-${PRIMARY_ENV}"
       RELEASE="${APP}-${PRIMARY_ENV}"
-      # Apuntamos al STABLE service: cuando este Task corre (Stage 7) la
-      # nueva versión ya fue promovida → stable es la versión bajo prueba.
       TARGET_URL="http://${RELEASE}-stable.${NS}.svc.cluster.local:8080"
       SCRIPT_PATH="$(workspaces.source.path)/src/loadtest/burn-to-scale.js"
 
+      echo "================================================================"
+      echo "  BURN sidecar — k6 loadgen"
+      echo "================================================================"
+      echo "  Target URL:   $TARGET_URL (stable svc)"
+      echo "  Script:       $SCRIPT_PATH"
+      echo "  Profile:      200 VUs sostenidos por 120s sin sleep"
+      echo "================================================================"
+
       if [ ! -f "$SCRIPT_PATH" ]; then
-        echo "ERROR: $SCRIPT_PATH no existe en el repo de la app."
-        echo "       Agregar loadtest/burn-to-scale.js al repo de la app."
+        echo "  ✗ ERROR: $SCRIPT_PATH no existe en el repo de la app."
+        echo "    Agregar loadtest/burn-to-scale.js."
         exit 1
       fi
 
-      echo "=== Sidecar loadgen: k6 burn contra $TARGET_URL ==="
-      # No thresholds en k6: este test es de capacidad, no de latencia.
-      # El éxito o falla lo decide el step principal según replicas.
+      echo "→ Lanzando k6..."
       k6 run -e TARGET_URL="$TARGET_URL" "$SCRIPT_PATH" || true
-      echo "=== Sidecar loadgen: k6 finalizado ==="
-      # Mantener el sidecar vivo hasta que el step termine para que Tekton
-      # no lo marque como Error.
+      echo "  ✓ k6 burn finalizado"
+
+      # Mantener vivo hasta que el step principal termine
+      # (Tekton mata el sidecar cuando el último step exit).
       sleep 600
   stepTemplate:
     env:
@@ -108,19 +108,27 @@ spec:
       HPA="${APP}-${PRIMARY_ENV}"
       TIMEOUT=$(params.monitor-timeout-seconds)
 
-      # Producción no se quema: el Task termina ok sin tocar nada.
+      echo "================================================================"
+      echo "  BURN — monitor-hpa step"
+      echo "================================================================"
+      echo "  Rollout:    $ROLLOUT"
+      echo "  HPA:        $HPA"
+      echo "  Namespace:  $NS"
+      echo "  Timeout:    ${TIMEOUT}s"
+      echo "  Success:    max_replicas > baseline_replicas"
+      echo "================================================================"
+
       if [ "$PRIMARY_ENV" = "production" ]; then
-        echo "PRODUCTION: burn-to-scale skipped."
+        echo "  ⚠ PRODUCTION env — saltando burn (no quemamos CPU productiva)"
         printf "skipped" > "$(results.outcome.path)"
         printf "0" > "$(results.baseline-replicas.path)"
         printf "0" > "$(results.max-replicas.path)"
         exit 0
       fi
 
-      # Verificación previa: si no hay HPA, el test no aplica.
       if ! kubectl get hpa "$HPA" -n "$NS" >/dev/null 2>&1; then
-        echo "WARN: HPA $HPA no existe en $NS. Habilita hpa.enabled en values.yaml."
-        echo "       Marcando como failed para que el equipo lo arregle."
+        echo "  ✗ HPA $HPA NO EXISTE en $NS"
+        echo "    Habilitar hpa.enabled=true en charts/pythonapps/apps/$APP/$PRIMARY_ENV/values.yaml"
         printf "failed" > "$(results.outcome.path)"
         printf "0" > "$(results.baseline-replicas.path)"
         printf "0" > "$(results.max-replicas.path)"
@@ -140,9 +148,17 @@ spec:
       BASELINE=$(get_replicas)
       [ -z "$BASELINE" ] && BASELINE=1
       printf "%s" "$BASELINE" > "$(results.baseline-replicas.path)"
-      echo "=== Burn-to-scale: rollout=$ROLLOUT ns=$NS baseline=$BASELINE timeout=${TIMEOUT}s ==="
-      echo "    HPA target: $(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.metrics[0].resource.target.averageUtilization}')% CPU"
-      echo "    HPA range:  $(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.minReplicas}')..$(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.maxReplicas}')"
+
+      HPA_TARGET=$(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.metrics[0].resource.target.averageUtilization}')
+      HPA_MIN=$(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.minReplicas}')
+      HPA_MAX=$(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.maxReplicas}')
+
+      echo "  Baseline replicas: $BASELINE"
+      echo "  HPA target CPU:    ${HPA_TARGET}%"
+      echo "  HPA min/max:       $HPA_MIN..$HPA_MAX"
+      echo "→ Sidecar k6 va a empezar a generar carga en ~10s"
+      echo "→ Polling cada 10s durante ${TIMEOUT}s..."
+      echo "================================================================"
 
       MAX_SEEN=$BASELINE
       ELAPSED=0
@@ -163,11 +179,19 @@ spec:
       done
 
       printf "%s" "$MAX_SEEN" > "$(results.max-replicas.path)"
+
+      echo ""
+      echo "================================================================"
       if [ "$SCALED" = "1" ]; then
-        echo "=== PASSED: HPA escaló $BASELINE → $MAX_SEEN replicas ==="
+        echo "  ✓ BURN PASSED — HPA escaló $BASELINE → $MAX_SEEN replicas"
         printf "passed" > "$(results.outcome.path)"
       else
-        echo "=== FAILED: replicas nunca subieron de $BASELINE (CPU no alcanzó target) ==="
+        echo "  ✗ BURN FAILED — replicas nunca subieron de $BASELINE"
+        echo "    Posibles causas:"
+        echo "      - CPU no alcanzó el target ${HPA_TARGET}% (carga insuficiente)"
+        echo "      - HPA min/max muy restrictivo"
+        echo "      - Cluster sin capacidad para nuevos pods"
         printf "failed" > "$(results.outcome.path)"
       fi
+      echo "================================================================"
 {{- end }}

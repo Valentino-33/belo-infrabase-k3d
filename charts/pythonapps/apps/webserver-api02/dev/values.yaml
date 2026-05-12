@@ -3,14 +3,17 @@ app:
   namespace: "webserver-api02-dev"
 
 image:
-  repository: docker.io/valentinobruno/api02
+  repository: docker.io/valentinobruno/webserver-api02
   tag: "latest"
   pullPolicy: IfNotPresent
 
 rollout:
   strategy: canary
 
-replicas: 1
+# minReplicas 2 a propósito: el load test de 1000 VUs satura 1 pod (300m CPU
+# limit) antes de que HPA reaccione → 5xx mientras escala. Arrancar con 2
+# pods da capacidad de baseline; HPA escala desde ahí si hace falta.
+replicas: 2
 
 ports:
   containerPort: 8000
@@ -23,9 +26,10 @@ resources:
     cpu: "300m"
     memory: "256Mi"
 
+# Probes apuntan a /api02/health — el código de api02 NO expone /health a la raíz.
 livenessProbe:
   httpGet:
-    path: /health
+    path: /api02/health
     port: 8000
   initialDelaySeconds: 10
   periodSeconds: 10
@@ -33,7 +37,7 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /health
+    path: /api02/health
     port: 8000
   initialDelaySeconds: 5
   periodSeconds: 5
@@ -41,7 +45,7 @@ readinessProbe:
 
 hpa:
   enabled: true
-  minReplicas: 1
+  minReplicas: 2
   maxReplicas: 5
   targetCPUUtilizationPercentage: 70
 
@@ -49,8 +53,8 @@ ingress:
   enabled: true
   hostname: api02.localhost
   ingressClassName: nginx
-  annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
+  # Sin rewrite-target — la app tiene rutas explícitas bajo /api02/*.
+  annotations: {}
 
 serviceMonitor:
   enabled: true

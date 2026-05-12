@@ -5,14 +5,21 @@ metadata:
   name: git-clone-app
   namespace: tekton-pipelines
 spec:
+  description: |
+    Stage 1 — clona el repo de la app exactamente en la ref del tag al
+    workspace `output`. Stages siguientes (build, load-test, burn) leen
+    archivos desde acá.
   params:
   - name: url
     type: string
+    description: "URL del repo a clonar (e.g. https://github.com/org/webserver-api01)"
   - name: revision
     type: string
     default: main
+    description: "Ref a clonar — el TriggerBinding pasa refs/tags/<formato> del webhook"
   workspaces:
   - name: output
+    description: "Workspace destino — se monta como /workspace/output. Clonamos en output/src/"
   stepTemplate:
     env:
     - name: HOME
@@ -33,11 +40,38 @@ spec:
       #!/bin/sh
       set -e
       DEST="$(workspaces.output.path)/src"
+
+      echo "================================================================"
+      echo "  STAGE 1 — git-clone-app"
+      echo "================================================================"
+      echo "  Repo URL:    $(params.url)"
+      echo "  Revision:    $(params.revision)"
+      echo "  Destino:     $DEST"
+      echo "  Image:       alpine/git:latest"
+      echo "  Run as UID:  $(id -u) (nonroot)"
+      echo "================================================================"
+
+      # Algunos servidores no permiten clone --depth 1 --branch <tag-ref>
+      # directamente para tag refs con / adentro. El flujo clone → fetch →
+      # checkout funciona universalmente.
+      echo "→ Clonando shallow (--depth 1)..."
       git clone --depth 1 "$(params.url)" "$DEST" 2>/dev/null || true
       cd "$DEST"
+
+      echo "→ Fetcheando ref específico: $(params.revision)..."
       git fetch --depth 1 origin "$(params.revision)" 2>/dev/null || \
         git fetch origin "$(params.revision)"
+
+      echo "→ Checkout en la ref..."
       git checkout "$(params.revision)"
-      echo "Clonado OK: $(params.url) @ $(params.revision)"
-      ls -la "$DEST"
+
+      echo ""
+      echo "================================================================"
+      echo "  ✓ Clone OK"
+      echo "================================================================"
+      echo "  Commit SHA:       $(git rev-parse HEAD)"
+      echo "  Branch/Tag:       $(git describe --all --always)"
+      echo "  Archivos en raíz: $(ls -1 | tr '\n' ' ')"
+      echo "  loadtest/:        $(ls -1 loadtest/ 2>/dev/null | tr '\n' ' ' || echo '(no existe)')"
+      echo "================================================================"
 {{- end }}

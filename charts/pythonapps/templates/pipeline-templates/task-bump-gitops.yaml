@@ -5,6 +5,11 @@ metadata:
   name: bump-gitops-image
   namespace: tekton-pipelines
 spec:
+  description: |
+    Stage 3 — clona el gitops repo, escribe image.tag en values.yaml de
+    cada env del param `environments`, commitea y pushea. Emite el SHA
+    del commit como result `commit-sha` (Stage 4 lo usa para verificar
+    que ArgoCD aplicó ESTE commit y no uno más viejo — race condition fix).
   params:
   - name: gitops-repo-url
     type: string
@@ -26,7 +31,7 @@ spec:
   - name: gitops
   results:
   - name: commit-sha
-    description: "Full SHA of the bump commit (empty string if no changes)"
+    description: "Full SHA of the bump commit (empty if no changes)"
   volumes:
   - name: git-token
     secret:
@@ -57,10 +62,23 @@ spec:
     script: |
       #!/bin/sh
       set -e
+      echo "================================================================"
+      echo "  STAGE 3 — bump-gitops-image"
+      echo "================================================================"
+      echo "  Gitops repo:  $(params.gitops-repo-url)"
+      echo "  App:          $(params.app-name)"
+      echo "  Image tag:    $(params.image-tag)"
+      echo "  Environments: $(params.environments)"
+      echo "  Git user:     $(params.git-user-name) <$(params.git-user-email)>"
+      echo "================================================================"
+      echo "→ Clonando gitops repo (con token autenticado)..."
+
+      # tr -d '[:space:]' cubre \n, \r, tab, vertical tab — algunos secrets
+      # se crean con trailing newline que rompe la URL.
       TOKEN=$(tr -d '[:space:]' < /workspace/git-token/token)
       AUTH_URL=$(echo "$(params.gitops-repo-url)" | sed "s|https://|https://x-access-token:${TOKEN}@|")
       git clone "$AUTH_URL" "$(workspaces.gitops.path)/gitops"
-      echo "Gitops clonado"
+      echo "  ✓ Gitops clonado en $(workspaces.gitops.path)/gitops"
 
   - name: bump-all-envs
     image: mikefarah/yq:latest
@@ -74,16 +92,19 @@ spec:
     script: |
       #!/bin/sh
       set -e
-      # Split comma-separated environments and update each values file
+      echo "→ Actualizando image.tag en cada env..."
       echo "$ENVIRONMENTS" | tr ',' '\n' | while read ENV; do
         ENV=$(echo "$ENV" | tr -d ' ')
         VALUES_FILE="$(workspaces.gitops.path)/gitops/charts/pythonapps/apps/${APP_NAME}/${ENV}/values.yaml"
         if [ ! -f "$VALUES_FILE" ]; then
-          echo "WARN: $VALUES_FILE no encontrado — skipping env=$ENV"
+          echo "  ⚠ WARN: $VALUES_FILE no existe — skip env=$ENV"
           continue
         fi
+        OLD_TAG=$(yq e '.image.tag' "$VALUES_FILE")
+        # strenv (no env) — strenv interpreta el valor como string siempre.
+        # Sin esto, v0.4.0 se interpretaría como flotante → serializa "0.4".
         yq e '.image.tag = strenv(IMAGE_TAG)' -i "$VALUES_FILE"
-        echo "Bump OK: $APP_NAME/$ENV → image.tag=$IMAGE_TAG"
+        echo "  ✓ $APP_NAME/$ENV: image.tag $OLD_TAG → $IMAGE_TAG"
       done
 
   - name: commit-and-push
@@ -100,18 +121,36 @@ spec:
       git config user.name "$(params.git-user-name)"
       git config user.email "$(params.git-user-email)"
       git add .
+
+      echo "→ Verificando si hay cambios para commitear..."
       if git diff --staged --quiet; then
-        echo "Sin cambios que commitear"
+        echo "  ⚠ Sin cambios — image.tag ya estaba en $(params.image-tag)"
         printf "" > "$(results.commit-sha.path)"
+        echo "================================================================"
+        echo "  Stage 3 termina con commit-sha vacío. Stage 4 lo manejará."
+        echo "================================================================"
         exit 0
       fi
+
       ENVS_LABEL=$(echo "$(params.environments)" | tr ',' '+')
+      echo "→ Commiteando: 'bump $(params.app-name) a $(params.image-tag) en [${ENVS_LABEL}]'"
       git commit -m "bump $(params.app-name) a $(params.image-tag) en [${ENVS_LABEL}]"
-      # Compute push URL from the pristine pipeline param to avoid doubling
-      # the token (origin remote already contains auth from the clone step).
+
+      # IMPORTANTE: usar pristine URL para evitar tokens dobles (clone-gitops
+      # ya dejó el remote con el token embebido).
       PUSH_URL=$(echo "$(params.gitops-repo-url)" | sed "s|https://|https://x-access-token:${TOKEN}@|")
+      echo "→ Pusheando a $(params.gitops-repo-url) main..."
       git push "$PUSH_URL" main
+
       SHA=$(git rev-parse HEAD)
       printf "%s" "$SHA" > "$(results.commit-sha.path)"
-      echo "Commit SHA: $SHA"
+
+      echo ""
+      echo "================================================================"
+      echo "  ✓ Stage 3 OK"
+      echo "================================================================"
+      echo "  Commit SHA:   $SHA"
+      echo "  Branch:       main"
+      echo "  Result:       commit-sha=$SHA (Stage 4 lo va a esperar)"
+      echo "================================================================"
 {{- end }}

@@ -5,6 +5,11 @@ metadata:
   name: promote-or-rollback
   namespace: tekton-pipelines
 spec:
+  description: |
+    Stage 6 — dueño de la verdad del release. Patches directos al Rollout
+    según outcome + strategy. Sin plugin kubectl-argo-rollouts (los mismos
+    patches que el plugin emite internamente). Verifica transición a
+    Healthy (passed) o Degraded (failed).
   params:
   - name: app-name
     type: string
@@ -43,29 +48,41 @@ spec:
       STRATEGY="$(params.strategy)"
       OUTCOME="$(params.outcome)"
       TIMEOUT=180
-      echo "=== promote-or-rollback: rollout=$ROLLOUT ns=$NS strategy=$STRATEGY outcome=$OUTCOME ==="
 
-      # Production gate: no auto-promote — annotate the ArgoCD app and exit.
+      echo "================================================================"
+      echo "  STAGE 6 — promote-or-rollback"
+      echo "================================================================"
+      echo "  Rollout:    $ROLLOUT"
+      echo "  Namespace:  $NS"
+      echo "  Strategy:   $STRATEGY"
+      echo "  Outcome:    $OUTCOME (de Stage 5 load test)"
+      echo "  Phase target: Healthy (si passed) o Degraded (si failed)"
+      echo "  Timeout:    ${TIMEOUT}s"
+      echo "================================================================"
+
+      # Production gate: no auto-promote — annotate la ArgoCD app y salir.
       if [ "$PRIMARY_ENV" = "production" ]; then
+        echo "→ PRODUCTION GATE detectado — NO auto-promote."
         if [ "$OUTCOME" = "passed" ]; then
-          echo "PRODUCTION GATE: tests passed. Manual sync and promote required."
-          echo "  1. ArgoCD: sync ${APP}-production manually"
-          echo "  2. After Rollout is Paused: patch status.pauseConditions=null"
+          echo "  ✓ Tests PASSED. Annotation belo/pending-promote=true agregada."
+          echo "  Sync manual requerido: ArgoCD UI → ${APP}-production → SYNC"
           kubectl annotate application "${APP}-production" -n argocd \
             belo/pending-promote="true" \
             belo/promote-reason="load-test-passed" \
             --overwrite 2>/dev/null || true
         else
-          echo "PRODUCTION GATE: tests FAILED. Revert gitops values manually if needed."
+          echo "  ✗ Tests FAILED. Annotation belo/pending-promote=false."
           kubectl annotate application "${APP}-production" -n argocd \
             belo/pending-promote="false" \
             belo/promote-reason="load-test-failed" \
             --overwrite 2>/dev/null || true
         fi
+        echo "================================================================"
+        echo "  Stage 6 OK (production gate sin auto-action)"
+        echo "================================================================"
         exit 0
       fi
 
-      # wait_phase EXPECTED — block until rollout phase reaches EXPECTED (or timeout).
       wait_phase() {
         EXPECTED="$1"
         ELAPSED=0
@@ -73,57 +90,66 @@ spec:
           PHASE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
           ACTIVE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.blueGreen.activeSelector}' 2>/dev/null || echo "")
           STABLE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "")
-          echo "  [${ELAPSED}s] phase=$PHASE stableRS=$STABLE active=$ACTIVE (waiting for $EXPECTED)"
+          echo "  [${ELAPSED}s] phase=$PHASE stableRS=${STABLE:0:10} activeSelector=${ACTIVE:0:10} (esperando $EXPECTED)"
           [ "$PHASE" = "$EXPECTED" ] && return 0
           sleep 5
           ELAPSED=$((ELAPSED + 5))
         done
-        echo "ERROR: rollout $ROLLOUT did not reach phase=$EXPECTED in ${TIMEOUT}s (last phase=$PHASE)"
+        echo "  ✗ TIMEOUT: rollout $ROLLOUT no llegó a phase=$EXPECTED en ${TIMEOUT}s (último: $PHASE)"
         return 1
       }
 
-      # Implement the argo-rollouts plugin promote/abort actions via plain
-      # kubectl patches — same patches the plugin issues, no external binary
-      # download required. Patches sourced from:
-      # https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go
       case "$STRATEGY" in
         rollingupdate)
           if [ "$OUTCOME" = "failed" ]; then
-            echo "RollingUpdate: FAILED — aborting"
+            echo "→ RollingUpdate FAILED → kubectl patch spec.abort=true"
             kubectl patch rollout "$ROLLOUT" -n "$NS" --type=merge -p '{"spec":{"abort":true}}'
             wait_phase "Degraded" || exit 1
+            echo "  ✓ Rollout abortado, stable intacto"
           else
-            echo "RollingUpdate: PASSED — completes automatically"
+            echo "→ RollingUpdate PASSED → no-op (el RS nuevo ya es stable)"
             wait_phase "Healthy" || exit 1
+            echo "  ✓ Rollout Healthy"
           fi
           ;;
         bluegreen)
           if [ "$OUTCOME" = "failed" ]; then
-            echo "BlueGreen: FAILED — aborting (keeping stable blue)"
+            echo "→ BlueGreen FAILED → kubectl patch spec.abort=true"
+            echo "  Esto destruye el green RS, mantiene blue como stable (rollback efectivo)."
             kubectl patch rollout "$ROLLOUT" -n "$NS" --type=merge -p '{"spec":{"abort":true}}'
             wait_phase "Degraded" || exit 1
+            echo "  ✓ Green destruido, blue queda sirviendo"
           else
-            echo "BlueGreen: PASSED — clearing pauseConditions to promote green to stable"
+            echo "→ BlueGreen PASSED → patch status.pauseConditions=null"
+            echo "  Esto switchea el active svc del blue al green, blue scale-down 30s después."
             kubectl patch rollout "$ROLLOUT" -n "$NS" --subresource=status --type=merge \
               -p '{"status":{"pauseConditions":null}}'
             wait_phase "Healthy" || exit 1
+            echo "  ✓ Switchover completo — green ahora es stable"
           fi
           ;;
         canary)
           if [ "$OUTCOME" = "failed" ]; then
-            echo "Canary: FAILED — aborting"
+            echo "→ Canary FAILED → kubectl patch spec.abort=true"
             kubectl patch rollout "$ROLLOUT" -n "$NS" --type=merge -p '{"spec":{"abort":true}}'
             wait_phase "Degraded" || exit 1
+            echo "  ✓ Canary abortado, stable queda sirviendo"
           else
-            echo "Canary: PASSED — setting promoteFull=true to skip remaining steps"
+            echo "→ Canary PASSED → patch status.promoteFull=true"
+            echo "  Esto salta los steps restantes del canary y va directo a 100%."
             kubectl patch rollout "$ROLLOUT" -n "$NS" --subresource=status --type=merge \
               -p '{"status":{"promoteFull":true}}'
             wait_phase "Healthy" || exit 1
+            echo "  ✓ Canary 100% — ahora es stable"
           fi
           ;;
         *)
-          echo "WARN: unknown strategy '$STRATEGY' — no action taken"
+          echo "  ⚠ WARN: strategy desconocida '$STRATEGY' — no action"
           ;;
       esac
-      echo "=== Done ==="
+
+      echo ""
+      echo "================================================================"
+      echo "  ✓ Stage 6 OK"
+      echo "================================================================"
 {{- end }}
