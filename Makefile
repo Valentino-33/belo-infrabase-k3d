@@ -343,6 +343,15 @@ push:  ## Push a DockerHub: make push APP=webserver-api01 TAG=v0.1.0
 .PHONY: build-push
 build-push: build push  ## Build + push en un paso
 
+.PHONY: images-initial
+images-initial:  ## Build y push de ambas apps con tag latest (requerido antes de make bootstrap)
+	@echo "$(YELLOW)→ Build y push de imágenes iniciales...$(NC)"
+	docker build -t $(DOCKERHUB_USER)/api01:latest $(ROOT_DIR)apps/webserver-api01/
+	docker push $(DOCKERHUB_USER)/api01:latest
+	docker build -t $(DOCKERHUB_USER)/api02:latest $(ROOT_DIR)apps/webserver-api02/
+	docker push $(DOCKERHUB_USER)/api02:latest
+	@echo "$(GREEN)✓ Imágenes iniciales publicadas en Docker Hub$(NC)"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Acceso a UIs
 # ──────────────────────────────────────────────────────────────────────────────

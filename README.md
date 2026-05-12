@@ -56,45 +56,71 @@ Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD,
 >
 > **Windows**: después de instalar k3d con winget, reiniciá la terminal para que el PATH se actualice.
 > Si usás `make` desde Git Bash, todos los comandos de esta guía asumen Git Bash o WSL2.
+>
+> **Docker Desktop debe estar corriendo** antes de cualquier comando. Si `k3d cluster list` da error de conexión, abrí Docker Desktop y esperá a que esté activo.
+>
+> **Token de DockerHub**: creá un Access Token en hub.docker.com → Account Settings → Security (no uses la contraseña directamente).
 
 ---
 
 ## Levantado desde cero
+
+> **Antes de empezar**: asegurate de que Docker Desktop esté corriendo. Sin el daemon de Docker activo, k3d no puede crear el cluster.
 
 ```bash
 # 1. Clonar este repo
 git clone https://github.com/Valentino-33/belo-infrabase-k3d
 cd belo-infrabase-k3d
 
-# 2. Crear el cluster k3d e instalar todos los addons (~10 min)
+# 2. Crear el cluster k3d e instalar todos los addons (~10-15 min)
 make cluster-up
+```
 
+```bash
 # 3. Crear los secretos necesarios para el pipeline
 make secrets-apply \
   DOCKERHUB_USER=<tu-usuario-dockerhub> \
   DOCKERHUB_TOKEN=<tu-token-dockerhub> \
   GITHUB_TOKEN=<tu-personal-access-token>
+```
 
-# 4. Bootstrap: aplicar root Application de ArgoCD + manifests de Tekton
+```bash
+# 4. Publicar las imágenes iniciales en Docker Hub
+#    (ArgoCD las necesita para levantar los pods la primera vez)
+docker login -u <tu-usuario-dockerhub> --password-stdin <<< "<tu-token-dockerhub>"
+make images-initial DOCKERHUB_USER=<tu-usuario-dockerhub>
+```
+
+```bash
+# 5. Bootstrap: aplicar root Application de ArgoCD + manifests de Tekton
 make bootstrap
+```
 
-# 5. Ver el estado de todo
+```bash
+# 6. Verificar el estado (esperar ~2 min después del bootstrap)
 make cluster-status
 make cluster-info
 ```
 
-Después de `make bootstrap`, ArgoCD sincroniza las apps automáticamente. En ~2 minutos:
+Después de `make bootstrap`, ArgoCD sincroniza las apps automáticamente. En ~2 minutos todos los pods deben estar corriendo:
 
 ```bash
 kubectl -n argocd get applications
 # NAME                   SYNC STATUS   HEALTH STATUS
+# apps-of-apps           Synced        Healthy
 # gitops-core-dev        Synced        Healthy
 # webserver-api01-dev    Synced        Healthy
 # webserver-api02-dev    Synced        Healthy
+
+kubectl -n dev get pods
+# NAME                                   READY   STATUS    RESTARTS   AGE
+# webserver-api01-dev-xxx-xxx            1/1     Running   0          2m
+# webserver-api02-dev-xxx-xxx            1/1     Running   0          2m
 ```
 
-> **Atajo**: `make all` hace cluster-up + bootstrap en un solo comando, pero omite el paso de secretos.
-> Corré `make secrets-apply ...` antes de disparar el primer pipeline.
+> **Nota sobre Kibana**: el pod de Kibana puede tardar hasta 3-5 minutos en responder luego de que aparezca como `Running`. Es normal — el proceso de inicialización de Kibana 8.x es lento.
+
+> **Nota sobre `make all`**: hace `cluster-up + bootstrap` en un solo comando, pero **omite** el paso de secretos y el push de imágenes iniciales. Corré siempre los pasos 3 y 4 antes o las apps van a quedar en `ImagePullBackOff`.
 
 ---
 
@@ -327,6 +353,66 @@ belo-infrabase-k3d/
     ├── architecture.md                 ← Diagramas Mermaid de la arquitectura
     ├── demo-guide.md                   ← Guía paso a paso de cada estrategia
     └── webhook-setup.md               ← Configuración del webhook GitHub → Tekton
+```
+
+---
+
+## Troubleshooting
+
+### Pods en `ImagePullBackOff` al hacer bootstrap
+
+Las imágenes `<dockerhub-user>/api01:latest` y `api02:latest` deben existir en Docker Hub **antes** de que ArgoCD haga el primer sync. Si los pods arrancan en error:
+
+```bash
+# Verificar el error exacto
+kubectl -n dev describe pod <pod-name> | grep -A5 "Events:"
+
+# Solución: publicar las imágenes y forzar un retry
+make images-initial DOCKERHUB_USER=<tu-usuario>
+kubectl -n dev delete pod --all   # fuerza re-pull inmediato
+```
+
+### Kibana en `CrashLoopBackOff` o `OOMKilled`
+
+Kibana 8.x requiere al menos **1Gi de RAM**. Si el pod crashea:
+
+```bash
+# Ver el error exacto
+kubectl -n logging logs -l app=kibana --tail=20
+
+# Si dice "definition for this key is missing" con xpack.security.enabled:
+# Esa opción fue eliminada en Kibana 8.x — ya está corregida en helm/addons/kibana/values.yaml
+
+# Re-aplicar con los valores correctos
+helm upgrade --install kibana elastic/kibana \
+  --namespace logging \
+  --values helm/addons/kibana/values.yaml \
+  --no-hooks --timeout 6m
+```
+
+### ArgoCD muestra `OutOfSync` para las webserver apps
+
+Si ambas apps (api01-dev, api02-dev) muestran `SharedResourceWarning` o `OutOfSync`:
+
+```bash
+# Forzar refresh desde Git
+kubectl -n argocd annotate app webserver-api01-dev argocd.argoproj.io/refresh=normal --overwrite
+kubectl -n argocd annotate app webserver-api02-dev argocd.argoproj.io/refresh=normal --overwrite
+```
+
+Los recursos de Tekton (Tasks, Pipeline, EventListener) son gestionados exclusivamente por `make tekton-apply` y **no** por ArgoCD. Si los Tekton resources fueron prunados:
+
+```bash
+make tekton-apply
+```
+
+### EventListener no disponible (`MinimumReplicasUnavailable`)
+
+Normal durante el primer minuto después de `make tekton-apply`. Esperá 60 segundos y verificá:
+
+```bash
+kubectl -n tekton-pipelines get eventlisteners
+kubectl -n tekton-pipelines get pods | grep el-github
 ```
 
 ---
