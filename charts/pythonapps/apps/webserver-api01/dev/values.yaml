@@ -7,10 +7,10 @@ image:
   pullPolicy: IfNotPresent
 rollout:
   strategy: bluegreen
-# minReplicas 2 a propósito: el load test de 1000 VUs satura 1 pod (300m CPU
-# limit) antes de que HPA reaccione → 5xx mientras escala. Arrancar con 2
-# pods da capacidad de baseline; HPA escala desde ahí si hace falta.
-replicas: 2
+# replicas: 3 — el load test ramp hasta 500 VUs satura una BG paused con
+# 2/2 pods (preview overload). Con 3 baseline + 3 preview = 6 pods en BG
+# pause, c/u con limit 300m → 1.8 cores total. Maneja 500 VUs en preview.
+replicas: 3
 ports:
   containerPort: 8000
 resources:
