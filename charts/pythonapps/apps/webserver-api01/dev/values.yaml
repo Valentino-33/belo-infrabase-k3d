@@ -3,7 +3,7 @@ app:
   namespace: "webserver-api01-dev"
 image:
   repository: docker.io/valentinobruno/webserver-api01
-  tag: "latest"
+  tag: "v0.4.4"
   pullPolicy: IfNotPresent
 rollout:
   strategy: bluegreen
