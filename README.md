@@ -539,17 +539,11 @@ belo-infrabase-k3d/
 ├── Makefile                            ← Entrada principal (make help)
 ├── k3d/
 │   └── config.yaml                     ← Definición del cluster k3d (4 nodos)
-├── apps/                               ← copia del código fuente solo para referencia/build local
-│   ├── webserver-api01/
-│   │   ├── app/                        ← Código Python FastAPI
-│   │   ├── Dockerfile
-│   │   └── pyproject.toml
-│   └── webserver-api02/
-│       ├── app/
-│       ├── Dockerfile
-│       └── pyproject.toml
-│   ★ Los scripts de loadtest (k6) viven en el REPO REMOTO de cada app
-│     (loadtest/ en la raíz), no acá. El pipeline los clona en Stage 1.
+│   ★ El código de las apps NO vive en este repo. Single source of truth:
+│     - github.com/Valentino-33/webserver-api01 (loadtest/ + app/ + Dockerfile)
+│     - github.com/Valentino-33/webserver-api02 (loadtest/ + app/ + Dockerfile)
+│     `make images-initial` clona estos repos a /tmp y buildea desde ahí.
+│     `make build APP=...` también clona del repo externo.
 ├── charts/
 │   └── pythonapps/                     ← Helm chart maestro
 │       ├── templates/

@@ -1,0 +1,223 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-dev-cluster
+  namespace: monitoring
+  labels:
+    # El sidecar de kube-prometheus-stack lo auto-carga (config:
+    # sidecar.dashboards.enabled=true en helm/addons/kube-prometheus/values.yaml).
+    grafana_dashboard: "1"
+data:
+  dev-cluster.json: |
+    {
+      "title": "belo — DEV cluster overview (apps + nodes + pipeline)",
+      "uid": "belo-dev-cluster",
+      "schemaVersion": 36,
+      "version": 1,
+      "tags": ["belo-challenge", "dev", "overview"],
+      "timezone": "browser",
+      "time": { "from": "now-30m", "to": "now" },
+      "refresh": "15s",
+      "panels": [
+        {
+          "type": "row",
+          "title": "Apps de DEV — vista lado a lado",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+        },
+        {
+          "type": "stat",
+          "title": "api01 — replicas",
+          "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+          "targets": [{
+            "expr": "count(kube_pod_status_phase{namespace=\"webserver-api01-dev\", phase=\"Running\"} == 1)"
+          }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null }, { "color": "yellow", "value": 1 }, { "color": "green", "value": 2 }
+          ] } } }
+        },
+        {
+          "type": "stat",
+          "title": "api01 — RPS",
+          "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+          "targets": [{ "expr": "sum(rate(api01_requests_total[1m]))" }],
+          "fieldConfig": { "defaults": { "unit": "reqps" } }
+        },
+        {
+          "type": "stat",
+          "title": "api01 — error rate 5xx",
+          "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+          "targets": [{ "expr": "sum(rate(api01_requests_total{status_code=~\"5..\"}[1m]))" }],
+          "fieldConfig": { "defaults": { "unit": "reqps", "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "yellow", "value": 0.1 }, { "color": "red", "value": 1 }
+          ] } } }
+        },
+        {
+          "type": "stat",
+          "title": "api02 — replicas",
+          "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+          "targets": [{
+            "expr": "count(kube_pod_status_phase{namespace=\"webserver-api02-dev\", phase=\"Running\"} == 1)"
+          }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null }, { "color": "yellow", "value": 1 }, { "color": "green", "value": 2 }
+          ] } } }
+        },
+        {
+          "type": "stat",
+          "title": "api02 — RPS",
+          "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+          "targets": [{ "expr": "sum(rate(api02_requests_total[1m]))" }],
+          "fieldConfig": { "defaults": { "unit": "reqps" } }
+        },
+        {
+          "type": "stat",
+          "title": "api02 — error rate 5xx",
+          "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+          "targets": [{ "expr": "sum(rate(api02_requests_total{status_code=~\"5..\"}[1m]))" }],
+          "fieldConfig": { "defaults": { "unit": "reqps", "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "yellow", "value": 0.1 }, { "color": "red", "value": 1 }
+          ] } } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Latencia p95 — api01 vs api02",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 5 },
+          "targets": [
+            { "expr": "histogram_quantile(0.95, sum by (le) (rate(api01_request_duration_seconds_bucket[1m])))", "legendFormat": "api01 p95" },
+            { "expr": "histogram_quantile(0.95, sum by (le) (rate(api02_request_duration_seconds_bucket[1m])))", "legendFormat": "api02 p95" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Latencia p99 — api01 vs api02",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 5 },
+          "targets": [
+            { "expr": "histogram_quantile(0.99, sum by (le) (rate(api01_request_duration_seconds_bucket[1m])))", "legendFormat": "api01 p99" },
+            { "expr": "histogram_quantile(0.99, sum by (le) (rate(api02_request_duration_seconds_bucket[1m])))", "legendFormat": "api02 p99" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "type": "row",
+          "title": "HPA — autoscaling de DEV",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 }
+        },
+        {
+          "type": "timeseries",
+          "title": "HPA replicas — api01 (current/desired/target)",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
+          "targets": [
+            { "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"webserver-api01-dev\"}", "legendFormat": "current" },
+            { "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"webserver-api01-dev\"}", "legendFormat": "desired" },
+            { "expr": "kube_horizontalpodautoscaler_spec_max_replicas{namespace=\"webserver-api01-dev\"}", "legendFormat": "max" },
+            { "expr": "kube_horizontalpodautoscaler_spec_min_replicas{namespace=\"webserver-api01-dev\"}", "legendFormat": "min" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "HPA replicas — api02 (current/desired/target)",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
+          "targets": [
+            { "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"webserver-api02-dev\"}", "legendFormat": "current" },
+            { "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"webserver-api02-dev\"}", "legendFormat": "desired" },
+            { "expr": "kube_horizontalpodautoscaler_spec_max_replicas{namespace=\"webserver-api02-dev\"}", "legendFormat": "max" },
+            { "expr": "kube_horizontalpodautoscaler_spec_min_replicas{namespace=\"webserver-api02-dev\"}", "legendFormat": "min" }
+          ]
+        },
+        {
+          "type": "row",
+          "title": "Recursos — DEV namespaces",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 }
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU usage por pod — webserver-api01-dev",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+          "targets": [{
+            "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"webserver-api01-dev\", container!=\"\"}[1m]))",
+            "legendFormat": "{{pod}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU usage por pod — webserver-api02-dev",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+          "targets": [{
+            "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"webserver-api02-dev\", container!=\"\"}[1m]))",
+            "legendFormat": "{{pod}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Memory por pod — ambos namespaces DEV",
+          "gridPos": { "h": 7, "w": 24, "x": 0, "y": 28 },
+          "targets": [{
+            "expr": "sum by (namespace, pod) (container_memory_working_set_bytes{namespace=~\"webserver-api0(1|2)-dev\", container!=\"\"})",
+            "legendFormat": "{{namespace}} / {{pod}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "bytes" } }
+        },
+        {
+          "type": "row",
+          "title": "Nodos del cluster",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 }
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU usage por nodo",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 36 },
+          "targets": [{
+            "expr": "1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m]))",
+            "legendFormat": "{{instance}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Memoria usada por nodo (%)",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 36 },
+          "targets": [{
+            "expr": "1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+            "legendFormat": "{{instance}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 } }
+        },
+        {
+          "type": "row",
+          "title": "Tekton pipelines",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 }
+        },
+        {
+          "type": "stat",
+          "title": "PipelineRuns total",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 44 },
+          "targets": [{
+            "expr": "sum(tekton_pipelines_controller_pipelinerun_count)"
+          }]
+        },
+        {
+          "type": "stat",
+          "title": "TaskRuns fallidas",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 44 },
+          "targets": [{
+            "expr": "sum(tekton_pipelines_controller_taskrun_count{status=\"failed\"})"
+          }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }
+          ] } } }
+        },
+        {
+          "type": "timeseries",
+          "title": "TaskRun duration p95 por task",
+          "gridPos": { "h": 6, "w": 12, "x": 12, "y": 44 },
+          "targets": [{
+            "expr": "histogram_quantile(0.95, sum by (le, task) (rate(tekton_pipelines_controller_taskrun_duration_seconds_bucket[5m])))",
+            "legendFormat": "{{task}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        }
+      ]
+    }

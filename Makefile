@@ -477,9 +477,17 @@ rollout-abort:  ## Abortar rollout (rollback): make rollout-abort APP=webserver-
 # ──────────────────────────────────────────────────────────────────────────────
 # Build local de imágenes (sin k3d)
 # ──────────────────────────────────────────────────────────────────────────────
+# Build local — clona el repo de la app desde GitHub (single source of truth).
+# El código de las apps NO vive en este repo; vive en los repos externos:
+#   github.com/Valentino-33/webserver-api01
+#   github.com/Valentino-33/webserver-api02
+# Override APP_REPO_BASE si tus repos viven en otro org.
 .PHONY: build
-build:  ## Build local: make build APP=webserver-api01 TAG=v0.1.0
-	docker build -t $(DOCKERHUB_USER)/$(APP):$(TAG) $(ROOT_DIR)apps/$(APP)/
+build:  ## Build local: make build APP=webserver-api01 TAG=v0.1.0 (clona repo externo)
+	@rm -rf /tmp/belo-build/$(APP) 2>/dev/null || true
+	@mkdir -p /tmp/belo-build
+	git clone --depth 1 $(APP_REPO_BASE)/$(APP) /tmp/belo-build/$(APP)
+	docker build -t $(DOCKERHUB_USER)/$(APP):$(TAG) /tmp/belo-build/$(APP)/
 
 .PHONY: push
 push:  ## Push a DockerHub: make push APP=webserver-api01 TAG=v0.1.0
@@ -490,12 +498,17 @@ build-push: build push  ## Build + push en un paso
 
 .PHONY: images-initial
 images-initial:  ## Build y push de ambas apps con tag latest (requerido antes de make bootstrap)
-	@echo "$(YELLOW)→ Build y push de imágenes iniciales...$(NC)"
-	docker build -t $(DOCKERHUB_USER)/api01:latest $(ROOT_DIR)apps/webserver-api01/
-	docker push $(DOCKERHUB_USER)/api01:latest
-	docker build -t $(DOCKERHUB_USER)/api02:latest $(ROOT_DIR)apps/webserver-api02/
-	docker push $(DOCKERHUB_USER)/api02:latest
-	@echo "$(GREEN)✓ Imágenes iniciales publicadas en Docker Hub$(NC)"
+	@echo "$(YELLOW)→ Clonando repos externos y buildeando imágenes iniciales...$(NC)"
+	@echo "$(YELLOW)  (single source of truth: $(APP_REPO_BASE))$(NC)"
+	@rm -rf /tmp/belo-bootstrap 2>/dev/null || true
+	@mkdir -p /tmp/belo-bootstrap
+	git clone --depth 1 $(APP_REPO_BASE)/webserver-api01 /tmp/belo-bootstrap/webserver-api01
+	git clone --depth 1 $(APP_REPO_BASE)/webserver-api02 /tmp/belo-bootstrap/webserver-api02
+	docker build -t $(DOCKERHUB_USER)/webserver-api01:latest /tmp/belo-bootstrap/webserver-api01/
+	docker push $(DOCKERHUB_USER)/webserver-api01:latest
+	docker build -t $(DOCKERHUB_USER)/webserver-api02:latest /tmp/belo-bootstrap/webserver-api02/
+	docker push $(DOCKERHUB_USER)/webserver-api02:latest
+	@echo "$(GREEN)✓ Imágenes iniciales publicadas en Docker Hub (built from external repos)$(NC)"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Acceso a UIs

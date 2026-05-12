@@ -1,3 +1,12 @@
+# Fluent-bit config para k3d + Elasticsearch 8.x.
+#
+# Decisiones críticas:
+#   - Suppress_Type_Name On: ES 8 removió _type de los bulk requests.
+#     Sin esto fluent-bit recibe 400 illegal_argument_exception por cada
+#     batch → ningún índice se crea, Kibana queda vacío.
+#   - daemonSetVolumes/Mounts: override del default para NO montar
+#     /etc/machine-id (no existe como file regular en k3d → pods stuck
+#     en ContainerCreating con FailedMount).
 config:
   service: |
     [SERVICE]
@@ -5,12 +14,34 @@ config:
         Log_Level     info
         Daemon        off
         Parsers_File  parsers.conf
+        Parsers_File  custom_parsers.conf
+        # HTTP_Server enabled — el chart provee liveness/readiness probes
+        # contra :2020/api/v2/health. Sin esto los pods quedan en
+        # CrashLoopBackOff por probe fail.
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_Port     2020
+
+  # Custom parser cri_log: el cri parser default usa `message` como campo,
+  # pero el filtro kubernetes hace Merge_Log sobre `log`. Renombramos el
+  # campo destino a `log` para que el merge JSON funcione.
+  customParsers: |
+    [PARSER]
+        Name        cri_log
+        Format      regex
+        Regex       ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[FP]) (?<log>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
 
   inputs: |
     [INPUT]
         Name              tail
         Path              /var/log/containers/*.log
-        Parser            docker
+        # k3d usa containerd (formato CRI), no Docker. Usamos custom parser
+        # cri_log (definido arriba) que deja el contenido en `log` para que
+        # el filter kubernetes haga Merge_Log y promueva las keys JSON de
+        # structlog al nivel raíz del evento.
+        Parser            cri_log
         Tag               kube.*
         Refresh_Interval  5
         Mem_Buf_Limit     5MB
@@ -23,19 +54,13 @@ config:
         Kube_URL            https://kubernetes.default.svc:443
         Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
         Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
-        # Merge_Log On: parsea el campo `log` (que ya es JSON gracias a structlog)
-        # y promueve sus keys al nivel raíz del evento. Sin esto, las búsquedas en
-        # Kibana tendrían que ser sobre `log.event`, `log.path`, etc.
+        # Parsea el campo `log` (que es JSON gracias a structlog) y promueve
+        # sus keys al nivel raíz del evento. Sin esto, las búsquedas en Kibana
+        # tendrían que ser sobre `log.event`, `log.path`, etc.
         Merge_Log           On
-        # Merge_Log_Trim On: elimina el campo `log` después del merge — evita la
-        # duplicación de datos en cada documento de Elasticsearch.
+        # Elimina el campo `log` después del merge — evita duplicación.
         Merge_Log_Trim      On
-        # K8S-Logging.Parser On: permite que un Pod sobreescriba el parser usado
-        # via annotation `fluentbit.io/parser`. Apps que NO usan structlog
-        # (terceros, sidecars) pueden declarar un parser custom.
         K8S-Logging.Parser  On
-        # Anotamos cada evento con el nombre/namespace del pod — base para
-        # filtrar en Kibana por app/env.
         Annotations         Off
         Labels              On
 
@@ -52,7 +77,28 @@ config:
         Retry_Limit     False
         tls             Off
         tls.verify      Off
+        # ES 8.x removió _type — sin esto, todos los bulks fallan con 400.
+        Suppress_Type_Name On
 
-# DaemonSet must run on every node regardless of taints.
+# Override de daemonSetVolumes para NO montar /etc/machine-id (k3d no lo
+# tiene como file regular, pods quedan en ContainerCreating). El chart
+# default monta config, varlog, varlibdockercontainers, etcmachineid —
+# acá enumeramos solo los 3 primeros (sin machine-id).
+daemonSetVolumes:
+- name: varlog
+  hostPath:
+    path: /var/log
+- name: varlibdockercontainers
+  hostPath:
+    path: /var/lib/docker/containers
+
+daemonSetVolumeMounts:
+- name: varlog
+  mountPath: /var/log
+- name: varlibdockercontainers
+  mountPath: /var/lib/docker/containers
+  readOnly: true
+
+# DaemonSet debe correr en cada nodo regardless de taints.
 tolerations:
 - operator: Exists
