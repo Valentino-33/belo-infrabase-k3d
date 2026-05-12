@@ -15,7 +15,7 @@ spec:
     helm:
       valueFiles:
       - apps/webserver-api01/build-time/app.yaml
-      - apps/webserver-api01/dev/values-webserver-api01-dev.yaml
+      - apps/webserver-api01/dev/values.yaml
   destination:
     server: https://kubernetes.default.svc
     namespace: dev

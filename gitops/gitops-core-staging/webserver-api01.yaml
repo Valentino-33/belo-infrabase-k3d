@@ -1,11 +1,11 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: webserver-api02-dev
+  name: webserver-api01-staging
   namespace: argocd
   labels:
-    app: webserver-api02
-    environment: dev
+    app: webserver-api01
+    environment: staging
 spec:
   project: default
   source:
@@ -14,11 +14,11 @@ spec:
     path: charts/pythonapps
     helm:
       valueFiles:
-      - apps/webserver-api02/build-time/app.yaml
-      - apps/webserver-api02/dev/values.yaml
+      - apps/webserver-api01/build-time/app.yaml
+      - apps/webserver-api01/staging/values.yaml
   destination:
     server: https://kubernetes.default.svc
-    namespace: dev
+    namespace: staging
   syncPolicy:
     automated:
       prune: true

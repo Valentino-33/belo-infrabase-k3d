@@ -1,21 +1,24 @@
+# Ejemplo de Application CR para una nueva app Canary en dev.
+# Copiar como: gitops/gitops-core-dev/<nombre-de-tu-app>.yaml
+# Reemplazar <nombre-de-tu-app> y hacer git push para que ArgoCD lo detecte.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: webserver-api02-dev
+  name: <nombre-de-tu-app>-dev
   namespace: argocd
   labels:
-    app: webserver-api02
+    app: <nombre-de-tu-app>
     environment: dev
 spec:
   project: default
   source:
-    repoURL: https://github.com/Valentino-33/belo-infrabase-k3d
+    repoURL: https://github.com/<org>/belo-infrabase-k3d
     targetRevision: main
     path: charts/pythonapps
     helm:
       valueFiles:
-      - apps/webserver-api02/build-time/app.yaml
-      - apps/webserver-api02/dev/values.yaml
+      - apps/<nombre-de-tu-app>/build-time/app.yaml
+      - apps/<nombre-de-tu-app>/dev/values.yaml
   destination:
     server: https://kubernetes.default.svc
     namespace: dev

@@ -22,3 +22,95 @@ spec:
       selfHeal: true
     syncOptions:
     - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitops-core-lab
+  namespace: argocd
+  labels:
+    environment: lab
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Valentino-33/belo-infrabase-k3d
+    targetRevision: main
+    path: gitops/gitops-core-lab
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitops-core-test
+  namespace: argocd
+  labels:
+    environment: test
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Valentino-33/belo-infrabase-k3d
+    targetRevision: main
+    path: gitops/gitops-core-test
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitops-core-staging
+  namespace: argocd
+  labels:
+    environment: staging
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Valentino-33/belo-infrabase-k3d
+    targetRevision: main
+    path: gitops/gitops-core-staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitops-core-production
+  namespace: argocd
+  labels:
+    environment: production
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Valentino-33/belo-infrabase-k3d
+    targetRevision: main
+    path: gitops/gitops-core-production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true

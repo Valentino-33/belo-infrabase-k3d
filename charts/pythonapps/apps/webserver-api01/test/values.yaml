@@ -1,0 +1,22 @@
+image:
+  tag: "latest"
+
+replicas: 1
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "300m"
+    memory: "256Mi"
+
+hpa:
+  enabled: false
+
+ingress:
+  enabled: true
+  hostname: api01.test.localhost
+  ingressClassName: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /

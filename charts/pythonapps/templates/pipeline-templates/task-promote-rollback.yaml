@@ -1,8 +1,4 @@
 {{- if .Values.tekton.enabled }}
-# Stage 6: promote or abort the Rollout based on load test outcome.
-# BlueGreen: promote/abort.
-# Canary: promote --full (skip to 100%) / abort.
-# RollingUpdate: undo (kubectl rollout undo) / no-op.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -12,13 +8,13 @@ spec:
   params:
   - name: app-name
     type: string
-  - name: environment
+  - name: environments
     type: string
+    default: dev
   - name: strategy
     type: string
-    default: rollingupdate
+    default: ""
   - name: outcome
-    description: "passed or failed — from load-test result"
     type: string
     default: passed
   steps:
@@ -27,15 +23,37 @@ spec:
     script: |
       #!/bin/sh
       set -e
+      PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
-      NS="$(params.environment)"
+      NS="$PRIMARY_ENV"
       STRATEGY="$(params.strategy)"
       OUTCOME="$(params.outcome)"
       echo "=== promote-or-rollback: app=$APP env=$NS strategy=$STRATEGY outcome=$OUTCOME ==="
 
-      # Download kubectl-argo-rollouts plugin (v1.7.2 — pinned for reproducibility).
-      PLUGIN_URL="https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64"
+      # Production gate: no auto-promote. Leave annotation and exit.
+      if [ "$NS" = "production" ]; then
+        if [ "$OUTCOME" = "passed" ]; then
+          echo "PRODUCTION GATE: tests passed. Manual sync and promote required."
+          echo "  1. ArgoCD: sync webserver application in production namespace"
+          echo "  2. After Rollout is Paused: kubectl argo rollouts promote $APP -n production"
+          kubectl annotate application "${APP}-production" -n argocd \
+            belo/pending-promote="true" \
+            belo/promote-reason="load-test-passed" \
+            --overwrite 2>/dev/null || true
+        else
+          echo "PRODUCTION GATE: tests FAILED. Gitops values NOT reverted automatically."
+          echo "  Review and manually revert if needed."
+          kubectl annotate application "${APP}-production" -n argocd \
+            belo/pending-promote="false" \
+            belo/promote-reason="load-test-failed" \
+            --overwrite 2>/dev/null || true
+        fi
+        exit 0
+      fi
+
+      # Download kubectl-argo-rollouts plugin
       if ! command -v kubectl-argo-rollouts >/dev/null 2>&1; then
+        PLUGIN_URL="https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64"
         echo "Downloading kubectl-argo-rollouts..."
         curl -sL "$PLUGIN_URL" -o /tmp/kubectl-argo-rollouts
         chmod +x /tmp/kubectl-argo-rollouts
@@ -43,35 +61,34 @@ spec:
       fi
 
       case "$STRATEGY" in
-        rollingupdate|RollingUpdate)
+        rollingupdate)
           if [ "$OUTCOME" = "failed" ]; then
-            echo "RollingUpdate: load test FAILED — rolling back deployment"
-            kubectl rollout undo deployment/"$APP" -n "$NS" 2>/dev/null || \
-              kubectl argo rollouts undo "$APP" -n "$NS" || true
+            echo "RollingUpdate: FAILED — rolling back"
+            kubectl argo rollouts undo "$APP" -n "$NS" || true
           else
-            echo "RollingUpdate: load test PASSED — deployment auto-completes, no action needed"
+            echo "RollingUpdate: PASSED — completes automatically"
           fi
           ;;
-        bluegreen|BlueGreen)
+        bluegreen)
           if [ "$OUTCOME" = "failed" ]; then
-            echo "BlueGreen: load test FAILED — aborting (keeping stable blue)"
+            echo "BlueGreen: FAILED — aborting (keeping stable blue)"
             kubectl argo rollouts abort "$APP" -n "$NS"
           else
-            echo "BlueGreen: load test PASSED — promoting green to stable"
+            echo "BlueGreen: PASSED — promoting green to stable"
             kubectl argo rollouts promote "$APP" -n "$NS"
           fi
           ;;
-        canary|Canary)
+        canary)
           if [ "$OUTCOME" = "failed" ]; then
-            echo "Canary: load test FAILED — aborting canary"
+            echo "Canary: FAILED — aborting"
             kubectl argo rollouts abort "$APP" -n "$NS"
           else
-            echo "Canary: load test PASSED — promoting to 100%"
+            echo "Canary: PASSED — promoting to 100%"
             kubectl argo rollouts promote "$APP" -n "$NS" --full
           fi
           ;;
         *)
-          echo "WARN: unknown strategy '$STRATEGY' — no rollout action taken"
+          echo "WARN: unknown strategy '$STRATEGY' — no action taken"
           ;;
       esac
       echo "=== Done ==="

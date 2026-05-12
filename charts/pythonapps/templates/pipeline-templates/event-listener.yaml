@@ -14,19 +14,18 @@ spec:
         kind: ClusterInterceptor
       params:
       - name: filter
-        # Require 5-segment tag: refs/tags/<env>/<strategy>/<semver>
-        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/') && body.ref.split('/').size() >= 5"
+        # Require tag format: refs/tags/release/<semver>/<envs>
+        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/release/') && body.ref.split('/').size() >= 4"
       - name: overlays
         value:
-        - key: environment
-          expression: "body.ref.split('/')[2]"
-        - key: strategy
-          expression: "body.ref.split('/')[3]"
         - key: image_tag
-          # refs/tags/dev/rollingupdate/v1.0.0 → split → [refs,tags,dev,rollingupdate,v1.0.0] → index 4
-          expression: "body.ref.split('/')[4]"
+          # refs/tags/release/v1.0.0/dev → split → [refs,tags,release,v1.0.0,dev] → index 3
+          expression: "body.ref.split('/')[3]"
+        - key: environments
+          # Optional 5th segment: comma-separated envs. Default to 'dev' if absent.
+          expression: "body.ref.split('/').size() > 4 ? body.ref.split('/')[4] : 'dev'"
         - key: git_revision
-          # Full tag ref for git checkout (e.g. refs/tags/dev/rollingupdate/v1.0.0)
+          # Full tag ref for git checkout
           expression: "body.ref"
     bindings:
     - ref: github-tag-binding

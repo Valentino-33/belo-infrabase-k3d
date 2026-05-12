@@ -1,5 +1,4 @@
 {{- if .Values.tekton.enabled }}
-# storageClassName: local-path (k3d default — no necesita provisioner externo)
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
 metadata:
@@ -12,10 +11,8 @@ spec:
   - name: image-tag
   - name: revision
     default: main
-  - name: environment
+  - name: environments
     default: dev
-  - name: strategy
-    default: rollingupdate
   resourcetemplates:
   - apiVersion: tekton.dev/v1
     kind: PipelineRun
@@ -26,7 +23,6 @@ spec:
       pipelineRef:
         name: pythonapps-pipeline
       taskRunTemplate:
-        # SA with RBAC to read Rollouts and ArgoCD Applications (stages 4 & 6).
         serviceAccountName: tekton-pipeline-runner
       podTemplate:
         tolerations:
@@ -47,17 +43,10 @@ spec:
         value: $(tt.params.revision)
       - name: image-full
         value: "docker.io/{{ .Values.tekton.dockerhubUser }}/$(tt.params.app-name):$(tt.params.image-tag)"
-      - name: environment
-        value: $(tt.params.environment)
-      - name: strategy
-        value: $(tt.params.strategy)
+      - name: environments
+        value: $(tt.params.environments)
       - name: gitops-repo-url
         value: "{{ .Values.tekton.gitopsRepoUrl }}"
-      # Cluster-internal URLs for k6 load tests running inside the cluster.
-      - name: base-url
-        value: "http://$(tt.params.app-name)-stable.$(tt.params.environment).svc.cluster.local:8000"
-      - name: preview-url
-        value: "http://$(tt.params.app-name)-preview.$(tt.params.environment).svc.cluster.local:8000"
       workspaces:
       - name: source
         volumeClaimTemplate:

@@ -1,11 +1,11 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: webserver-api02-dev
+  name: webserver-api02-test
   namespace: argocd
   labels:
     app: webserver-api02
-    environment: dev
+    environment: test
 spec:
   project: default
   source:
@@ -15,10 +15,10 @@ spec:
     helm:
       valueFiles:
       - apps/webserver-api02/build-time/app.yaml
-      - apps/webserver-api02/dev/values.yaml
+      - apps/webserver-api02/test/values.yaml
   destination:
     server: https://kubernetes.default.svc
-    namespace: dev
+    namespace: test
   syncPolicy:
     automated:
       prune: true

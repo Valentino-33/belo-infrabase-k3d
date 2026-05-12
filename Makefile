@@ -17,6 +17,7 @@ DOCKERHUB_USER ?= valentinobruno
 NAMESPACE      := dev
 APP            ?= webserver-api01
 TAG            ?= latest
+ENVS           ?= dev
 
 GREEN  := \033[0;32m
 YELLOW := \033[0;33m
@@ -245,6 +246,17 @@ pipeline-run:  ## Disparar pipeline manual: make pipeline-run APP=webserver-api0
 	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl apply -f -
 	@echo "$(GREEN)✓ PipelineRun creado — monitoreá con:$(NC)"
 	@echo "   tkn pipelinerun logs -n tekton-pipelines --last -f"
+
+.PHONY: release
+release:  ## Crear y pushear tag de release: make release APP=webserver-api01 TAG=v1.0.0 ENVS=dev
+	@if [ -z "$(TAG)" ]; then echo "$(RED)Falta TAG (ej: make release TAG=v1.0.0)$(NC)"; exit 1; fi
+	@echo "$(YELLOW)→ Creando tag release/$(TAG)/$(ENVS) para $(APP)...$(NC)"
+	@echo "  Repo de la app: corré esto DESDE el repo de la app, no desde el gitops repo"
+	@echo ""
+	@echo "  git tag release/$(TAG)/$(ENVS)"
+	@echo "  git push origin release/$(TAG)/$(ENVS)"
+	@echo ""
+	@echo "$(GREEN)Eso dispara el webhook → pipeline para $(APP) en ambiente(s): $(ENVS)$(NC)"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Demos

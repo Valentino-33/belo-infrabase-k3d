@@ -12,11 +12,8 @@ spec:
     value: $(body.repository.name)
   - name: image-tag
     value: $(extensions.image_tag)
-  - name: environment
-    value: $(extensions.environment)
-  - name: strategy
-    value: $(extensions.strategy)
+  - name: environments
+    value: $(extensions.environments)
   - name: revision
-    # Full ref so git can fetch the exact tag commit.
     value: $(extensions.git_revision)
 {{- end }}

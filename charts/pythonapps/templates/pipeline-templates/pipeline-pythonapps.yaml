@@ -17,21 +17,12 @@ spec:
     type: string
   - name: image-full
     type: string
-    description: "imagen completa: docker.io/user/app:tag"
-  - name: environment
+  - name: environments
     type: string
     default: dev
-  - name: strategy
-    type: string
-    default: rollingupdate
+    description: "Comma-separated list: dev,staging,production"
   - name: gitops-repo-url
     type: string
-  - name: base-url
-    type: string
-    default: ""
-  - name: preview-url
-    type: string
-    default: ""
   workspaces:
   - name: source
   - name: gitops
@@ -64,7 +55,7 @@ spec:
     - name: context
       value: src
 
-  # Stage 3: update image.tag + rollout.strategy in gitops repo and push — triggers ArgoCD sync
+  # Stage 3: update image.tag in ALL requested environments and push one commit
   - name: bump-gitops
     taskRef:
       name: bump-gitops-image
@@ -77,14 +68,12 @@ spec:
       value: $(params.gitops-repo-url)
     - name: app-name
       value: $(params.app-name)
-    - name: environment
-      value: $(params.environment)
+    - name: environments
+      value: $(params.environments)
     - name: image-tag
       value: $(params.image-tag)
-    - name: strategy
-      value: $(params.strategy)
 
-  # Stage 4: poll ArgoCD until Synced+Healthy, then wait for Rollout to Pause
+  # Stage 4: wait for ArgoCD + Rollout on the PRIMARY env (first in list)
   - name: wait-argocd
     taskRef:
       name: wait-argocd-sync
@@ -92,12 +81,10 @@ spec:
     params:
     - name: app-name
       value: $(params.app-name)
-    - name: environment
-      value: $(params.environment)
-    - name: strategy
-      value: $(params.strategy)
+    - name: environments
+      value: $(params.environments)
 
-  # Stage 5: k6 load test against preview/stable; always exits 0; emits outcome result
+  # Stage 5: k6 load test on the PRIMARY env
   - name: load-test
     taskRef:
       name: run-load-test
@@ -108,14 +95,12 @@ spec:
     params:
     - name: app-name
       value: $(params.app-name)
+    - name: environments
+      value: $(params.environments)
     - name: strategy
-      value: $(params.strategy)
-    - name: preview-url
-      value: $(params.preview-url)
-    - name: base-url
-      value: $(params.base-url)
+      value: $(tasks.wait-argocd.results.strategy)
 
-  # Stage 6: promote or abort based on load test outcome
+  # Stage 6: promote or abort based on outcome
   - name: promote-rollback
     taskRef:
       name: promote-or-rollback
@@ -123,10 +108,10 @@ spec:
     params:
     - name: app-name
       value: $(params.app-name)
-    - name: environment
-      value: $(params.environment)
+    - name: environments
+      value: $(params.environments)
     - name: strategy
-      value: $(params.strategy)
+      value: $(tasks.wait-argocd.results.strategy)
     - name: outcome
       value: $(tasks.load-test.results.outcome)
 {{- end }}

@@ -1,5 +1,4 @@
 {{- if .Values.tekton.enabled }}
-# Corre scripts k6 según la strategy. Si no existen los scripts, genera WARN y continúa.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -9,18 +8,16 @@ spec:
   params:
   - name: app-name
     type: string
+  - name: environments
+    type: string
+    default: dev
   - name: strategy
     type: string
-    default: rollingupdate
-  - name: preview-url
     default: ""
-    type: string
-  - name: base-url
-    default: ""
-    type: string
+    description: "Auto-detected by wait-argocd — bluegreen, canary, or rollingupdate"
   results:
   - name: outcome
-    description: "passed or failed — read by stage 6 (promote-or-rollback)"
+    description: "passed or failed"
   workspaces:
   - name: source
   steps:
@@ -28,28 +25,32 @@ spec:
     image: grafana/k6:latest
     script: |
       #!/bin/sh
+      PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
       STRATEGY="$(params.strategy)"
-      echo "=== Load test: $APP (strategy: $STRATEGY) ==="
+      echo "=== Load test: $APP env=$PRIMARY_ENV strategy=$STRATEGY ==="
+
+      BASE_URL="http://${APP}-stable.${PRIMARY_ENV}.svc.cluster.local:8000"
+      PREVIEW_URL="http://${APP}-preview.${PRIMARY_ENV}.svc.cluster.local:8000"
 
       case "$STRATEGY" in
-        BlueGreen|bluegreen)
+        bluegreen)
           SCRIPT="load-bluegreen.js"
-          EXTRA="-e PREVIEW_URL=$(params.preview-url)"
+          EXTRA="-e PREVIEW_URL=$PREVIEW_URL"
           ;;
-        Canary|canary)
+        canary)
           SCRIPT="load-canary.js"
-          EXTRA="-e BASE_URL=$(params.base-url)"
+          EXTRA="-e BASE_URL=$BASE_URL"
           ;;
         *)
           SCRIPT="smoke.js"
-          EXTRA="-e BASE_URL=$(params.base-url)"
+          EXTRA="-e BASE_URL=$BASE_URL"
           ;;
       esac
 
       SCRIPT_PATH="$(workspaces.source.path)/src/loadtest/$SCRIPT"
       if [ ! -f "$SCRIPT_PATH" ]; then
-        echo "WARN: $SCRIPT_PATH not found — skipping load test, emitting outcome=passed"
+        echo "WARN: $SCRIPT_PATH not found — skipping, outcome=passed"
         printf "passed" > "$(results.outcome.path)"
         exit 0
       fi
@@ -57,10 +58,9 @@ spec:
       OUTCOME="passed"
       if ! k6 run $EXTRA "$SCRIPT_PATH"; then
         OUTCOME="failed"
-        echo "=== Load test FAILED — pipeline continues, outcome=failed ==="
+        echo "=== Load test FAILED ==="
       else
         echo "=== Load test PASSED ==="
       fi
-      # Always exit 0: stage 6 decides promote/abort based on outcome result.
       printf "%s" "$OUTCOME" > "$(results.outcome.path)"
 {{- end }}

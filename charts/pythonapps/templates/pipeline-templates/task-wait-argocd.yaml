@@ -1,6 +1,4 @@
 {{- if .Values.tekton.enabled }}
-# Stage 4: poll ArgoCD Application until Synced+Healthy, then poll Rollout
-# until Paused (bluegreen/canary) or Healthy (rollingupdate). Timeout 600s.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -10,21 +8,28 @@ spec:
   params:
   - name: app-name
     type: string
-  - name: environment
+  - name: environments
     type: string
-  - name: strategy
-    type: string
-    default: rollingupdate
+    default: dev
   - name: timeout-seconds
     default: "600"
     type: string
+  results:
+  - name: primary-env
+    description: "First environment in the list (target for stages 5-6)"
+  - name: strategy
+    description: "Detected rollout strategy: bluegreen, canary, or rollingupdate"
   steps:
   - name: wait-argocd
     image: bitnami/kubectl:latest
     script: |
       #!/bin/sh
       set -e
-      APP_CR="$(params.app-name)-$(params.environment)"
+      # Use only the first environment for gate stages 4-6
+      PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
+      printf "%s" "$PRIMARY_ENV" > "$(results.primary-env.path)"
+
+      APP_CR="$(params.app-name)-${PRIMARY_ENV}"
       TIMEOUT=$(params.timeout-seconds)
       ELAPSED=0
       echo "=== Waiting for ArgoCD app $APP_CR to be Synced+Healthy ==="
@@ -46,34 +51,41 @@ spec:
         exit 1
       fi
 
-  - name: wait-rollout
+  - name: detect-strategy-and-wait-rollout
     image: bitnami/kubectl:latest
     script: |
       #!/bin/sh
       set -e
+      PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
-      NS="$(params.environment)"
-      STRATEGY="$(params.strategy)"
+      NS="$PRIMARY_ENV"
       TIMEOUT=$(params.timeout-seconds)
       ELAPSED=0
+
+      # Auto-detect strategy from the live Rollout
+      if kubectl get rollout "$APP" -n "$NS" \
+          -o jsonpath='{.spec.strategy.blueGreen.activeService}' 2>/dev/null | grep -q .; then
+        STRATEGY="bluegreen"
+      elif kubectl get rollout "$APP" -n "$NS" \
+          -o jsonpath='{.spec.strategy.canary.steps}' 2>/dev/null | grep -q .; then
+        STRATEGY="canary"
+      else
+        STRATEGY="rollingupdate"
+      fi
+      printf "%s" "$STRATEGY" > "$(results.strategy.path)"
+      echo "=== Detected strategy: $STRATEGY ==="
+
       echo "=== Waiting for Rollout $APP in $NS (strategy=$STRATEGY) ==="
       while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
         PHASE=$(kubectl get rollout "$APP" -n "$NS" \
           -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
         echo "  [${ELAPSED}s] phase=$PHASE"
         case "$STRATEGY" in
-          rollingupdate|RollingUpdate)
-            if [ "$PHASE" = "Healthy" ]; then
-              echo "=== Rollout complete (RollingUpdate) ==="
-              exit 0
-            fi
-            ;;
+          rollingupdate)
+            [ "$PHASE" = "Healthy" ] && echo "=== RollingUpdate complete ===" && exit 0 ;;
           *)
-            if [ "$PHASE" = "Paused" ] || [ "$PHASE" = "Healthy" ]; then
-              echo "=== Rollout is Paused/Healthy — ready for load test ==="
-              exit 0
-            fi
-            ;;
+            { [ "$PHASE" = "Paused" ] || [ "$PHASE" = "Healthy" ]; } && \
+              echo "=== Rollout Paused/Healthy — ready for load test ===" && exit 0 ;;
         esac
         sleep 10
         ELAPSED=$((ELAPSED + 10))

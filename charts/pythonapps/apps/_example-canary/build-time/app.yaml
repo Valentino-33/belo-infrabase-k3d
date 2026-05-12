@@ -1,0 +1,23 @@
+# Plantilla para una nueva app con estrategia Canary.
+# Copiar este directorio a: charts/pythonapps/apps/<nombre-de-tu-app>/
+# Reemplazar TODOS los valores entre < > con los de tu app.
+
+app:
+  name: <nombre-de-tu-app>         # Debe coincidir con el repo de GitHub
+  pathPrefix: <prefijo-url>         # Ej: myapp (accesible en /myapp/*)
+  metricsPath: /<prefijo-url>/metrics
+
+rollout:
+  strategy: canary                  # FIJO para esta app — no cambia por tag
+
+image:
+  repository: docker.io/<dockerhub-user>/<nombre-de-tu-app>
+  pullPolicy: IfNotPresent
+
+tekton:
+  dockerhubUser: <dockerhub-user>
+  gitopsRepoUrl: https://github.com/<org>/belo-infrabase-k3d
+
+serviceMonitor:
+  enabled: true
+  interval: 30s

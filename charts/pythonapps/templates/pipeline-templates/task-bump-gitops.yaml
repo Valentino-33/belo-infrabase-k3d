@@ -1,5 +1,4 @@
 {{- if .Values.tekton.enabled }}
-# Actualiza el tag de imagen en el values del ambiente y hace commit + push.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -11,13 +10,12 @@ spec:
     type: string
   - name: app-name
     type: string
-  - name: environment
+  - name: environments
     type: string
+    description: "Comma-separated list: dev,staging,production"
+    default: dev
   - name: image-tag
     type: string
-  - name: strategy
-    type: string
-    default: rollingupdate
   - name: git-user-name
     default: "tekton-bot"
     type: string
@@ -44,45 +42,55 @@ spec:
       #!/bin/sh
       set -e
       TOKEN=$(cat /workspace/git-token/token)
-      # Inject token into URL so git push in later step is authenticated.
       AUTH_URL=$(echo "$(params.gitops-repo-url)" | sed "s|https://|https://x-access-token:${TOKEN}@|")
       git clone "$AUTH_URL" "$(workspaces.gitops.path)/gitops"
       echo "Gitops clonado"
 
-  - name: bump-tag
+  - name: bump-all-envs
     image: mikefarah/yq:latest
     env:
     - name: IMAGE_TAG
       value: "$(params.image-tag)"
-    - name: STRATEGY
-      value: "$(params.strategy)"
+    - name: ENVIRONMENTS
+      value: "$(params.environments)"
+    - name: APP_NAME
+      value: "$(params.app-name)"
     script: |
       #!/bin/sh
       set -e
-      VALUES_FILE="$(workspaces.gitops.path)/gitops/charts/pythonapps/apps/$(params.app-name)/$(params.environment)/values-$(params.app-name)-$(params.environment).yaml"
-      if [ ! -f "$VALUES_FILE" ]; then
-        echo "WARN: $VALUES_FILE no encontrado, skipping bump"
-        exit 0
-      fi
-      # Actualiza image.tag y rollout.strategy juntos — ambos determinan qué despliega ArgoCD.
-      yq e '.image.tag = strenv(IMAGE_TAG)' -i "$VALUES_FILE"
-      yq e '.rollout.strategy = strenv(STRATEGY)' -i "$VALUES_FILE"
-      echo "Bump OK: image.tag=$IMAGE_TAG  rollout.strategy=$STRATEGY"
-      echo "Archivo: $VALUES_FILE"
+      # Split comma-separated environments and update each values file
+      echo "$ENVIRONMENTS" | tr ',' '\n' | while read ENV; do
+        ENV=$(echo "$ENV" | tr -d ' ')
+        VALUES_FILE="$(workspaces.gitops.path)/gitops/charts/pythonapps/apps/${APP_NAME}/${ENV}/values.yaml"
+        if [ ! -f "$VALUES_FILE" ]; then
+          echo "WARN: $VALUES_FILE no encontrado — skipping env=$ENV"
+          continue
+        fi
+        yq e '.image.tag = strenv(IMAGE_TAG)' -i "$VALUES_FILE"
+        echo "Bump OK: $APP_NAME/$ENV → image.tag=$IMAGE_TAG"
+      done
 
   - name: commit-and-push
     image: alpine/git:latest
+    volumeMounts:
+    - name: git-token
+      mountPath: /workspace/git-token
+      readOnly: true
     script: |
       #!/bin/sh
       set -e
+      TOKEN=$(cat /workspace/git-token/token)
       cd "$(workspaces.gitops.path)/gitops"
       git config user.name "$(params.git-user-name)"
       git config user.email "$(params.git-user-email)"
+      AUTH_URL=$(git remote get-url origin | sed "s|https://|https://x-access-token:${TOKEN}@|")
+      git remote set-url origin "$AUTH_URL"
       git add .
       if git diff --staged --quiet; then
         echo "Sin cambios que commitear"
         exit 0
       fi
-      git commit -m "bump $(params.app-name) a $(params.image-tag) en $(params.environment)"
+      ENVS_LABEL=$(echo "$(params.environments)" | tr ',' '+')
+      git commit -m "bump $(params.app-name) a $(params.image-tag) en [${ENVS_LABEL}]"
       git push origin main
 {{- end }}
