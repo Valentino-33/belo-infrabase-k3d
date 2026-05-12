@@ -12,14 +12,14 @@ Para detalles de implementación (imágenes, comandos exactos, RBAC) ver [pipeli
 
 ## Visión general
 
-El pipeline `pythonapps-pipeline` tiene **7 stages**:
+El **release pipeline** `pythonapps-pipeline` tiene **6 stages**:
 
 ```
-┌─────────┐  ┌─────────────┐  ┌────────────┐  ┌──────────────┐  ┌───────────┐  ┌──────────────┐  ┌──────────────┐
-│ 1.Clone │→ │ 2.Build/Push│→ │ 3.Bump GO  │→ │4.Wait ArgoCD │→ │5.LoadTest │→ │6.Promote/RB  │→ │7.Burn-to-scl │
-└─────────┘  └─────────────┘  └────────────┘  └──────────────┘  └───────────┘  └──────────────┘  └──────────────┘
-   git           Kaniko          yq + push       polling state    k6 funcional    kubectl patch    k6 carga + HPA
-   clone         a DockerHub     a gitops repo   ArgoCD+Rollout   contra preview   subresource     polling replicas
+┌─────────┐  ┌─────────────┐  ┌────────────┐  ┌──────────────┐  ┌───────────┐  ┌──────────────┐
+│ 1.Clone │→ │ 2.Build/Push│→ │ 3.Bump GO  │→ │4.Wait ArgoCD │→ │5.LoadTest │→ │6.Promote/RB  │
+└─────────┘  └─────────────┘  └────────────┘  └──────────────┘  └───────────┘  └──────────────┘
+   git           Kaniko          yq + push       polling state    k6 funcional    kubectl patch
+   clone         a DockerHub     a gitops repo   ArgoCD+Rollout   contra preview   subresource
 ```
 
 Cada stage **bloquea** los siguientes hasta cumplir su contrato. Si cualquiera falla, el pipeline se corta y el Stage 6 hace `abort` (rollback automático) para las strategies que lo soportan.
@@ -32,7 +32,8 @@ Cada stage **bloquea** los siguientes hasta cumplir su contrato. Si cualquiera f
 | 4 | `wait-argocd-sync` | `bitnami/kubectl` | ArgoCD Application + Rollout (cluster) | Rollout en `Paused` con `image-tag` correcto + result `strategy` |
 | 5 | `run-load-test` | `grafana/k6` | preview svc (BG/Canary) o stable svc (Rolling) | result `outcome` ∈ {passed, failed} |
 | 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout (patch subresource) | Rollout `Healthy` (promote) o `Degraded` (abort) |
-| 7 | `run-burn-to-scale` | sidecar `k6` + step `kubectl` | stable svc (versión recién promovida) + HPA | result `outcome` + `baseline/max-replicas` |
+
+**El promote (Stage 6) es el dueño de la verdad del release.** Validaciones de **capacidad** (HPA scale-up) viven en un [**pipeline separado**](#pipeline-auxiliar--burn-to-scale-capacity-test) que se dispara on-demand. Ver el final de este documento.
 
 ---
 
@@ -268,60 +269,6 @@ Y exit OK. Un humano debe promover manualmente. Ver detalle en [pipeline-interna
 
 ---
 
-## Stage 7 — Burn-to-scale (NUEVO)
-
-**Qué hace**: valida que el HPA escala el Rollout al cruzar el `targetCPUUtilization`. Es ortogonal a la validación funcional del Stage 5 — acá medimos **capacidad**, no latencia.
-
-**Diseño con sidecar de Tekton**:
-
-```yaml
-sidecars:
-- name: loadgen           # corre k6 burn-to-scale.js EN PARALELO al step principal
-  image: grafana/k6:latest
-  script: |
-    sleep 10               # darle tiempo al step para capturar baseline
-    k6 run -e TARGET_URL=$STABLE_URL /workspace/source/src/loadtest/burn-to-scale.js
-    sleep 600              # mantener vivo hasta que el step termine
-
-steps:
-- name: monitor-hpa       # corre kubectl polling
-  image: bitnami/kubectl:latest
-  script: |
-    BASELINE=$(kubectl get rollout $R -o jsonpath='{.status.replicas}')
-    MAX_SEEN=$BASELINE
-    ELAPSED=0
-    while [ $ELAPSED -lt 180 ]; do
-      R=$(kubectl get rollout $R -o jsonpath='{.status.replicas}')
-      [ "$R" -gt "$MAX_SEEN" ] && MAX_SEEN=$R
-      sleep 10
-      ELAPSED=$((ELAPSED+10))
-    done
-    if [ "$MAX_SEEN" -gt "$BASELINE" ]; then echo passed; else echo failed; fi
-```
-
-**Por qué un Task separado y no parte de Stage 5**:
-- **Separación de preocupaciones**: Stage 5 valida que la app responda correctamente (200s, schema, latencia). Stage 7 valida que la app escala bajo carga. Si las mezcláramos, una falla de capacidad (CPU insuficiente) marcaría `outcome=failed` y abortaría el rollout — pero la app puede estar funcionalmente perfecta.
-- **Diferentes éxito-criteria**: Stage 5 usa thresholds de k6 (p95/p99/error_rate); Stage 7 valida `replicas > baseline`.
-- **Diferentes targets**: Stage 5 corre contra preview/canary (versión NO promovida); Stage 7 corre contra stable (ya promovido) porque queremos validar la versión que ahora sirve tráfico productivo.
-- **Trazabilidad**: dos TaskRuns separados, logs separados, results separados — debugging más limpio.
-
-**When-clause**:
-
-```yaml
-when:
-- input: "$(tasks.load-test.results.outcome)"
-  operator: in
-  values: ["passed"]
-```
-
-Si Stage 5 falló (Stage 6 ya hizo rollback), Stage 7 ni siquiera arranca — no tiene sentido validar capacidad de algo que volvió a la versión vieja.
-
-**Skip en production**: el step principal hace `if [ "$PRIMARY_ENV" = "production" ]; then exit 0; fi`. No quemamos CPU del entorno productivo.
-
-**Condición de éxito**: `MAX_REPLICAS > BASELINE_REPLICAS` durante la ventana de monitoreo (180s default). Si el HPA escaló de 1 → 2 (o más) replicas **al menos una vez**, pasa. El test no exige que se mantenga escalado al final (la HPA tiene stabilization windows largas para scale-down, ~5min default).
-
----
-
 ## Garantías del circuito completo
 
 | Garantía | Cómo se logra |
@@ -331,7 +278,7 @@ Si Stage 5 falló (Stage 6 ya hizo rollback), Stage 7 ni siquiera arranca — no
 | **No se prueba una versión vieja por race condition** | Stage 4 espera `app.status.sync.revision == commit-sha del Stage 3`. El force-refresh saca el polling de 3min default a ~5s. |
 | **Rollback automático si los tests fallan** | Stage 6 emite `kubectl patch spec.abort=true` para BG/Canary/Rolling. Argo Rollouts destruye el RS nuevo, mantiene stable. |
 | **Production no se auto-promueve** | Stage 6 detecta `PRIMARY_ENV=production` y solo annota — promote manual obligatorio. |
-| **Capacidad se valida después de promote** | Stage 7 valida HPA scale-up cuando el RS nuevo ya es stable. Si HPA no funciona, el equipo lo nota antes del siguiente release. |
+| **Capacidad se valida fuera del release** | El [burn pipeline aparte](#pipeline-auxiliar--burn-to-scale-capacity-test) se dispara on-demand cuando el equipo quiere validar HPA. No contamina el release pipeline ni los timings. |
 | **Re-pushear el mismo tag falla limpio** | TriggerTemplate usa `name: <app>-pipelinerun-<tag>` determinístico. Re-push → `AlreadyExists` en lugar de re-ejecutar silencioso. |
 | **PipelineRun queda trazable por release** | Naming determinístico permite `kubectl get pipelinerun webserver-api01-pipelinerun-v1.2.0 -o yaml` y ver todo el detalle del deploy. |
 
@@ -345,13 +292,8 @@ params.image-tag                          ──→  Stage 4 wait-argocd.params.
 
 Stage 4 wait-argocd.results.strategy      ──→  Stage 5 load-test.params.strategy
                                           ──→  Stage 6 promote-rollback.params.strategy
-                                          ──→  Stage 7 burn-to-scale.params.strategy
 
 Stage 5 load-test.results.outcome         ──→  Stage 6 promote-rollback.params.outcome
-                                          ──→  Stage 7 burn-to-scale.when (skip if not passed)
-
-Stage 7 burn-to-scale.results.outcome     ──→  (visible vía tkn / Tekton Dashboard, no consumido)
-Stage 7 burn-to-scale.results.max-replicas ──→ (visible para auditoria)
 ```
 
 ---
@@ -372,7 +314,7 @@ Eso queda **fuera** del pipeline y deja un rastro claro de que no fue un deploy 
 
 ---
 
-## Diagrama de flujo end-to-end (todos los stages)
+## Diagrama de flujo end-to-end (release pipeline)
 
 ```mermaid
 flowchart TB
@@ -399,17 +341,158 @@ flowchart TB
 
     S6_KO -->|abort=true| DEGRADED[Rollout Degraded<br/>stable intacto]
 
-    HEALTHY1 --> S7{7. Burn-to-scale}
+    HEALTHY1 --> END_OK([Pipeline OK<br/>versión nueva sirviendo 100%])
     DEGRADED --> END_KO([Pipeline OK<br/>rollback efectivo])
-
-    S7 -->|sidecar k6 + monitor HPA<br/>replicas > baseline| END_OK([Pipeline OK<br/>capacidad validada])
-    S7 -->|no scale-up en 180s| END_PARTIAL([Pipeline OK<br/>WARN: HPA no escaló])
 
     classDef ok fill:#dcfce7,stroke:#16a34a
     classDef fail fill:#fee2e2,stroke:#dc2626
     classDef gate fill:#fef9c3,stroke:#ca8a04
 
-    class HEALTHY1,END_OK,END_KO,END_PARTIAL ok
+    class HEALTHY1,END_OK,END_KO ok
     class FAIL1 fail
-    class S4,S6_OK,S6_KO,S7 gate
+    class S4,S6_OK,S6_KO gate
+```
+
+---
+
+## Pipeline auxiliar — burn-to-scale (capacity test)
+
+`pythonapps-burn-pipeline` es un Pipeline Tekton **separado** del release pipeline. Su propósito es validar que el HPA escala correctamente bajo carga sostenida. Se dispara on-demand (no en cada release).
+
+### Por qué un pipeline aparte y no un Stage 7
+
+1. **Enterprise pattern**: en producción real, los capacity/chaos tests no se ejecutan en cada release — son lentos (~3min de CPU saturada), la config del HPA cambia raramente, y mezclarlos con el flujo de release crea falsos negativos. Viven en un pipeline aparte que el SRE/Platform team gatilla cuando hace falta (semanal, antes de un evento de alto tráfico, después de tunear el HPA, etc.).
+
+2. **Problema técnico con BG**: si corriéramos burn antes de Stage 6 (promote), durante `phase=Paused` el HPA promedia CPU entre los pods del RS stable (blue, idle) y del RS preview (green, bajo carga). La dilución resultante (~50% promedio aunque el preview esté a 100%) **impide el scale-up** y el test daría falsos negativos. Esperar a después del promote para validar también funciona, pero entonces si el HPA falla el equipo se entera tarde (versión nueva ya productiva) y hay que hacer rollback manual.
+
+3. **Solución limpia**: extraer el burn a un pipeline propio que apunte siempre al stable svc del Rollout ya estable. Sin race conditions, sin dilución, sin riesgo a la release.
+
+4. **Promote como dueño de la verdad**: el Stage 6 del release pipeline es la última palabra sobre si una versión avanza o no. Las validaciones de capacidad son independientes — un release puede ser funcional y el HPA puede no estar bien configurado, esos son dos problemas distintos con dos respuestas distintas.
+
+### Trigger del burn pipeline
+
+#### A) Vía webhook GitHub (tag `burn/<env>`)
+
+Desde el repo de la app:
+
+```bash
+git tag burn/dev
+git push origin burn/dev
+```
+
+El segundo trigger del EventListener (`github-tag-burn`) filtra `refs/tags/burn/*`, extrae el env vía CEL overlay (`body.ref.split('/')[3]`) y crea un PipelineRun usando `pythonapps-burn-trigger-template`.
+
+> **Re-correr**: a diferencia de los release tags (que deben ser unique semver), los `burn/<env>` se re-corren seguido. El TriggerTemplate usa `generateName: <app>-burn-<env>-` (no `name:` fijo), por lo que cada push agrega un sufijo random. Si volvés a empujar el mismo tag tenés que borrarlo primero:
+>
+> ```bash
+> git tag -d burn/dev
+> git push --delete origin burn/dev
+> git tag burn/dev && git push origin burn/dev
+> ```
+
+#### B) Manual sin webhook
+
+```bash
+make burn-test APP=webserver-api01 ENV=dev
+```
+
+Usa `envsubst` sobre `manifests/tekton/pipelinerun-burn-manual.yaml` y crea un PipelineRun directo. Mismo template que el del webhook.
+
+### Stages (solo 2)
+
+```
+┌─────────┐  ┌──────────────────────────────┐
+│ 1.Clone │→ │ 2.Burn-to-scale              │
+│ (alpine │  │ sidecar k6 + step kubectl    │
+│  /git)  │  │ monitorea replicas del HPA   │
+└─────────┘  └──────────────────────────────┘
+```
+
+| # | Task | Imagen | Qué hace |
+|---|------|--------|----------|
+| 1 | `git-clone-app` | `alpine/git` | Clona el repo de la app para tener `loadtest/burn-to-scale.js` |
+| 2 | `run-burn-to-scale` | sidecar `grafana/k6` + step `bitnami/kubectl` | Sidecar genera 200 VUs sostenidos sin sleep contra `<app>-<env>-stable.<ns>.svc:8080`. Step principal lee `rollout.status.replicas` cada 10s durante 180s. Marca `outcome=passed` si `MAX_REPLICAS > BASELINE` en algún momento de la ventana |
+
+### Diseño con sidecar
+
+```yaml
+sidecars:
+- name: loadgen           # corre k6 burn-to-scale.js EN PARALELO al step principal
+  image: grafana/k6:latest
+  script: |
+    sleep 10              # darle tiempo al step para capturar baseline
+    k6 run -e TARGET_URL=$STABLE_URL /workspace/source/src/loadtest/burn-to-scale.js
+    sleep 600             # mantener vivo hasta que el step termine
+
+steps:
+- name: monitor-hpa       # corre kubectl polling
+  image: bitnami/kubectl:latest
+  script: |
+    BASELINE=$(kubectl get rollout $R -o jsonpath='{.status.replicas}')
+    MAX_SEEN=$BASELINE
+    ELAPSED=0
+    while [ $ELAPSED -lt 180 ]; do
+      R=$(kubectl get rollout $R -o jsonpath='{.status.replicas}')
+      [ "$R" -gt "$MAX_SEEN" ] && MAX_SEEN=$R
+      sleep 10
+      ELAPSED=$((ELAPSED+10))
+    done
+    if [ "$MAX_SEEN" -gt "$BASELINE" ]; then echo passed; else echo failed; fi
+```
+
+Las dos partes comparten el workspace `source` (donde quedó `loadtest/burn-to-scale.js` después del Stage 1). El sidecar se inicia al mismo tiempo que el step y vive hasta que el step termina.
+
+### Condición de éxito
+
+`MAX_REPLICAS > BASELINE_REPLICAS` durante la ventana de monitoreo (180s default). Si el HPA escaló de 1 → 2 (o más) replicas **al menos una vez**, pasa. No exige que se mantenga escalado al final — la HPA tiene stabilization windows largas para scale-down (~5min default) y el burn dura solo 2-3min.
+
+### Results emitidos
+
+| Result | Tipo | Significado |
+|--------|------|-------------|
+| `outcome` | string | `passed`, `failed`, o `skipped` (en production) |
+| `baseline-replicas` | number | Replicas observadas al inicio del burn |
+| `max-replicas` | number | Máximo de replicas observado durante el burn |
+
+Visibles en el Tekton Dashboard, en `tkn pipelinerun describe`, o por `kubectl get pipelinerun -l pipeline=burn -o yaml | yq .status.results`.
+
+### Production gate
+
+El step principal hace:
+
+```sh
+if [ "$PRIMARY_ENV" = "production" ]; then
+  echo "PRODUCTION: burn-to-scale skipped."
+  printf "skipped" > "$(results.outcome.path)"
+  exit 0
+fi
+```
+
+Por defecto **no se quema CPU productiva**. Si el equipo quiere validar HPA en prod (e.g., en una ventana de mantenimiento), debe modificar este check explícitamente y entender el impacto.
+
+### Diagrama del burn pipeline
+
+```mermaid
+flowchart TB
+    START([Push tag<br/>burn/dev])
+    EL[EventListener<br/>trigger github-tag-burn]
+    TR[PipelineRun creado<br/>name=<app>-burn-dev-XXXXX]
+
+    START --> EL --> TR
+
+    TR --> S1[1. Clone<br/>repo@main → loadtest/burn-to-scale.js]
+    S1 --> S2[2. Burn-to-scale]
+
+    S2 -->|sidecar k6 quema CPU<br/>step kubectl polling HPA| DECISION{¿replicas > baseline<br/>en 180s?}
+
+    DECISION -->|sí| OK([outcome=passed<br/>HPA escaló N→M replicas])
+    DECISION -->|no| KO([outcome=failed<br/>HPA no escaló — revisar config])
+
+    classDef ok fill:#dcfce7,stroke:#16a34a
+    classDef ko fill:#fee2e2,stroke:#dc2626
+    classDef gate fill:#fef9c3,stroke:#ca8a04
+
+    class OK ok
+    class KO ko
+    class DECISION,S2 gate
 ```

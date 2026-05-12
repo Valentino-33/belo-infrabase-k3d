@@ -105,6 +105,16 @@ spec:
       value: $(tasks.wait-argocd.results.strategy)
 
   # Stage 6: promote or abort based on outcome
+  # Stage final del release pipeline: el promote es el "dueño de la verdad".
+  # Las validaciones de CAPACIDAD (burn-to-scale / HPA) viven en un pipeline
+  # SEPARADO (pythonapps-burn-pipeline) que se dispara on-demand vía tag
+  # `refs/tags/burn/<env>` o vía `make burn-test`. Razones:
+  #   - HPA cambia poco; validarlo en cada release es over-testing.
+  #   - Burn-to-scale tiene problemas técnicos si corre durante BG pause:
+  #     el HPA promedia CPU entre stable+preview RSes → la dilución impide
+  #     ver scale-up aunque el preview esté a 100% CPU.
+  #   - Modelo enterprise: capacity tests viven en pipeline de chaos/capacity
+  #     separado, no en el de release.
   - name: promote-rollback
     taskRef:
       name: promote-or-rollback
@@ -118,26 +128,4 @@ spec:
       value: $(tasks.wait-argocd.results.strategy)
     - name: outcome
       value: $(tasks.load-test.results.outcome)
-
-  # Stage 7: burn-to-scale — valida HPA generando CPU >70% contra el stable
-  # (ya promovido). when-clause: solo si Stage 5 pasó Y no estamos en producción.
-  # Si el HPA escala, el deploy queda validado en capacidad además de funcional.
-  - name: burn-to-scale
-    taskRef:
-      name: run-burn-to-scale
-    runAfter: [promote-rollback]
-    when:
-    - input: "$(tasks.load-test.results.outcome)"
-      operator: in
-      values: ["passed"]
-    workspaces:
-    - name: source
-      workspace: source
-    params:
-    - name: app-name
-      value: $(params.app-name)
-    - name: environments
-      value: $(params.environments)
-    - name: strategy
-      value: $(tasks.wait-argocd.results.strategy)
 {{- end }}

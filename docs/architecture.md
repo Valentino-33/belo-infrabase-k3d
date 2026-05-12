@@ -279,7 +279,9 @@ refs/tags/release/<semver>/<envs>
 >
 > La **strategy** (bluegreen / canary / rollingupdate) **NO** se pasa por el tag — viene fija del `rollout.strategy` del chart Helm de la app. El pipeline la auto-detecta inspeccionando el live Rollout.
 
-### Stages del pipeline (resumen)
+### Stages del pipeline de release (resumen)
+
+El **release pipeline** (`pythonapps-pipeline`) tiene 6 stages:
 
 | # | Task Tekton | Image | Output principal |
 |---|-------------|-------|------------------|
@@ -288,10 +290,18 @@ refs/tags/release/<semver>/<envs>
 | 3 | `bump-gitops-image` | `alpine/git` + `mikefarah/yq` | commit pusheado + **result `commit-sha`** |
 | 4 | `wait-argocd-sync` | `bitnami/kubectl` | sync.revision verificado + Rollout en `Paused` con el image-tag correcto |
 | 5 | `run-load-test` | `grafana/k6` | **result `outcome` = passed/failed** (1000 VUs, p95/p99 thresholds) |
-| 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout `phase=Healthy` o `Degraded` (verificado) |
-| 7 | `run-burn-to-scale` | sidecar `k6` + step `bitnami/kubectl` | **result `outcome` + `max-replicas`** — valida HPA scale-up |
+| 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout `phase=Healthy` o `Degraded` (verificado) — **dueño de la verdad del release** |
 
-> Ver detalle stage-por-stage y garantías de correctness en [docs/pipeline-stages.md](pipeline-stages.md).
+El pipeline **auxiliar** (`pythonapps-burn-pipeline`) corre on-demand para validar HPA capacity:
+
+| # | Task | Image | Output principal |
+|---|------|-------|------------------|
+| 1 | `git-clone-app` | `alpine/git` | repo (con `loadtest/burn-to-scale.js`) |
+| 2 | `run-burn-to-scale` | sidecar `k6` + step `bitnami/kubectl` | **result `outcome` + `max-replicas`** — valida HPA scale-up |
+
+Se dispara vía tag `refs/tags/burn/<env>` o `make burn-test`. Es **independiente** del release pipeline para no contaminar el promote con tests de capacidad lentos.
+
+> Ver detalle stage-por-stage, garantías de correctness y el porqué de pipelines separados en [docs/pipeline-stages.md](pipeline-stages.md).
 
 ### Naming convention del PipelineRun
 

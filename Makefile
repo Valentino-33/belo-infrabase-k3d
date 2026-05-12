@@ -234,6 +234,9 @@ tekton-apply:  ## Aplicar Tasks, Pipeline y Triggers de Tekton
 	  -s templates/pipeline-templates/task-load-test.yaml \
 	  -s templates/pipeline-templates/task-promote-rollback.yaml \
 	  -s templates/pipeline-templates/task-burn-to-scale.yaml \
+	  -s templates/pipeline-templates/pipeline-burn.yaml \
+	  -s templates/pipeline-templates/trigger-binding-burn.yaml \
+	  -s templates/pipeline-templates/trigger-template-burn.yaml \
 	  -s templates/pipeline-templates/pipeline-pythonapps.yaml \
 	  -s templates/pipeline-templates/trigger-binding.yaml \
 	  -s templates/pipeline-templates/trigger-template.yaml \
@@ -290,6 +293,28 @@ pipeline-run:  ## Disparar pipeline manual: make pipeline-run APP=webserver-api0
 	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl create -f -
 	@echo "$(GREEN)✓ PipelineRun creado — monitoreá con:$(NC)"
 	@echo "   tkn pipelinerun logs -n tekton-pipelines --last -f"
+
+.PHONY: burn-test
+burn-test:  ## Disparar burn pipeline (HPA capacity test): make burn-test APP=webserver-api01 ENV=dev
+	@echo "$(YELLOW)→ Iniciando burn-to-scale pipeline para $(APP) en $(ENV)...$(NC)"
+	@echo "$(YELLOW)  El test sostiene 200 VUs ~3min — el cluster va a estar caliente.$(NC)"
+	APP=$(APP) ENV=$(ENV) \
+	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-burn-manual.yaml | kubectl create -f -
+	@echo "$(GREEN)✓ Burn pipeline disparado — observá HPA en paralelo:$(NC)"
+	@echo "   kubectl get hpa $(APP)-$(ENV) -n $(APP)-$(ENV) -w"
+	@echo "   tkn pipelinerun logs -n tekton-pipelines --last -f"
+
+.PHONY: burn-release-tag
+burn-release-tag:  ## Crear y pushear tag de burn (equivalente a make burn-test pero vía webhook): cd <app-repo> && make burn-release-tag ENV=dev (desde el infra repo solo imprime el comando)
+	@echo "$(YELLOW)→ Para disparar el burn pipeline vía webhook desde un repo de app:$(NC)"
+	@echo ""
+	@echo "  cd /ruta/al/repo/de/la/app"
+	@echo "  git tag burn/$(ENV)"
+	@echo "  git push origin burn/$(ENV)"
+	@echo ""
+	@echo "$(GREEN)El webhook gatilla el pipeline burn contra $(ENV).$(NC)"
+	@echo "$(YELLOW)Re-correr el mismo env: borrar el tag local+remoto antes:$(NC)"
+	@echo "  git tag -d burn/$(ENV) && git push --delete origin burn/$(ENV)"
 
 .PHONY: release
 release:  ## Crear y pushear tag de release: make release APP=webserver-api01 TAG=v1.0.0 ENVS=dev

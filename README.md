@@ -1,11 +1,16 @@
 # belo-infrabase-k3d
 
 Stack completo de CI/CD y deployment strategies sobre Kubernetes local con **k3d**.
-Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD, y un pipeline de **7 stages** completamente automatizado con Tekton — desde `git push tag` hasta `Rollout Healthy` con la nueva imagen activa y HPA validado, sin intervención manual.
+Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD, y dos pipelines Tekton:
 
-**Run end-to-end típico** (cold cache): clone (10s) → kaniko build+push (31s) → bump-gitops (11s) → wait-argocd (23s) → k6 load-test 1000 VUs (~2m) → promote-rollback (11s) → burn-to-scale (~3m, valida HPA) = **~6m** desde el push del tag hasta la nueva versión sirviendo 100% del tráfico con capacidad probada. Cada PipelineRun se nombra `<app>-pipelinerun-<tag>` (ej: `webserver-api01-pipelinerun-v1.2.0`).
+- **Release pipeline** (6 stages): desde `git push tag` hasta `Rollout Healthy` con la nueva imagen activa, sin intervención manual. El Stage 6 (promote/rollback) es el dueño de la verdad del release.
+- **Burn pipeline** (2 stages, on-demand): valida que el HPA escala bajo carga. Se dispara con tag `refs/tags/burn/<env>` o `make burn-test`. Vive separado del release porque los capacity tests son ortogonales al despliegue funcional.
 
-Para entender **qué hace cada stage del pipeline, cómo se garantiza que el load test corra sobre la versión nueva, y por qué el circuito de promote/rollback es correcto para BG y Canary**, leer [docs/pipeline-stages.md](docs/pipeline-stages.md).
+**Run end-to-end típico del release** (cold cache): clone (10s) → kaniko build+push (31s) → bump-gitops (11s) → wait-argocd (23s) → k6 load-test 1000 VUs (~2m) → promote-rollback (11s) = **~3m** desde el push del tag hasta la nueva versión sirviendo 100% del tráfico. Cada PipelineRun se nombra `<app>-pipelinerun-<tag>` (ej: `webserver-api01-pipelinerun-v1.2.0`).
+
+**Run del burn pipeline**: ~3-4min de CPU saturada. Disparalo cuando quieras (post-tunear HPA, antes de un evento de tráfico alto, weekly check, etc.) — no en cada release.
+
+Para entender **qué hace cada stage del pipeline de release, cómo se garantiza que el load test corra sobre la versión nueva, por qué el circuito de promote/rollback es correcto para BG y Canary, y por qué el burn vive en pipeline separado**, leer [docs/pipeline-stages.md](docs/pipeline-stages.md).
 
 ---
 
@@ -266,11 +271,38 @@ tkn pipelinerun logs -n tekton-pipelines --last -f
 # http://tekton.localhost:8888/#/pipelineruns
 ```
 
+### Correr el burn pipeline (HPA capacity test)
+
+Pipeline aparte del release, on-demand. Útil para validar HPA después de tunear `targetCPUUtilization` o `maxReplicas`, antes de un evento de tráfico alto, o como check semanal del platform team.
+
+**Vía webhook** (desde el repo de la app):
+```bash
+cd /ruta/al/repo/de/la/app
+git tag burn/dev
+git push origin burn/dev
+```
+
+El segundo trigger del EventListener (`github-tag-burn`) filtra el tag `refs/tags/burn/<env>` y crea un PipelineRun llamado `<app>-burn-<env>-<random>` (generateName — re-correr el mismo env es seguro, cada push genera un run nuevo).
+
+**Manual** (sin webhook):
+```bash
+make burn-test APP=webserver-api01 ENV=dev
+# Observar HPA en paralelo:
+kubectl get hpa webserver-api01-dev -n webserver-api01-dev -w
+```
+
+Outcome del burn:
+- `passed`: HPA escaló de N → M replicas (con M > N) en algún momento de la ventana de 180s. Capacidad validada.
+- `failed`: replicas nunca subieron — revisar `targetCPUUtilization`, `resources.limits.cpu`, o si `hpa.enabled=true`.
+- `skipped`: corrió en production, no quemamos prod por defecto.
+
+Más detalle: [docs/pipeline-stages.md → Pipeline auxiliar — burn-to-scale](docs/pipeline-stages.md#pipeline-auxiliar--burn-to-scale-capacity-test).
+
 ---
 
-## Stages del pipeline
+## Stages del pipeline de release
 
-Las **7 stages** del pipeline `pythonapps-pipeline` (definido en `charts/pythonapps/templates/pipeline-templates/pipeline-pythonapps.yaml`):
+Las **6 stages** del pipeline `pythonapps-pipeline` (definido en `charts/pythonapps/templates/pipeline-templates/pipeline-pythonapps.yaml`):
 
 ```mermaid
 flowchart LR
@@ -279,10 +311,9 @@ flowchart LR
     C --> D[4. wait-argocd]
     D --> E[5. load-test]
     E --> F[6. promote-rollback]
-    F --> G[7. burn-to-scale]
 
     classDef done fill:#dcfce7,stroke:#16a34a
-    class A,B,C,D,E,F,G done
+    class A,B,C,D,E,F done
 ```
 
 | # | Task | Image | Qué hace | Output / Result |
@@ -293,7 +324,18 @@ flowchart LR
 | 4 | `wait-argocd-sync` | `bitnami/kubectl` | (a) Force-refresh ArgoCD app; (b) Espera `.status.sync.revision == commit-sha`; (c) Auto-detecta strategy; (d) Espera `Rollout.spec.image-tag == <tag>` Y `phase=Paused` (BG/Canary) o `phase=Healthy` (Rolling). **Esta task es la que garantiza que Stage 5 corre sobre la versión nueva** | **Results: `primary-env`, `strategy`** |
 | 5 | `run-load-test` | `grafana/k6` | k6 (1000 VUs ramp + sustained) contra preview/canary según strategy. Lee el script desde el repo de la app (`loadtest/`). **Fail-fast** si el script no existe. Thresholds p95<2s, p99<3s, errors<5% (laxos a propósito — solo falla en regresión real) | **Result: `outcome`** = `passed` \| `failed` |
 | 6 | `promote-or-rollback` | `bitnami/kubectl` | Patches directos a la spec/status del Rollout:<br/>• BG passed → `status.pauseConditions=null` → `phase=Healthy`<br/>• Canary passed → `status.promoteFull=true` → `phase=Healthy`<br/>• Cualquier failed → `spec.abort=true` → `phase=Degraded` | — |
-| 7 | `run-burn-to-scale` | sidecar `k6` + step `bitnami/kubectl` | Sidecar genera carga sostenida (200 VUs sin sleep) → CPU >70% → HPA debería escalar. Step principal monitorea `rollout.status.replicas`. Skip en production y si Stage 5 falló (when-clause) | **Results: `outcome`, `baseline-replicas`, `max-replicas`** |
+
+### Pipeline auxiliar — burn-to-scale (capacity test on-demand)
+
+`pythonapps-burn-pipeline` se dispara con tag `refs/tags/burn/<env>` (e.g. `burn/dev`) o con `make burn-test APP=x ENV=dev`. Vive separado del release pipeline para no contaminar el promote con tests lentos que cambian raramente. Detalles en [docs/pipeline-stages.md → Pipeline auxiliar](docs/pipeline-stages.md#pipeline-auxiliar--burn-to-scale-capacity-test).
+
+```mermaid
+flowchart LR
+    A[1. clone] --> B[2. burn-to-scale<br/>sidecar k6 + monitor HPA]
+
+    classDef done fill:#dcfce7,stroke:#16a34a
+    class A,B done
+```
 
 ### Contrato del repo de la app — scripts de load test
 
@@ -310,13 +352,13 @@ El Stage 5 lee los scripts k6 desde el **repo de la app**, no desde este repo. E
 └── pyproject.toml
 ```
 
-| strategy del Helm chart | Script Stage 5 | Script Stage 7 (siempre) |
-|-------------------------|----------------|--------------------------|
+| strategy del Helm chart | Script Stage 5 (release pipeline) | Script Burn pipeline (on-demand) |
+|-------------------------|-----------------------------------|----------------------------------|
 | `bluegreen` | `loadtest/load-bluegreen.js` | `loadtest/burn-to-scale.js` |
 | `canary` | `loadtest/load-canary.js` | `loadtest/burn-to-scale.js` |
 | `rollingupdate` | `loadtest/smoke.js` | `loadtest/burn-to-scale.js` |
 
-**Si el script no existe, el pipeline falla ruidosamente** (exit 1). Esto previene que cambiar la strategy del chart sin tener el load test correspondiente termine en un "verde fantasma". Si querés que la app soporte cualquier strategy futura, agregá los 3 scripts.
+**Si el script no existe, el pipeline falla ruidosamente** (exit 1). Esto previene que cambiar la strategy del chart sin tener el load test correspondiente termine en un "verde fantasma". Si querés que la app soporte cualquier strategy futura, agregá los 3 scripts. El `burn-to-scale.js` es requerido por el burn pipeline cualquiera sea la strategy.
 
 El task pasa al script las env vars `BASE_URL` y `PREVIEW_URL` apuntando a los services internos del cluster (`<release>-stable.<ns>.svc:8080` / `<release>-preview.<ns>.svc:8080`). Los fallbacks hardcodeados en los .js solo se usan para corridas locales (`make load-test-*`).
 
@@ -574,6 +616,7 @@ make rollout-abort APP=webserver-api01       # rollback
 make load-test-smoke APP=webserver-api01     # smoke test k6
 make load-test-bluegreen                     # load test 1000 VUs contra preview
 make load-test-canary                        # load test 1000 VUs canary
+make burn-test APP=webserver-api01 ENV=dev   # burn pipeline (HPA capacity test)
 make dashboards-apply                        # aplicar/recargar dashboards Grafana
 make tunnel                                  # ngrok → exponer EventListener
 make port-forward                            # port-forward de fallback

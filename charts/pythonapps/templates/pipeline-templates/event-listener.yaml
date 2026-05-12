@@ -7,14 +7,14 @@ metadata:
 spec:
   serviceAccountName: tekton-triggers-sa
   triggers:
-  - name: github-tag-push
+  # Trigger 1: tags `refs/tags/release/<semver>/<envs>` → pipeline de release (6 stages)
+  - name: github-tag-release
     interceptors:
     - ref:
         name: "cel"
         kind: ClusterInterceptor
       params:
       - name: filter
-        # Require tag format: refs/tags/release/<semver>/<envs>
         value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/release/') && body.ref.split('/').size() >= 4"
       - name: overlays
         value:
@@ -25,12 +25,35 @@ spec:
           # Optional 5th segment: comma-separated envs. Default to 'dev' if absent.
           expression: "body.ref.split('/').size() > 4 ? body.ref.split('/')[4] : 'dev'"
         - key: git_revision
-          # Full tag ref for git checkout
           expression: "body.ref"
     bindings:
     - ref: github-tag-binding
     template:
       ref: pythonapps-trigger-template
+
+  # Trigger 2: tags `refs/tags/burn/<env>` → pipeline de capacity test (2 stages, on-demand)
+  # Es un trigger SEPARADO con su propio binding + template para que la separación
+  # de pipelines quede explícita: ningún param compartido entre release y burn.
+  - name: github-tag-burn
+    interceptors:
+    - ref:
+        name: "cel"
+        kind: ClusterInterceptor
+      params:
+      - name: filter
+        # Format: refs/tags/burn/<env> → 4 segmentos exactos
+        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/burn/') && body.ref.split('/').size() == 4"
+      - name: overlays
+        value:
+        - key: burn_env
+          # refs/tags/burn/dev → split → [refs,tags,burn,dev] → index 3
+          expression: "body.ref.split('/')[3]"
+        - key: git_revision
+          expression: "body.ref"
+    bindings:
+    - ref: github-burn-binding
+    template:
+      ref: pythonapps-burn-trigger-template
 ---
 # Ingress para recibir webhooks desde GitHub (expuesto via NodePort 8888)
 apiVersion: networking.k8s.io/v1

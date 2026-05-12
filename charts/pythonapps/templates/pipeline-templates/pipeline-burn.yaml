@@ -1,0 +1,74 @@
+{{- if .Values.tekton.enabled }}
+# Pipeline dedicado para HPA capacity validation.
+#
+# Disparadores:
+#   1. Webhook GitHub con tag `refs/tags/burn/<env>` (e.g. burn/dev)
+#   2. Manual: `make burn-test APP=webserver-api01 ENV=dev`
+#
+# Por qué separado del release pipeline:
+#   - El release pipeline cubre correctness FUNCIONAL (smoke/load test) y
+#     promote/rollback. Su Stage final (promote) es el dueño de la verdad.
+#   - El burn-to-scale valida CAPACIDAD (¿escala el HPA?). Es ortogonal,
+#     costoso (~3min de CPU saturada), y la config del HPA cambia rara vez,
+#     así que correrlo en cada release es ruido.
+#   - Enterprise pattern: capacity / chaos tests viven en un pipeline aparte
+#     que corre on-demand o schedulado contra deployments ya estables.
+#
+# Stages (solo 2):
+#   1. clone — trae el repo de la app al workspace (necesitamos el script
+#      loadtest/burn-to-scale.js).
+#   2. burn-to-scale — sidecar k6 genera carga sostenida + step kubectl
+#      monitorea rollout.status.replicas. Outcome=passed si vio scale-up.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: pythonapps-burn-pipeline
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: repo-url
+    type: string
+  - name: revision
+    type: string
+    default: main
+  - name: app-name
+    type: string
+  - name: environment
+    type: string
+    default: dev
+    description: "Env contra el que correr el burn (single env — no comma-separated)."
+  workspaces:
+  - name: source
+
+  tasks:
+  # Stage 1: clone para tener loadtest/burn-to-scale.js en el workspace
+  - name: clone
+    taskRef:
+      name: git-clone-app
+    workspaces:
+    - name: output
+      workspace: source
+    params:
+    - name: url
+      value: $(params.repo-url)
+    - name: revision
+      value: $(params.revision)
+
+  # Stage 2: burn + monitor HPA
+  - name: burn-to-scale
+    taskRef:
+      name: run-burn-to-scale
+    runAfter: [clone]
+    workspaces:
+    - name: source
+      workspace: source
+    params:
+    - name: app-name
+      value: $(params.app-name)
+    - name: environments
+      value: $(params.environment)
+    # strategy no es usado por el Task (siempre targetea stable svc), pero
+    # el Task lo declara como param — pasamos string vacío.
+    - name: strategy
+      value: ""
+{{- end }}

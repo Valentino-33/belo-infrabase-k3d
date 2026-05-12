@@ -1,0 +1,46 @@
+# PipelineRun manual del burn pipeline (sin webhook).
+# Usar: make burn-test APP=webserver-api01 ENV=dev
+# O con envsubst: APP=webserver-api01 ENV=dev envsubst < pipelinerun-burn-manual.yaml | kubectl create -f -
+#
+# generateName (no name fijo) — el burn es idempotente y se espera correrlo
+# varias veces. Tekton agrega sufijo random.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: ${APP}-burn-${ENV}-
+  namespace: tekton-pipelines
+  labels:
+    pipeline: burn
+    app: ${APP}
+    env: ${ENV}
+spec:
+  pipelineRef:
+    name: pythonapps-burn-pipeline
+  taskRunTemplate:
+    serviceAccountName: tekton-pipeline-runner
+    podTemplate:
+      tolerations:
+      - key: workload
+        value: cicd
+        operator: Equal
+        effect: NoSchedule
+      nodeSelector:
+        role: cicd
+  params:
+  - name: repo-url
+    value: https://github.com/Valentino-33/${APP}
+  - name: revision
+    value: main
+  - name: app-name
+    value: ${APP}
+  - name: environment
+    value: ${ENV}
+  workspaces:
+  - name: source
+    volumeClaimTemplate:
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi

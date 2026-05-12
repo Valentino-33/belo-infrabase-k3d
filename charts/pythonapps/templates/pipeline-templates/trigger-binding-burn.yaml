@@ -1,0 +1,19 @@
+{{- if .Values.tekton.enabled }}
+# Binding para tags `refs/tags/burn/<env>`. No hay image-tag (no buildeamos),
+# solo necesitamos el env contra el que validar el HPA.
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: github-burn-binding
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: repo-url
+    value: $(body.repository.clone_url)
+  - name: app-name
+    value: $(body.repository.name)
+  - name: environment
+    value: $(extensions.burn_env)
+  - name: revision
+    value: $(extensions.git_revision)
+{{- end }}

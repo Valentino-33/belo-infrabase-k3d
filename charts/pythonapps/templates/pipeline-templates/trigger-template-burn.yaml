@@ -1,0 +1,58 @@
+{{- if .Values.tekton.enabled }}
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: pythonapps-burn-trigger-template
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: repo-url
+  - name: app-name
+  - name: environment
+  - name: revision
+    default: main
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1
+    kind: PipelineRun
+    metadata:
+      # generateName en lugar de name fijo: a diferencia del release pipeline
+      # (donde re-pushear el mismo semver debe fallar), el burn pipeline es
+      # idempotente y se espera correrlo múltiples veces contra el mismo env.
+      generateName: $(tt.params.app-name)-burn-$(tt.params.environment)-
+      namespace: tekton-pipelines
+      labels:
+        pipeline: burn
+        app: $(tt.params.app-name)
+        env: $(tt.params.environment)
+    spec:
+      pipelineRef:
+        name: pythonapps-burn-pipeline
+      taskRunTemplate:
+        serviceAccountName: tekton-pipeline-runner
+      podTemplate:
+        tolerations:
+        - key: workload
+          value: cicd
+          operator: Equal
+          effect: NoSchedule
+        nodeSelector:
+          role: cicd
+      params:
+      - name: repo-url
+        value: $(tt.params.repo-url)
+      - name: app-name
+        value: $(tt.params.app-name)
+      - name: environment
+        value: $(tt.params.environment)
+      - name: revision
+        value: $(tt.params.revision)
+      workspaces:
+      - name: source
+        volumeClaimTemplate:
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: local-path
+            resources:
+              requests:
+                storage: 1Gi
+{{- end }}
