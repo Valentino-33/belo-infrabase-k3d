@@ -37,14 +37,13 @@ spec:
   - name: loadgen
     image: grafana/k6:latest
     workingDir: $(workspaces.source.path)
-    securityContext:
-      runAsNonRoot: true
-      runAsUser: 65532
-      allowPrivilegeEscalation: false
-      capabilities:
-        drop: ["ALL"]
-      seccompProfile:
-        type: RuntimeDefault
+    # NO seteamos securityContext (runAsNonRoot: true rompe el sidecar):
+    # Tekton init container `place-scripts` escribe el script como root
+    # en /tekton/scripts/sidecar-script-*. Si después el sidecar dropea
+    # a UID 65532, no tiene permisos exec sobre el script → "permission
+    # denied". El namespace tekton-pipelines está en PSA baseline, root
+    # está permitido. La k6 image tiene su propio usuario interno k6,
+    # corre fine.
     env:
     - name: HOME
       value: /tekton/home
