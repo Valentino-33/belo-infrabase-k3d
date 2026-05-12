@@ -31,6 +31,19 @@ spec:
       items:
       - key: token
         path: token
+  stepTemplate:
+    env:
+    - name: HOME
+      value: /tekton/home
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
   steps:
   - name: clone-gitops
     image: alpine/git:latest
@@ -41,7 +54,7 @@ spec:
     script: |
       #!/bin/sh
       set -e
-      TOKEN=$(cat /workspace/git-token/token)
+      TOKEN=$(tr -d '[:space:]' < /workspace/git-token/token)
       AUTH_URL=$(echo "$(params.gitops-repo-url)" | sed "s|https://|https://x-access-token:${TOKEN}@|")
       git clone "$AUTH_URL" "$(workspaces.gitops.path)/gitops"
       echo "Gitops clonado"
@@ -79,12 +92,10 @@ spec:
     script: |
       #!/bin/sh
       set -e
-      TOKEN=$(cat /workspace/git-token/token)
+      TOKEN=$(tr -d '[:space:]' < /workspace/git-token/token)
       cd "$(workspaces.gitops.path)/gitops"
       git config user.name "$(params.git-user-name)"
       git config user.email "$(params.git-user-email)"
-      AUTH_URL=$(git remote get-url origin | sed "s|https://|https://x-access-token:${TOKEN}@|")
-      git remote set-url origin "$AUTH_URL"
       git add .
       if git diff --staged --quiet; then
         echo "Sin cambios que commitear"
@@ -92,5 +103,8 @@ spec:
       fi
       ENVS_LABEL=$(echo "$(params.environments)" | tr ',' '+')
       git commit -m "bump $(params.app-name) a $(params.image-tag) en [${ENVS_LABEL}]"
-      git push origin main
+      # Compute push URL from the pristine pipeline param to avoid doubling
+      # the token (origin remote already contains auth from the clone step).
+      PUSH_URL=$(echo "$(params.gitops-repo-url)" | sed "s|https://|https://x-access-token:${TOKEN}@|")
+      git push "$PUSH_URL" main
 {{- end }}

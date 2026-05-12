@@ -75,7 +75,10 @@
       "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\); [print\\(c['type'],':',c['message']\\) for c in data]\")",
       "Bash(git rm *)",
       "Bash(git reset *)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "PowerShell(ngrok config *)",
+      "Bash(xargs grep -l \"eventlistener\\\\|tekton-webhook\\\\|EventListener\")",
+      "Bash(xargs grep -l \"TriggerBinding\\\\|TriggerTemplate\\\\|github-tag-binding\")"
     ]
   }
 }

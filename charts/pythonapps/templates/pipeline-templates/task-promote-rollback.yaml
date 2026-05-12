@@ -17,12 +17,28 @@ spec:
   - name: outcome
     type: string
     default: passed
+  stepTemplate:
+    env:
+    - name: HOME
+      value: /tekton/home
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
   steps:
   - name: promote-or-abort
     image: bitnami/kubectl:latest
     script: |
       #!/bin/sh
       set -e
+      # Prepend $HOME/bin (where we install the kubectl-argo-rollouts plugin
+      # as nonroot) without clobbering the image's default PATH.
+      export PATH="$HOME/bin:$PATH"
       PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
       # namespace y nombre de rollout = app-name + env
@@ -52,13 +68,13 @@ spec:
         exit 0
       fi
 
-      # Download kubectl-argo-rollouts plugin
+      # Download kubectl-argo-rollouts plugin (nonroot — instalar bajo $HOME/bin que ya está en PATH)
       if ! command -v kubectl-argo-rollouts >/dev/null 2>&1; then
         PLUGIN_URL="https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64"
         echo "Downloading kubectl-argo-rollouts..."
-        curl -sL "$PLUGIN_URL" -o /tmp/kubectl-argo-rollouts
-        chmod +x /tmp/kubectl-argo-rollouts
-        mv /tmp/kubectl-argo-rollouts /usr/local/bin/kubectl-argo-rollouts
+        mkdir -p "$HOME/bin"
+        curl -sL "$PLUGIN_URL" -o "$HOME/bin/kubectl-argo-rollouts"
+        chmod +x "$HOME/bin/kubectl-argo-rollouts"
       fi
 
       case "$STRATEGY" in

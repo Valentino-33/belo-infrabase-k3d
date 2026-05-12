@@ -19,6 +19,19 @@ spec:
     description: "First environment in the list (target for stages 5-6)"
   - name: strategy
     description: "Detected rollout strategy: bluegreen, canary, or rollingupdate"
+  stepTemplate:
+    env:
+    - name: HOME
+      value: /tekton/home
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
   steps:
   - name: wait-argocd
     image: bitnami/kubectl:latest

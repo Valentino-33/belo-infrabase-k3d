@@ -11,17 +11,17 @@ spec:
     name: pythonapps-pipeline
   taskRunTemplate:
     serviceAccountName: tekton-pipeline-runner
-  podTemplate:
-    tolerations:
-    - key: workload
-      value: cicd
-      operator: Equal
-      effect: NoSchedule
-    nodeSelector:
-      role: cicd
+    podTemplate:
+      tolerations:
+      - key: workload
+        value: cicd
+        operator: Equal
+        effect: NoSchedule
+      nodeSelector:
+        role: cicd
   params:
   - name: repo-url
-    value: https://github.com/Valentino-33/belo-infrabase-k3d
+    value: https://github.com/Valentino-33/${APP}
   - name: revision
     value: main
   - name: app-name

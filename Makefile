@@ -247,7 +247,7 @@ secrets-apply:  ## Crear secretos: make secrets-apply DOCKERHUB_USER=x DOCKERHUB
 pipeline-run:  ## Disparar pipeline manual: make pipeline-run APP=webserver-api01 TAG=v0.1.0
 	@echo "$(YELLOW)→ Iniciando PipelineRun para $(APP):$(TAG)...$(NC)"
 	APP=$(APP) TAG=$(TAG) DOCKERHUB_USER=$(DOCKERHUB_USER) \
-	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl apply -f -
+	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl create -f -
 	@echo "$(GREEN)✓ PipelineRun creado — monitoreá con:$(NC)"
 	@echo "   tkn pipelinerun logs -n tekton-pipelines --last -f"
 
@@ -426,12 +426,12 @@ cluster-info:  ## Mostrar URLs, passwords y comandos útiles de un vistazo
 
 .PHONY: tunnel
 tunnel:  ## Exponer EventListener a internet con ngrok (requiere ngrok instalado)
-	@echo "$(YELLOW)→ Iniciando ngrok en puerto 8888...$(NC)"
+	@echo "$(YELLOW)→ Iniciando ngrok en puerto 8888 (host-header=tekton-webhook.localhost)...$(NC)"
 	@echo "$(YELLOW)  Una vez activo, copiá la URL https:// y configurala en GitHub:"$(NC)
 	@echo "  Settings → Webhooks → Payload URL: <ngrok-url>"
-	@echo "  Content type: application/json  |  Events: Push"
+	@echo "  Content type: application/json  |  Events: Push (incluye tags)"
 	@echo ""
-	ngrok http 8888
+	ngrok http --host-header=tekton-webhook.localhost 8888
 
 .PHONY: load-test-smoke
 load-test-smoke:  ## Smoke test: make load-test-smoke APP=webserver-api01

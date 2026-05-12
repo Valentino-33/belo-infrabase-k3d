@@ -13,6 +13,19 @@ spec:
     default: main
   workspaces:
   - name: output
+  stepTemplate:
+    env:
+    - name: HOME
+      value: /tekton/home
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
   steps:
   - name: clone
     image: alpine/git:latest

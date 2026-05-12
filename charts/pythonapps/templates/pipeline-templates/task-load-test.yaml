@@ -20,6 +20,19 @@ spec:
     description: "passed or failed"
   workspaces:
   - name: source
+  stepTemplate:
+    env:
+    - name: HOME
+      value: /tekton/home
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
   steps:
   - name: run-k6
     image: grafana/k6:latest
