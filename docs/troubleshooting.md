@@ -1,0 +1,536 @@
+# Troubleshooting
+
+Gotchas concretos hit durante el desarrollo del pipeline. Cada entrada tiene **síntoma**, **causa raíz**, y **fix**. Ordenados aproximadamente en el orden en que aparecerían si tropezás con el sistema por primera vez.
+
+---
+
+## Setup & cluster
+
+### `make tunnel` falla con "Your ngrok-agent version is too old"
+
+**Síntoma**:
+```
+authentication failed: Your ngrok-agent version "3.3.1" is too old.
+The minimum supported agent version for your account is "3.20.0".
+ERR_NGROK_121
+```
+
+**Causa**: cuentas free de ngrok ahora requieren cliente ≥ 3.20.0.
+
+**Fix**:
+```bash
+ngrok update                    # autoupdater oficial
+# o
+winget upgrade ngrok.ngrok      # si fue instalado con winget
+```
+
+### `make tunnel` arranca pero los webhooks devuelven 404
+
+**Síntoma**: ngrok corre OK, pero curlear su URL pública devuelve 404 desde nginx.
+
+**Causa**: ngrok no está reescribiendo el `Host` header al hostname que nginx-ingress espera (`tekton-webhook.localhost`).
+
+**Fix**: asegurate de que el Makefile lance ngrok con `--host-header`:
+```makefile
+.PHONY: tunnel
+tunnel:
+	ngrok http --host-header=tekton-webhook.localhost 8888
+```
+
+Verificá con:
+```bash
+curl -i -X POST https://<ngrok-url>/ \
+  -H "X-GitHub-Event: ping" \
+  -H "Content-Type: application/json" \
+  -d '{"zen":"test"}'
+# Esperado: HTTP/1.1 202 Accepted
+```
+
+### Pods de la app en `ImagePullBackOff` después de `make bootstrap`
+
+**Síntoma**: ArgoCD muestra las apps como `OutOfSync`/`Degraded`, pods en `ImagePullBackOff`.
+
+**Causa**: las imágenes `<dockerhub-user>/api01:latest` y `api02:latest` no existen aún en Docker Hub.
+
+**Fix**:
+```bash
+make images-initial DOCKERHUB_USER=<tu-usuario>
+kubectl -n webserver-api01-dev delete pod --all
+kubectl -n webserver-api02-dev delete pod --all
+```
+
+---
+
+## Pipeline / Tekton
+
+### `make pipeline-run` falla con `error: from ...-manual-run-: cannot use generate name with apply`
+
+**Síntoma (histórico)**:
+```
+APP=... | kubectl apply -f -
+error: from webserver-api01-manual-run-: cannot use generate name with apply
+make: *** [pipeline-run] Error 1
+```
+
+**Causa**: el manifest usaba `generateName` (que requería `kubectl create`, no `apply`).
+
+**Fix**: doble: (a) el Makefile usa `kubectl create -f -` para PipelineRuns; (b) el manifest pasó a usar `name` determinístico (`<app>-pipelinerun-<tag>`) en lugar de `generateName`. Si volvés a ver el síntoma, verificá ambas cosas.
+
+### `make pipeline-run` falla con `error from server (AlreadyExists)`
+
+**Síntoma**:
+```
+error from server (AlreadyExists): error when creating "STDIN":
+pipelineruns.tekton.dev "webserver-api01-pipelinerun-v1.2.0" already exists
+```
+
+**Causa**: el nombre del PipelineRun es **determinístico** (`<app>-pipelinerun-<tag>`). Si intentás correr dos veces con el mismo `TAG`, falla porque ya existe un PipelineRun con ese nombre.
+
+Es comportamiento **intencional** — fuerza disciplina de semver y evita que un re-push silencioso sobrescriba el historial.
+
+**Fix**:
+- **Recomendado**: usar un semver nuevo (`v1.2.1`, `v1.3.0`, etc.)
+- **Si querés re-correr el mismo tag**: eliminar el run viejo primero:
+```bash
+kubectl delete pipelinerun webserver-api01-pipelinerun-v1.2.0 -n tekton-pipelines
+# Después re-correr con el mismo TAG
+make pipeline-run APP=webserver-api01 TAG=v1.2.0
+```
+
+Lo mismo aplica al flujo webhook: re-pushear el mismo tag a GitHub dispara el EventListener, pero la creación del PipelineRun en el cluster falla con `AlreadyExists`. Para forzar re-corrida, borrar el run viejo y re-pushear (o usar `git push --force` + nuevo commit en el tag, pero entonces es más limpio bumpear el semver).
+
+### `kubectl create -f -` falla con `unknown field "spec.podTemplate"`
+
+**Síntoma**:
+```
+PipelineRun in version "v1" cannot be handled as a PipelineRun:
+strict decoding error: unknown field "spec.podTemplate"
+```
+
+**Causa**: el manifest usa la forma de v1beta1 (`spec.podTemplate`). En `tekton.dev/v1` se movió bajo `spec.taskRunTemplate.podTemplate`.
+
+**Fix**: ya corregido en `manifests/tekton/pipelinerun-manual.yaml`. Si volvés a verlo en un manifest custom:
+```yaml
+# ANTES (v1beta1)
+spec:
+  taskRunTemplate:
+    serviceAccountName: ...
+  podTemplate:
+    tolerations: ...
+
+# DESPUÉS (v1)
+spec:
+  taskRunTemplate:
+    serviceAccountName: ...
+    podTemplate:
+      tolerations: ...
+```
+
+### Stage 2 (kaniko) falla con `PodAdmissionFailed`
+
+**Síntoma**:
+```
+pods "...-build-push-pod" is forbidden: violates PodSecurity "restricted:latest":
+  allowPrivilegeEscalation != false (containers "prepare", "place-scripts", "step-build-and-push" must set securityContext.allowPrivilegeEscalation=false),
+  unrestricted capabilities (...must set securityContext.capabilities.drop=["ALL"]),
+  runAsNonRoot != true (...must set securityContext.runAsNonRoot=true),
+  seccompProfile (...must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+```
+
+**Causa**: el namespace `tekton-pipelines` tiene `pod-security.kubernetes.io/enforce=restricted` (viene del `release.yaml` oficial de Tekton). Kaniko necesita root y no puede cumplir restricted.
+
+**Fix**:
+```bash
+kubectl label namespace tekton-pipelines \
+  pod-security.kubernetes.io/enforce=baseline --overwrite
+```
+
+Ver [security-and-rbac.md → PodSecurity](security-and-rbac.md#1-podsecurity-standards) para el razonamiento.
+
+### Stage 2 (kaniko) falla con `error resolving dockerfile path`
+
+**Síntoma**:
+```
+Error: error resolving dockerfile path: please provide a valid path to a Dockerfile within the build context with --dockerfile
+```
+
+**Causa**: el `context` que `git-clone-app` deposita en `/workspace/source/src` no tiene un Dockerfile en el subdir que `kaniko` busca (`src/Dockerfile` por default).
+
+**Fix**: verificá que el repo de la app tenga el Dockerfile en la **raíz** del repo. El clone hace `git clone <repo> /workspace/source/src`, así que la raíz del repo queda en `/workspace/source/src`, y el Dockerfile en `/workspace/source/src/Dockerfile`. El param `context=src` del kaniko Task apunta a ese directorio.
+
+Si tu Dockerfile vive en un subdirectorio (e.g., `apps/api/Dockerfile`), pasá `--context=src/apps/api` al kaniko Task.
+
+### Stage 2 (kaniko) falla con `BackendUnavailable: Cannot import 'setuptools.backends.legacy'`
+
+**Síntoma**:
+```
+pip._vendor.pyproject_hooks._impl.BackendUnavailable: Cannot import 'setuptools.backends.legacy'
+```
+
+**Causa**: el `pyproject.toml` de la app declara `build-backend = "setuptools.backends.legacy:build"` que **no existe**. El nombre correcto es `setuptools.build_meta` (o `setuptools.build_meta:__legacy__` para el modo legacy).
+
+**Fix**: en el repo de la app:
+```toml
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+```
+
+### Stage 3 (bump-gitops) falla con `URL rejected: Port number was not a decimal number`
+
+**Síntoma**:
+```
+fatal: unable to access 'https://x-access-token:ghp_xxx@github.com/org/repo/':
+URL rejected: Port number was not a decimal number between 0 and 65535
+```
+
+**Causa**: el step `clone-gitops` clona con el token embebido en la URL del remote (`https://x-access-token:TOKEN@github.com/...`). La versión anterior del step `commit-and-push` hacía `git remote get-url origin | sed 's|https://|https://x-access-token:NEW@|'`, lo que producía una URL con **dos** `@`:
+
+```
+https://x-access-token:NEW@x-access-token:OLD@github.com/...
+```
+
+curl parsea el **primer** `@` como fin de userinfo → interpreta `x-access-token` como host y `OLD@github.com/...` como port (no numérico) → error.
+
+**Fix**: ya aplicado en `task-bump-gitops.yaml`. El step `commit-and-push` ahora computa la push URL desde `$(params.gitops-repo-url)` (pristine, sin token):
+
+```sh
+PUSH_URL=$(echo "$(params.gitops-repo-url)" | \
+  sed "s|https://|https://x-access-token:${TOKEN}@|")
+git push "$PUSH_URL" main
+```
+
+### Stage 3 (bump-gitops) falla con `Authentication failed`
+
+**Síntoma**:
+```
+fatal: Authentication failed for 'https://x-access-token:ghp_xxx@github.com/...'
+```
+
+**Causa**: el PAT expirando, revocado, o sin scope `repo`.
+
+**Fix**:
+1. Generar un PAT nuevo en GitHub → Settings → Developer settings → Personal access tokens → **scopes: `repo`**
+2. Actualizar el secret:
+```bash
+kubectl create secret generic github-token \
+  --from-literal=token=<NUEVO_PAT> \
+  -n tekton-pipelines \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+### Stage 4 (wait-argocd) timeout esperando Synced+Healthy
+
+**Síntoma**: `wait-argocd` queda 10 minutos en loop con `sync=Synced health=Progressing` y termina con timeout.
+
+**Causa (histórica)**: la versión anterior esperaba `sync=Synced AND health=Healthy`. Pero los Rollouts BlueGreen/Canary reportan `health=Progressing` mientras están `Paused`. Nunca llegaba a `Healthy` (eso solo pasa después del promote).
+
+**Fix**: ya aplicado. La task ahora solo espera `sync=Synced` (no health). Ver [pipeline-internals.md → wait-argocd](pipeline-internals.md#4-wait-argocd-sync).
+
+### Pipeline corre verde pero la imagen no se actualizó
+
+**Síntoma**: las 6 stages terminan `Succeeded`, pero el Rollout sigue con la versión anterior. `kubectl get rollout` muestra `image=docker.io/user/app:v0.4.5` cuando el pipeline corrió con `tag=v0.4.6`.
+
+**Causa**: **race condition** entre el pipeline y ArgoCD. ArgoCD polea el gitops cada ~3 minutos por default. Sin forzar refresh, `wait-argocd` veía el `sync.revision` viejo como `Synced` y avanzaba inmediatamente. Load-test corría contra la versión vieja. `promote-rollback` patcheaba un Rollout ya `Healthy` (no-op).
+
+**Fix**: ya aplicado. El pipeline ahora:
+1. `bump-gitops` emite el SHA del commit como Task result `commit-sha`
+2. `wait-argocd` recibe ese SHA como param, hace `kubectl annotate app ... argocd.argoproj.io/refresh=normal` para forzar polling inmediato, y espera que `.status.sync.revision == commit-sha`
+3. Step 2 verifica que `.spec.template.spec.containers[0].image` ya tenga el tag esperado **Y** `phase=Paused` (BG/Canary)
+
+Si volvés a ver el síntoma, chequear:
+- `task-bump-gitops.yaml` debe tener `results: - name: commit-sha`
+- `pipeline-pythonapps.yaml` debe mapear `tasks.bump-gitops.results.commit-sha` → `wait-argocd.params.expected-commit-sha` y `params.image-tag` → `wait-argocd.params.image-tag`
+- La SA `tekton-pipeline-runner` debe tener verb `patch` sobre `applications` (necesario para el annotate)
+
+### Stage 6 (promote-rollback) reporta "promoted" pero el Rollout vuelve a Paused
+
+**Síntoma (histórico, usando el plugin)**:
+```
+BlueGreen: PASSED — promoting green to stable
+rollout 'webserver-api01-dev' promoted
+=== Done ===
+```
+Pero `kubectl get rollout` muestra `phase=BlueGreenPause` ~10s después.
+
+**Causa**: `kubectl argo rollouts promote` (el plugin oficial) reporta éxito pero no persiste. Causa exacta no aislada — posiblemente race con ArgoCD reaplicando el manifest, posiblemente patches a campos que el controller revierte.
+
+**Fix**: ya aplicado. El step `promote-rollback` ahora usa `kubectl patch` directo al status subresource:
+
+```sh
+# BG passed
+kubectl patch rollout NAME -n NS --subresource=status --type=merge \
+  -p '{"status":{"pauseConditions":null}}'
+
+# Canary passed (full)
+kubectl patch rollout NAME -n NS --subresource=status --type=merge \
+  -p '{"status":{"promoteFull":true}}'
+
+# Any strategy failed
+kubectl patch rollout NAME -n NS --type=merge \
+  -p '{"spec":{"abort":true}}'
+```
+
+Estos son los mismos patches que el plugin emite internamente (según [`promote.go`](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)), aplicados directo. Persisten correctamente.
+
+### Stage 6 falla con `kubectl: command not found`
+
+**Síntoma**: el step `promote-or-abort` falla con:
+```
+/tekton/scripts/script-0-XXXXX: line N: kubectl: command not found
+```
+
+**Causa**: histórica — el `stepTemplate` setaba un override global de `PATH` (`/tekton/home/bin:/usr/local/sbin:...`) que **excluía** `/opt/bitnami/kubectl/bin` donde la imagen `bitnami/kubectl` tiene su binario.
+
+**Fix**: ya aplicado. El override de PATH se sacó del `stepTemplate` y se movió al script específico que lo necesita (con `export PATH="$HOME/bin:$PATH"` que **prepend** sin override total).
+
+### Stage 5 (load-test) falla con `ERROR: ... no encontrado en el repo de la app`
+
+**Síntoma**:
+```
+ERROR: /workspace/source/src/loadtest/load-canary.js no encontrado en el repo de la app.
+       strategy=canary requiere el script: load-canary.js
+       Agregalo al repo de la app en loadtest/load-canary.js y re-disparar.
+```
+
+**Causa**: el Helm chart de la app declara `rollout.strategy: canary` (o `bluegreen`), pero el repo de la app no tiene el `loadtest/<script>.js` correspondiente. Antes de esta fix, el Stage 5 silenciosamente emitía `outcome=passed` y el rollout se promovía sin haber sido testeado. Ahora **fail-fast**.
+
+**Fix**:
+1. En el repo de la app, agregar el script faltante en `loadtest/`. Modelo:
+```js
+// loadtest/load-canary.js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '10s', target: 5 },
+    { duration: '20s', target: 5 },
+    { duration: '10s', target: 0 },
+  ],
+  thresholds: { http_req_duration: ['p(95)<600'], errors: ['rate<0.005'] },
+};
+
+const BASE_URL = __ENV.BASE_URL || 'http://<release>-stable.<ns>.svc.cluster.local:8080';
+
+export default function () {
+  const res = http.get(`${BASE_URL}/health`);
+  check(res, { 'status 200': (r) => r.status === 200 });
+  sleep(0.5);
+}
+```
+
+2. Commit + push al repo de la app
+3. Re-pushear el tag (con un semver nuevo, o borrar el PipelineRun viejo primero)
+
+| strategy | Script requerido en `loadtest/` |
+|----------|---------------------------------|
+| `bluegreen` | `load-bluegreen.js` |
+| `canary` | `load-canary.js` |
+| `rollingupdate` | `smoke.js` |
+
+### EventListener `MinimumReplicasUnavailable`
+
+**Síntoma**: después de `make tekton-apply`, `kubectl get eventlisteners` muestra `Ready=False`.
+
+**Causa**: el operator de Tekton Triggers tarda ~30-60s en crear el Deployment `el-github-tag-listener` y esperar a que el pod esté Ready.
+
+**Fix**: esperá un minuto. Verificá con:
+```bash
+kubectl -n tekton-pipelines get pods -l eventlistener=github-tag-listener
+kubectl -n tekton-pipelines describe eventlistener github-tag-listener
+```
+
+Si después de 2 minutos sigue Down, revisar logs:
+```bash
+kubectl -n tekton-pipelines logs deployment/tekton-triggers-controller --tail=50
+```
+
+---
+
+## ArgoCD / GitOps
+
+### ArgoCD muestra `OutOfSync` para apps después de tocar el chart
+
+**Síntoma**: editaste algo en `charts/pythonapps/` pero ArgoCD no detecta el cambio.
+
+**Causa**: ArgoCD polea cada ~3 minutos. Si no querés esperar:
+
+**Fix**:
+```bash
+kubectl annotate application webserver-api01-dev -n argocd \
+  argocd.argoproj.io/refresh=normal --overwrite
+```
+
+> Eso es exactamente lo que hace el `wait-argocd` Task en su step 1.
+
+### Las apps siguen en `OutOfSync` después del refresh
+
+**Síntoma**: el refresh muestra Sync OK pero el Rollout no se actualiza.
+
+**Causa**: los Tekton CRDs (Tasks, Pipeline, EventListener) **no** están en el árbol de gitops que sigue ArgoCD — los gestiona `make tekton-apply`. Si una Task la prunaron desde ArgoCD por error:
+
+**Fix**:
+```bash
+make tekton-apply
+```
+
+---
+
+## Rollout / Argo Rollouts
+
+### Rollout queda en `Paused` después de promover manualmente
+
+**Síntoma**: hiciste `kubectl argo rollouts promote ROLLOUT -n NS` y el comando dice OK, pero el Rollout sigue `BlueGreenPause` 10s después.
+
+**Causa**: mismo issue del plugin que vimos en el pipeline.
+
+**Fix**: usar el patch directo:
+```bash
+# BlueGreen — clear pauseConditions
+kubectl patch rollout ROLLOUT -n NS --subresource=status --type=merge \
+  -p '{"status":{"pauseConditions":null}}'
+
+# Canary — promote-full
+kubectl patch rollout ROLLOUT -n NS --subresource=status --type=merge \
+  -p '{"status":{"promoteFull":true}}'
+
+# Abort (rollback)
+kubectl patch rollout ROLLOUT -n NS --type=merge \
+  -p '{"spec":{"abort":true}}'
+```
+
+### Cómo determinar qué RS es stable vs preview/canary
+
+```bash
+kubectl get rollout ROLLOUT -n NS -o jsonpath='\
+phase={.status.phase}
+stableRS={.status.stableRS}
+currentPodHash={.status.currentPodHash}
+activeSelector={.status.blueGreen.activeSelector}
+previewSelector={.status.blueGreen.previewSelector}
+'
+```
+
+- `stableRS == currentPodHash` → no hay deploy en curso, Rollout Healthy
+- `stableRS != currentPodHash AND phase=Paused` → green/canary RS levantado, esperando promote
+- `activeSelector` apunta al RS que recibe tráfico productivo
+
+### Pods quedan corriendo de versiones viejas
+
+**Síntoma**: después de promover, ves pods del stable viejo seguir corriendo.
+
+**Causa**: `scaleDownDelaySeconds: 30` en el BlueGreen spec. El stable viejo queda 30s después del promote (rollback ventana).
+
+**Fix**: no hace falta — es comportamiento esperado. Pasados 30s los pods desaparecen.
+
+---
+
+## ngrok / webhook
+
+### "Webhook delivery failed: connection refused"
+
+**Síntoma**: GitHub Settings → Webhooks → Recent Deliveries muestra error.
+
+**Causa**: ngrok no está corriendo o cerró la sesión.
+
+**Fix**:
+```bash
+make tunnel
+```
+
+> ngrok free expira la sesión cada ~2 horas. Si necesitás algo más persistente, considerá smee.io (ver [webhook-setup.md → Opción B](webhook-setup.md#opción-b--smeeio-alternativa-gratuita)).
+
+### Webhook llega pero Tekton no crea PipelineRun
+
+**Síntoma**: GitHub muestra 202 en delivery, pero `kubectl get pipelineruns` no muestra runs nuevos.
+
+**Causa probable**: tag con formato incorrecto. El CEL interceptor descarta tags que no cumplan `refs/tags/release/<sha>/<envs>`.
+
+**Fix**: ver logs del EventListener:
+```bash
+kubectl -n tekton-pipelines logs -l eventlistener=github-tag-listener -f --tail=50
+```
+
+Si el CEL filter rechazó el evento, vas a ver algo como:
+```
+event 12345 didn't pass interceptor cel (filter)
+```
+
+Solución: usar el formato correcto: `release/v1.0.0/dev` o `release/v1.0.0/dev,staging`.
+
+---
+
+## Tekton Dashboard
+
+### `tekton.localhost:8888` devuelve 404
+
+**Síntoma**: la URL no carga, el browser muestra "site not found" o nginx 404.
+
+**Causa(s)**:
+1. Falta la entrada en hosts file: `127.0.0.1 tekton.localhost`
+2. El Ingress no está aplicado
+3. El Dashboard no está instalado
+
+**Fix**:
+```bash
+# Verificar instalación del Dashboard
+kubectl -n tekton-pipelines get deployment tekton-dashboard
+# Si no existe:
+kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
+
+# Aplicar Ingress
+kubectl apply -f manifests/tekton/dashboard-ingress.yaml
+
+# Verificar el Ingress
+kubectl -n tekton-pipelines get ingress tekton-dashboard
+```
+
+Luego agregá a `C:\Windows\System32\drivers\etc\hosts` (como Admin):
+```
+127.0.0.1 tekton.localhost
+```
+
+---
+
+## Diagnóstico general
+
+### Comandos rápidos
+
+```bash
+# Estado global del cluster
+make cluster-status
+
+# Todos los PipelineRuns con su outcome
+kubectl -n tekton-pipelines get pipelineruns -o custom-columns=\
+NAME:.metadata.name,SUCCEEDED:.status.conditions[0].status,REASON:.status.conditions[0].reason,AGE:.metadata.creationTimestamp
+
+# Logs del PipelineRun más reciente (toda la pipeline)
+tkn pipelinerun logs -n tekton-pipelines --last -f
+
+# Sin tkn: logs de un step específico
+POD=$(kubectl get taskrun -n tekton-pipelines -l tekton.dev/pipelineRun=<NAME> -o jsonpath='{.items[0].metadata.name}')-pod
+kubectl logs -n tekton-pipelines $POD -c step-<step-name>
+
+# Estado del Rollout
+kubectl argo rollouts get rollout <NAME> -n <NS> --watch
+
+# Eventos recientes del namespace de la app
+kubectl get events -n <NS> --sort-by='.lastTimestamp' | tail -20
+
+# Forzar re-sync de ArgoCD
+kubectl annotate app <APP> -n argocd \
+  argocd.argoproj.io/refresh=normal --overwrite
+```
+
+### Logs estructurados de la app
+
+Las apps emiten JSON con structlog. Filtrar con `jq`:
+
+```bash
+kubectl logs -n webserver-api01-dev deployment/webserver-api01-dev | \
+  jq 'select(.level == "error")'
+```
+
+O desde Kibana (`http://kibana.localhost:8888`): crear index pattern `k8s-*` y filtrar por `kubernetes.labels.app_kubernetes_io_name: webserver-api01-dev`.

@@ -83,6 +83,10 @@ spec:
       value: $(params.app-name)
     - name: environments
       value: $(params.environments)
+    - name: expected-commit-sha
+      value: $(tasks.bump-gitops.results.commit-sha)
+    - name: image-tag
+      value: $(params.image-tag)
 
   # Stage 5: k6 load test on the PRIMARY env
   - name: load-test

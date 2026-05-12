@@ -14,17 +14,25 @@ make cluster-status
 kubectl -n argocd get applications
 # Esperado: webserver-api01-dev y webserver-api02-dev en estado Synced/Healthy
 
-# Verificar que los Rollouts existen
-kubectl -n dev get rollouts
+# Verificar que los Rollouts existen (cada app vive en su propio namespace: app-env)
+kubectl -n webserver-api01-dev get rollouts
+kubectl -n webserver-api02-dev get rollouts
 ```
 
 Asegurate de tener las entradas en el archivo `hosts` de Windows (`C:\Windows\System32\drivers\etc\hosts`):
 
 ```
-127.0.0.1 argocd.localhost grafana.localhost kibana.localhost headlamp.localhost
+127.0.0.1 argocd.localhost grafana.localhost kibana.localhost headlamp.localhost tekton.localhost
 127.0.0.1 api01.localhost preview-api01.localhost
 127.0.0.1 api02.localhost preview-api02.localhost
 127.0.0.1 tekton-webhook.localhost
+```
+
+Y que el tunnel de ngrok esté corriendo (en otra terminal):
+
+```bash
+make tunnel
+# Copiá la URL que muestra y configurala en GitHub → Settings → Webhooks → Payload URL
 ```
 
 ---
@@ -42,16 +50,34 @@ cd /ruta/a/webserver-api01
 
 ### Paso 2 — Crear y pushear el tag
 
-El formato del tag es `<env>/<strategy>/<semver>`:
+El formato del tag es `release/<semver>/<env>`:
 
 ```bash
-git tag dev/bluegreen/v1.2.0
-git push origin dev/bluegreen/v1.2.0
+git tag release/v1.2.0/dev
+git push origin release/v1.2.0/dev
 ```
 
-> El tag dispara el webhook → EventListener filtra con CEL → crea PipelineRun automáticamente.
+> El tag dispara el webhook → EventListener filtra con CEL → extrae `image_tag=v1.2.0`, `environments=dev` → crea PipelineRun **`webserver-api01-pipelinerun-v1.2.0`** automáticamente.
+>
+> La **strategy** (bluegreen) no viene del tag — está fija en `rollout.strategy: bluegreen` del `values.yaml` del chart. La task `wait-argocd` la auto-detecta inspeccionando el live Rollout.
 
 ### Paso 3 — Monitorear el pipeline
+
+**Visualmente (recomendado):** abrir el Tekton Dashboard en
+
+```
+http://tekton.localhost:8888/#/pipelineruns
+```
+
+Vas a ver el run nuevo con tree view de las 6 stages. Click en cada Task muestra los logs en streaming. Link directo al run específico:
+
+```
+http://tekton.localhost:8888/#/namespaces/tekton-pipelines/pipelineruns/webserver-api01-pipelinerun-v1.2.0
+```
+
+> El nombre del PipelineRun es **determinístico**: `<app>-pipelinerun-<tag>`. Re-pushear el mismo tag falla con `AlreadyExists` — usá un semver nuevo o borrá el run con `kubectl delete pipelinerun webserver-api01-pipelinerun-v1.2.0 -n tekton-pipelines`.
+
+**CLI (alternativa):**
 
 ```bash
 # Ver el PipelineRun en tiempo real
@@ -64,18 +90,18 @@ kubectl -n tekton-pipelines get pipelineruns --watch
 ### Paso 4 — Ver el estado del Rollout durante Stage 4
 
 ```bash
-kubectl argo rollouts get rollout webserver-api01 -n dev --watch
+kubectl argo rollouts get rollout webserver-api01-dev -n webserver-api01-dev --watch
 ```
 
 Vas a ver algo como:
 ```
-Name:            webserver-api01
-Namespace:       dev
+Name:            webserver-api01-dev
+Namespace:       webserver-api01-dev
 Status:          ॥ Paused
 Message:         BlueGreenPause
-...
-  canary  webserver-api01-<hash>  2          2          2          2          <timestamp>
-  stable  webserver-api01-<hash>  2          2          2          2          <timestamp>
+Strategy:        BlueGreen
+  ActiveSelector:    <hash-viejo>  (Blue = v1.1)
+  PreviewSelector:   <hash-nuevo>  (Green = v1.2)
 ```
 
 ### Paso 5 — Verificar el preview (Green) mientras Stage 5 corre el k6
@@ -88,17 +114,30 @@ curl http://api01.localhost:8888/version
 curl http://preview-api01.localhost:8888/version
 ```
 
+> **Sobre los scripts k6**: viven en el **repo de la app** (`github.com/Valentino-33/webserver-api01/loadtest/load-bluegreen.js`), no en este repo. El Stage 1 los clona automáticamente. Si cambiás `rollout.strategy` del chart (e.g., de bluegreen a canary), el repo de la app debe tener el script correspondiente (`load-canary.js`) — sino el Stage 5 falla `fail-fast`.
+
 ### Paso 6 — Ver el resultado del pipeline
 
-Si el k6 pasa:
-- Stage 6 ejecuta `kubectl argo rollouts promote webserver-api01`
-- El tráfico cambia al Green
-- El Blue se elimina en 30 segundos
+Si el k6 pasa, Stage 6 hace:
 
-Si el k6 falla:
-- Stage 6 ejecuta `kubectl argo rollouts abort webserver-api01`
-- El Green se destruye
-- El Blue (stable) sigue intacto
+```
+kubectl patch rollout webserver-api01-dev -n webserver-api01-dev \
+  --subresource=status --type=merge -p '{"status":{"pauseConditions":null}}'
+```
+
+Eso:
+- Switch del active service: Blue → Green (= v1.2 ahora es stable)
+- Scale-down del Blue en 30 segundos (`scaleDownDelaySeconds`)
+- El step verifica que `phase=Healthy` antes de declarar éxito
+
+Si el k6 falla, Stage 6 hace:
+
+```
+kubectl patch rollout webserver-api01-dev -n webserver-api01-dev \
+  --type=merge -p '{"spec":{"abort":true}}'
+```
+
+Eso destruye el Green; el Blue (stable) sigue intacto. El step verifica `phase=Degraded` antes de exit.
 
 ### Verificación final
 
@@ -120,39 +159,44 @@ make demo-bluegreen
 
 ## Demo 2 — Canary (webserver-api02)
 
-**Objetivo**: gradualmente migrar el tráfico a la nueva versión: 5% → 25% → 50% → 100%, con load test en cada paso.
+**Objetivo**: gradualmente migrar el tráfico a la nueva versión: 5% → 25% → 50% → 100%, con load test antes del promote.
 
 ### Paso 1 — Crear y pushear el tag
 
 ```bash
 cd /ruta/a/webserver-api02
 
-git tag dev/canary/v1.2.0
-git push origin dev/canary/v1.2.0
+git tag release/v1.2.0/dev
+git push origin release/v1.2.0/dev
 ```
 
 ### Paso 2 — Monitorear el pipeline y el Rollout
 
 ```bash
-# Pipeline
-tkn pipelinerun logs -n tekton-pipelines --last -f
+# Pipeline visual
+# http://tekton.localhost:8888/#/pipelineruns
 
-# Rollout (en otra terminal)
-kubectl argo rollouts get rollout webserver-api02 -n dev --watch
+# Rollout en otra terminal
+kubectl argo rollouts get rollout webserver-api02-dev -n webserver-api02-dev --watch
 ```
 
 ### Paso 3 — Observar los pasos del Canary
 
-Con strategy=canary, el Rollout avanza así:
+Con strategy=canary, el Rollout avanza así (definido en `charts/pythonapps/templates/rollout.yaml`):
 
 ```
-Step 1: setWeight 5    → Rollout pausa (Stage 5 corre k6)
-Step 2: setWeight 25   → Rollout pausa (Stage 5 corre k6)
-Step 3: setWeight 50   → Rollout pausa (Stage 5 corre k6)
+Step 1: setWeight 5    → Rollout pausa
+Step 2: setWeight 25   → Rollout pausa
+Step 3: setWeight 50   → Rollout pausa
+(después de cada pausa el pipeline puede correr k6 si está configurado)
 promote-full           → 100% canary → se convierte en stable
 ```
 
-> En esta POC, el pipeline hace `kubectl argo rollouts promote --full` en un solo paso (Stage 6) si el k6 pasó. Para demos más lentas, usá `make rollout-promote APP=webserver-api02` paso a paso.
+> En esta POC, el Stage 6 del pipeline hace **promote-full directo** (`status.promoteFull=true`) si el k6 pasa. Eso lleva el canary de su step actual a 100% en una sola operación. Para demos graduales sin promote-full, podés saltear el pipeline y correr a mano:
+> ```bash
+> kubectl argo rollouts promote webserver-api02-dev -n webserver-api02-dev
+> ```
+> (eso avanza un solo step a la vez)
 
 ### Paso 4 — Verificar la distribución de tráfico
 
@@ -162,8 +206,10 @@ Durante el canary (mientras esté en Step 1 al 3), podés ver la distribución:
 # Stable — versión anterior
 for i in $(seq 1 20); do
   curl -s http://api02.localhost:8888/version
-done
-# ~95% deben devolver v1.1.x, ~5% v1.2.0 (en Step 1)
+done | sort | uniq -c
+# Ejemplo en Step 1 (5%):
+#   19 v1.1.x
+#    1 v1.2.0
 ```
 
 ### Paso 5 — Guía interactiva
@@ -178,27 +224,38 @@ make demo-canary
 
 **Objetivo**: deployment simple sin pauses. Los pods se actualizan uno a uno; el pipeline corre un smoke test al final.
 
-### Paso 1 — Crear el tag con strategy rollingupdate
+### Paso 1 — Configurar la app con strategy=rollingupdate
+
+Editar el `values.yaml` del env de la app (en este repo: `charts/pythonapps/apps/<app>/<env>/values.yaml`) y setear:
+
+```yaml
+rollout:
+  strategy: rollingupdate
+```
+
+Commit y push al gitops repo. ArgoCD lo aplica al Rollout.
+
+### Paso 2 — Pushear el tag
 
 ```bash
 cd /ruta/a/webserver-api01  # o webserver-api02
 
-git tag dev/rollingupdate/v1.3.0
-git push origin dev/rollingupdate/v1.3.0
+git tag release/v1.3.0/dev
+git push origin release/v1.3.0/dev
 ```
 
-### Paso 2 — El Rollout completa solo
+### Paso 3 — El Rollout completa solo
 
-A diferencia de BlueGreen y Canary, no hay pausa. El Stage 4 espera que el Rollout llegue a `Healthy` directamente.
+A diferencia de BlueGreen y Canary, no hay pausa. El Stage 4 espera que el Rollout llegue a `phase=Healthy` directamente.
 
 ```bash
-kubectl argo rollouts get rollout webserver-api01 -n dev --watch
+kubectl argo rollouts get rollout webserver-api01-dev -n webserver-api01-dev --watch
 # Status: Healthy (sin Paused)
 ```
 
-### Paso 3 — Stage 5 corre smoke test
+### Paso 4 — Stage 5 corre smoke test
 
-El Stage 5 corre `smoke.js` contra el stable service. Si pasa, el pipeline termina exitosamente. Si falla, Stage 6 hace `kubectl rollout undo`.
+Stage 5 corre `smoke.js` contra el stable service. Si pasa, el pipeline termina exitosamente. Si falla, Stage 6 hace `kubectl patch ... '{"spec":{"abort":true}}'`.
 
 ---
 
@@ -207,21 +264,34 @@ El Stage 5 corre `smoke.js` contra el stable service. Si pasa, el pipeline termi
 Para demostrar el pipeline sin necesidad de pushear un tag de Git:
 
 ```bash
-# BlueGreen manual
+# BlueGreen manual (api01)
 make pipeline-run APP=webserver-api01 TAG=v1.2.0
 
-# Canary manual
+# Canary manual (api02)
 make pipeline-run APP=webserver-api02 TAG=v1.2.0
 
-# Monitorear
-tkn pipelinerun logs -n tekton-pipelines --last -f
+# Monitorear visualmente
+# http://tekton.localhost:8888/#/pipelineruns
 ```
 
-> El PipelineRun manual usa `strategy=bluegreen` por defecto. Para cambiar la estrategia, editá `manifests/tekton/pipelinerun-manual.yaml`.
+> El PipelineRun manual usa `repo-url=https://github.com/Valentino-33/${APP}` y `revision=main`. Para cambiar el revision o environments, editá `manifests/tekton/pipelinerun-manual.yaml`.
 
 ---
 
 ## Dashboard tour (después del deploy)
+
+### Tekton Dashboard
+
+```
+http://tekton.localhost:8888
+```
+
+- **Pipelines / PipelineRuns**: lista de todos los runs con status badges
+- Click en un run: **tree view (DAG)** de las 6 stages, con dependencias y status por step
+- Click en un step: logs streaming, env vars, container info
+- Botones de retry / cancel / rerun
+
+Equivalente exacto a la sección "Pipelines" de OpenShift Console.
 
 ### ArgoCD
 
@@ -234,6 +304,7 @@ Pass: make argocd-password
 - Ver las Applications: `webserver-api01-dev` y `webserver-api02-dev`
 - Sync status, health status, historial de revisiones
 - El Rollout aparece como resource tree dentro de la Application
+- Botón "REFRESH" forza re-fetch del repo gitops (lo que hace el Stage 4 automáticamente)
 
 ### Grafana
 
@@ -263,8 +334,9 @@ http://headlamp.localhost:8888
 Token: kubectl create token headlamp -n kube-system
 ```
 
-- Kubernetes dashboard alternativo
-- Ver pods, services, ingresses del namespace `dev`
+- Kubernetes dashboard general
+- Buena para inspeccionar pods, services, ingresses, CRDs
+- (Para PipelineRuns específicamente, Tekton Dashboard es mejor)
 
 ---
 
@@ -275,10 +347,21 @@ Token: kubectl create token headlamp -n kube-system
 make cluster-info
 make cluster-status
 
-# Rollout control manual
-make rollout-status APP=webserver-api01    # ver estado en vivo
-make rollout-promote APP=webserver-api01   # promover (BG/Canary)
-make rollout-abort APP=webserver-api01     # abortar/rollback
+# Rollout control manual (equivalente a lo que hace Stage 6 del pipeline)
+# Estado en vivo:
+kubectl argo rollouts get rollout webserver-api01-dev -n webserver-api01-dev --watch
+
+# Promover BG manual:
+kubectl patch rollout webserver-api01-dev -n webserver-api01-dev \
+  --subresource=status --type=merge -p '{"status":{"pauseConditions":null}}'
+
+# Promover canary --full manual:
+kubectl patch rollout webserver-api02-dev -n webserver-api02-dev \
+  --subresource=status --type=merge -p '{"status":{"promoteFull":true}}'
+
+# Abort manual (cualquier strategy):
+kubectl patch rollout <ROLLOUT> -n <NS> \
+  --type=merge -p '{"spec":{"abort":true}}'
 
 # Load tests locales (k6 debe estar instalado)
 make load-test-smoke APP=webserver-api01
@@ -290,7 +373,7 @@ kubectl -n tekton-pipelines get pipelineruns
 tkn pipelinerun list -n tekton-pipelines
 tkn pipelinerun logs -n tekton-pipelines --last -f
 
-# Ver logs de las apps
-kubectl -n dev logs -l app.kubernetes.io/name=webserver-api01 -f
-kubectl -n dev logs -l app.kubernetes.io/name=webserver-api02 -f
+# Ver logs de las apps (cada una en su namespace = app-env)
+kubectl -n webserver-api01-dev logs -l app.kubernetes.io/name=webserver-api01-dev -f
+kubectl -n webserver-api02-dev logs -l app.kubernetes.io/name=webserver-api02-dev -f
 ```

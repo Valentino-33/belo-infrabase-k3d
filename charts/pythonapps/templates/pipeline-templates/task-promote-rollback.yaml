@@ -36,24 +36,21 @@ spec:
     script: |
       #!/bin/sh
       set -e
-      # Prepend $HOME/bin (where we install the kubectl-argo-rollouts plugin
-      # as nonroot) without clobbering the image's default PATH.
-      export PATH="$HOME/bin:$PATH"
       PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
       APP="$(params.app-name)"
-      # namespace y nombre de rollout = app-name + env
       NS="${APP}-${PRIMARY_ENV}"
       ROLLOUT="${APP}-${PRIMARY_ENV}"
       STRATEGY="$(params.strategy)"
       OUTCOME="$(params.outcome)"
+      TIMEOUT=180
       echo "=== promote-or-rollback: rollout=$ROLLOUT ns=$NS strategy=$STRATEGY outcome=$OUTCOME ==="
 
-      # Production gate: no auto-promote. Anotar ArgoCD app y salir.
+      # Production gate: no auto-promote — annotate the ArgoCD app and exit.
       if [ "$PRIMARY_ENV" = "production" ]; then
         if [ "$OUTCOME" = "passed" ]; then
           echo "PRODUCTION GATE: tests passed. Manual sync and promote required."
           echo "  1. ArgoCD: sync ${APP}-production manually"
-          echo "  2. After Rollout is Paused: kubectl argo rollouts promote $ROLLOUT -n $NS"
+          echo "  2. After Rollout is Paused: patch status.pauseConditions=null"
           kubectl annotate application "${APP}-production" -n argocd \
             belo/pending-promote="true" \
             belo/promote-reason="load-test-passed" \
@@ -68,40 +65,60 @@ spec:
         exit 0
       fi
 
-      # Download kubectl-argo-rollouts plugin (nonroot — instalar bajo $HOME/bin que ya está en PATH)
-      if ! command -v kubectl-argo-rollouts >/dev/null 2>&1; then
-        PLUGIN_URL="https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64"
-        echo "Downloading kubectl-argo-rollouts..."
-        mkdir -p "$HOME/bin"
-        curl -sL "$PLUGIN_URL" -o "$HOME/bin/kubectl-argo-rollouts"
-        chmod +x "$HOME/bin/kubectl-argo-rollouts"
-      fi
+      # wait_phase EXPECTED — block until rollout phase reaches EXPECTED (or timeout).
+      wait_phase() {
+        EXPECTED="$1"
+        ELAPSED=0
+        while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+          PHASE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+          ACTIVE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.blueGreen.activeSelector}' 2>/dev/null || echo "")
+          STABLE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "")
+          echo "  [${ELAPSED}s] phase=$PHASE stableRS=$STABLE active=$ACTIVE (waiting for $EXPECTED)"
+          [ "$PHASE" = "$EXPECTED" ] && return 0
+          sleep 5
+          ELAPSED=$((ELAPSED + 5))
+        done
+        echo "ERROR: rollout $ROLLOUT did not reach phase=$EXPECTED in ${TIMEOUT}s (last phase=$PHASE)"
+        return 1
+      }
 
+      # Implement the argo-rollouts plugin promote/abort actions via plain
+      # kubectl patches — same patches the plugin issues, no external binary
+      # download required. Patches sourced from:
+      # https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go
       case "$STRATEGY" in
         rollingupdate)
           if [ "$OUTCOME" = "failed" ]; then
-            echo "RollingUpdate: FAILED — rolling back"
-            kubectl argo rollouts undo "$ROLLOUT" -n "$NS" || true
+            echo "RollingUpdate: FAILED — aborting"
+            kubectl patch rollout "$ROLLOUT" -n "$NS" --type=merge -p '{"spec":{"abort":true}}'
+            wait_phase "Degraded" || exit 1
           else
             echo "RollingUpdate: PASSED — completes automatically"
+            wait_phase "Healthy" || exit 1
           fi
           ;;
         bluegreen)
           if [ "$OUTCOME" = "failed" ]; then
             echo "BlueGreen: FAILED — aborting (keeping stable blue)"
-            kubectl argo rollouts abort "$ROLLOUT" -n "$NS"
+            kubectl patch rollout "$ROLLOUT" -n "$NS" --type=merge -p '{"spec":{"abort":true}}'
+            wait_phase "Degraded" || exit 1
           else
-            echo "BlueGreen: PASSED — promoting green to stable"
-            kubectl argo rollouts promote "$ROLLOUT" -n "$NS"
+            echo "BlueGreen: PASSED — clearing pauseConditions to promote green to stable"
+            kubectl patch rollout "$ROLLOUT" -n "$NS" --subresource=status --type=merge \
+              -p '{"status":{"pauseConditions":null}}'
+            wait_phase "Healthy" || exit 1
           fi
           ;;
         canary)
           if [ "$OUTCOME" = "failed" ]; then
             echo "Canary: FAILED — aborting"
-            kubectl argo rollouts abort "$ROLLOUT" -n "$NS"
+            kubectl patch rollout "$ROLLOUT" -n "$NS" --type=merge -p '{"spec":{"abort":true}}'
+            wait_phase "Degraded" || exit 1
           else
-            echo "Canary: PASSED — promoting to 100%"
-            kubectl argo rollouts promote "$ROLLOUT" -n "$NS" --full
+            echo "Canary: PASSED — setting promoteFull=true to skip remaining steps"
+            kubectl patch rollout "$ROLLOUT" -n "$NS" --subresource=status --type=merge \
+              -p '{"status":{"promoteFull":true}}'
+            wait_phase "Healthy" || exit 1
           fi
           ;;
         *)

@@ -65,11 +65,19 @@ spec:
           ;;
       esac
 
+      # Los scripts de k6 viven en el REPO DE LA APP (single source of truth).
+      # El Stage 1 (clone) los deposita en /workspace/source/src/loadtest/.
       SCRIPT_PATH="$(workspaces.source.path)/src/loadtest/$SCRIPT"
       if [ ! -f "$SCRIPT_PATH" ]; then
-        echo "WARN: $SCRIPT_PATH not found — skipping, outcome=passed"
-        printf "passed" > "$(results.outcome.path)"
-        exit 0
+        # FAIL FAST — no permitimos pipelines verdes sin haber testeado.
+        # Causa más probable: el repo de la app cambió de strategy pero no
+        # tiene el script correspondiente (e.g., api01 pasó de bluegreen a
+        # canary pero no agregaron loadtest/load-canary.js).
+        echo "ERROR: $SCRIPT_PATH no encontrado en el repo de la app."
+        echo "       strategy=$STRATEGY requiere el script: $SCRIPT"
+        echo "       Agregalo al repo de la app en loadtest/$SCRIPT y re-disparar."
+        printf "failed" > "$(results.outcome.path)"
+        exit 1
       fi
 
       OUTCOME="passed"

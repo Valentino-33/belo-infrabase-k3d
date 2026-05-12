@@ -68,8 +68,10 @@ subjects:
   namespace: tekton-pipelines
 ---
 # ClusterRole for pipeline runner pods: read Rollouts across namespaces,
-# update/patch them (promote/abort via kubectl-argo-rollouts), and
-# read ArgoCD Applications in the argocd namespace.
+# patch them directly (promote/abort via kubectl patch on spec + status
+# subresource — same patches kubectl-argo-rollouts emits internally), and
+# patch ArgoCD Applications (needed for the argocd.argoproj.io/refresh
+# annotation that forces an immediate sync in wait-argocd).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -80,7 +82,7 @@ rules:
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: ["argoproj.io"]
   resources: ["applications"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list", "watch", "patch", "update"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "patch"]

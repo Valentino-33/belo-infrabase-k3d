@@ -67,11 +67,43 @@ cluster-up: helm-repos  ## Crear cluster k3d, labeling de nodos e instalar addon
 	@echo "$(GREEN)✓ Cluster k3d listo. Siguiente: make secrets && make bootstrap$(NC)"
 
 .PHONY: cluster-down
-cluster-down:  ## Eliminar cluster k3d y volumen Docker
+cluster-down:  ## Eliminar cluster k3d y volumen Docker (DESTRUCTIVO — usar cluster-stop para preservar estado)
+	@echo "$(RED)→ ATENCIÓN: este comando elimina TODO el cluster y los volúmenes.$(NC)"
+	@echo "$(RED)  Para apagar preservando estado, usá: make cluster-stop$(NC)"
 	@echo "$(YELLOW)→ Eliminando cluster '$(K3D_CLUSTER)'...$(NC)"
 	k3d cluster delete $(K3D_CLUSTER)
 	docker volume rm belo-statefull-data 2>/dev/null || true
 	@echo "$(GREEN)✓ Cluster y volúmenes eliminados$(NC)"
+
+.PHONY: cluster-stop
+cluster-stop:  ## Apagar cluster preservando estado (etcd, PVCs, configs) — usar al final del día
+	@echo "$(YELLOW)→ Apagando cluster '$(K3D_CLUSTER)' (preserva estado)...$(NC)"
+	k3d cluster stop $(K3D_CLUSTER)
+	@echo "$(GREEN)✓ Cluster apagado. Los containers de Docker quedan parados pero existen.$(NC)"
+	@echo "$(GREEN)  Mañana: 'make cluster-start' para resumir desde donde quedaste.$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Tip: si querés liberar RAM ahora, también podés salir de Docker Desktop.$(NC)"
+	@echo "     Mañana abrís Docker Desktop primero, después 'make cluster-start'."
+
+.PHONY: cluster-start
+cluster-start:  ## Reanudar cluster previamente apagado con 'cluster-stop'
+	@echo "$(YELLOW)→ Verificando que Docker Desktop esté corriendo...$(NC)"
+	@docker info >/dev/null 2>&1 || { echo "$(RED)✗ Docker no responde. Abrí Docker Desktop y reintentá.$(NC)"; exit 1; }
+	@echo "$(YELLOW)→ Reanudando cluster '$(K3D_CLUSTER)'...$(NC)"
+	k3d cluster start $(K3D_CLUSTER)
+	@echo "$(YELLOW)→ Fijando contexto kubectl...$(NC)"
+	kubectl config use-context $(K3D_CONTEXT)
+	@echo "$(YELLOW)→ Esperando a que los nodos estén Ready (timeout 2m)...$(NC)"
+	@kubectl wait --for=condition=Ready node --all --timeout=120s
+	@echo "$(YELLOW)→ Esperando a que ArgoCD, Tekton EventListener y los Rollouts estén listos (timeout 3m)...$(NC)"
+	@kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=180s 2>/dev/null || echo "  (argocd-server tardando, revisar manualmente)"
+	@kubectl -n tekton-pipelines wait --for=condition=ready pod -l eventlistener=github-tag-listener --timeout=120s 2>/dev/null || echo "  (EventListener tardando, revisar manualmente)"
+	@kubectl -n tekton-pipelines wait --for=condition=available deployment/tekton-dashboard --timeout=60s 2>/dev/null || echo "  (Dashboard tardando, revisar manualmente)"
+	@echo ""
+	@echo "$(GREEN)✓ Cluster reanudado. Próximos pasos:$(NC)"
+	@echo "  • make cluster-status     → verificar nodos y apps"
+	@echo "  • make tunnel             → re-abrir ngrok (URL nueva — re-configurar webhook en GitHub)"
+	@echo "  • make pipeline-run APP=webserver-api01 TAG=vX.Y.Z → disparar un run manual"
 
 .PHONY: cluster-status
 cluster-status:  ## Estado del cluster: nodos + apps + rollouts
@@ -433,16 +465,41 @@ tunnel:  ## Exponer EventListener a internet con ngrok (requiere ngrok instalado
 	@echo ""
 	ngrok http --host-header=tekton-webhook.localhost 8888
 
+# Los scripts k6 son source-of-truth en el REPO DE CADA APP — no acá.
+# Estos targets clonan el repo de la app a /tmp y corren k6 contra el cluster.
+# Override APP_REPO_BASE si tus repos viven en otro org/usuario de GitHub.
+APP_REPO_BASE ?= https://github.com/Valentino-33
+
+LOADTEST_TMP := /tmp/belo-loadtest
+
+.PHONY: _fetch-app-repo
+_fetch-app-repo:
+	@rm -rf $(LOADTEST_TMP)/$(APP) 2>/dev/null || true
+	@mkdir -p $(LOADTEST_TMP)
+	@git clone --depth 1 $(APP_REPO_BASE)/$(APP) $(LOADTEST_TMP)/$(APP) 2>&1 | tail -1
+	@test -d $(LOADTEST_TMP)/$(APP)/loadtest || { \
+	  echo "$(RED)ERROR: $(APP_REPO_BASE)/$(APP) no tiene un directorio loadtest/ en su raíz$(NC)"; \
+	  exit 1; }
+
 .PHONY: load-test-smoke
-load-test-smoke:  ## Smoke test: make load-test-smoke APP=webserver-api01
-	k6 run -e BASE_URL=http://$(APP).localhost:8888 $(ROOT_DIR)apps/$(APP)/loadtest/smoke.js
+load-test-smoke: _fetch-app-repo  ## Smoke test: make load-test-smoke APP=webserver-api01
+	@test -f $(LOADTEST_TMP)/$(APP)/loadtest/smoke.js || { \
+	  echo "$(RED)ERROR: smoke.js no existe en el repo $(APP)$(NC)"; exit 1; }
+	k6 run -e BASE_URL=http://$(subst webserver-,,$(APP)).localhost:8888 \
+	  $(LOADTEST_TMP)/$(APP)/loadtest/smoke.js
 
 .PHONY: load-test-bluegreen
-load-test-bluegreen:  ## Load test BlueGreen (contra preview): make load-test-bluegreen
+load-test-bluegreen:  ## Load test BlueGreen (contra preview-api01) — usa el repo webserver-api01
+	@$(MAKE) _fetch-app-repo APP=webserver-api01
+	@test -f $(LOADTEST_TMP)/webserver-api01/loadtest/load-bluegreen.js || { \
+	  echo "$(RED)ERROR: load-bluegreen.js no existe en el repo webserver-api01$(NC)"; exit 1; }
 	k6 run -e PREVIEW_URL=http://preview-api01.localhost:8888 \
-	  $(ROOT_DIR)apps/webserver-api01/loadtest/load-bluegreen.js
+	  $(LOADTEST_TMP)/webserver-api01/loadtest/load-bluegreen.js
 
 .PHONY: load-test-canary
-load-test-canary:  ## Load test Canary (contra stable con canary activo): make load-test-canary
+load-test-canary:  ## Load test Canary (contra stable con canary activo) — usa el repo webserver-api02
+	@$(MAKE) _fetch-app-repo APP=webserver-api02
+	@test -f $(LOADTEST_TMP)/webserver-api02/loadtest/load-canary.js || { \
+	  echo "$(RED)ERROR: load-canary.js no existe en el repo webserver-api02$(NC)"; exit 1; }
 	k6 run -e BASE_URL=http://api02.localhost:8888 \
-	  $(ROOT_DIR)apps/webserver-api02/loadtest/load-canary.js
+	  $(LOADTEST_TMP)/webserver-api02/loadtest/load-canary.js

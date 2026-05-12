@@ -14,6 +14,14 @@ spec:
   - name: timeout-seconds
     default: "600"
     type: string
+  - name: expected-commit-sha
+    type: string
+    default: ""
+    description: "If non-empty, wait until ArgoCD reports this commit as the synced revision."
+  - name: image-tag
+    type: string
+    default: ""
+    description: "Expected image tag of the new green/canary RS. Used to verify the right revision is running before load test."
   results:
   - name: primary-env
     description: "First environment in the list (target for stages 5-6)"
@@ -44,23 +52,42 @@ spec:
       APP="$(params.app-name)"
       APP_CR="${APP}-${PRIMARY_ENV}"
       TIMEOUT=$(params.timeout-seconds)
+      EXPECTED_SHA="$(params.expected-commit-sha)"
       ELAPSED=0
-      echo "=== Waiting for ArgoCD app $APP_CR to be Synced+Healthy ==="
+
+      # Force ArgoCD to refresh the app immediately so it picks up the bump
+      # commit instead of waiting for its default polling interval (3min).
+      if [ -n "$EXPECTED_SHA" ]; then
+        echo "=== Refreshing ArgoCD app $APP_CR (expecting commit $EXPECTED_SHA) ==="
+        kubectl annotate application "$APP_CR" -n argocd \
+          argocd.argoproj.io/refresh=normal --overwrite >/dev/null 2>&1 || true
+      fi
+
+      # Wait until ArgoCD has applied the bump commit. Do NOT wait for
+      # Health=Healthy here: BlueGreen/Canary Rollouts stay in
+      # health=Progressing while Paused, and we want to drive into that state
+      # to run load tests. The next step waits for the Rollout itself.
+      echo "=== Waiting for ArgoCD app $APP_CR to be Synced ==="
       while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
         STATUS=$(kubectl get application "$APP_CR" -n argocd \
-          -o jsonpath='{.status.sync.status},{.status.health.status}' 2>/dev/null || echo "Unknown,Unknown")
+          -o jsonpath='{.status.sync.status},{.status.health.status},{.status.sync.revision}' 2>/dev/null \
+          || echo "Unknown,Unknown,")
         SYNC=$(echo "$STATUS" | cut -d',' -f1)
         HEALTH=$(echo "$STATUS" | cut -d',' -f2)
-        echo "  [${ELAPSED}s] sync=$SYNC health=$HEALTH"
-        if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
-          echo "=== ArgoCD $APP_CR is Synced+Healthy ==="
-          break
+        REVISION=$(echo "$STATUS" | cut -d',' -f3)
+        echo "  [${ELAPSED}s] sync=$SYNC health=$HEALTH revision=${REVISION:0:12}"
+        if [ "$SYNC" = "Synced" ]; then
+          if [ -z "$EXPECTED_SHA" ] || [ "$REVISION" = "$EXPECTED_SHA" ]; then
+            echo "=== ArgoCD $APP_CR is Synced at $REVISION (health=$HEALTH) ==="
+            break
+          fi
+          echo "  (synced but at older revision, waiting for $EXPECTED_SHA)"
         fi
-        sleep 10
-        ELAPSED=$((ELAPSED + 10))
+        sleep 5
+        ELAPSED=$((ELAPSED + 5))
       done
       if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
-        echo "ERROR: ArgoCD app $APP_CR did not sync in ${TIMEOUT}s"
+        echo "ERROR: ArgoCD app $APP_CR did not sync to $EXPECTED_SHA in ${TIMEOUT}s"
         exit 1
       fi
 
@@ -91,20 +118,40 @@ spec:
       printf "%s" "$STRATEGY" > "$(results.strategy.path)"
       echo "=== Detected strategy: $STRATEGY ==="
 
-      echo "=== Waiting for Rollout $ROLLOUT in $NS (strategy=$STRATEGY) ==="
+      IMAGE_TAG="$(params.image-tag)"
+
+      # For BlueGreen/Canary: wait until the new RS (matching IMAGE_TAG) is
+      # the previewSelector/canary RS AND the rollout is paused. This avoids
+      # the race where the rollout was already Healthy from a previous deploy
+      # and the new bump commit hasn't materialised in the Rollout spec yet.
+      echo "=== Waiting for Rollout $ROLLOUT in $NS (strategy=$STRATEGY, image-tag=$IMAGE_TAG) ==="
       while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
         PHASE=$(kubectl get rollout "$ROLLOUT" -n "$NS" \
           -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-        echo "  [${ELAPSED}s] phase=$PHASE"
+        SPEC_TAG=$(kubectl get rollout "$ROLLOUT" -n "$NS" \
+          -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's|.*:||')
+        echo "  [${ELAPSED}s] phase=$PHASE spec-image-tag=$SPEC_TAG (expecting $IMAGE_TAG)"
+
+        # The Rollout spec must reflect the new image tag (ArgoCD applied the bump).
+        if [ -n "$IMAGE_TAG" ] && [ "$SPEC_TAG" != "$IMAGE_TAG" ]; then
+          sleep 5; ELAPSED=$((ELAPSED + 5)); continue
+        fi
+
         case "$STRATEGY" in
           rollingupdate)
             [ "$PHASE" = "Healthy" ] && echo "=== RollingUpdate complete ===" && exit 0 ;;
-          *)
-            { [ "$PHASE" = "Paused" ] || [ "$PHASE" = "Healthy" ]; } && \
-              echo "=== Rollout Paused/Healthy — ready for load test ===" && exit 0 ;;
+          bluegreen|canary)
+            # For BG/Canary we require Paused — green/canary RS is ready and waiting
+            # for the load test + manual promote. Healthy here would mean the rollout
+            # already completed (stale state from a previous deploy).
+            if [ "$PHASE" = "Paused" ]; then
+              echo "=== Rollout Paused on image=$SPEC_TAG — ready for load test ==="
+              exit 0
+            fi
+            ;;
         esac
-        sleep 10
-        ELAPSED=$((ELAPSED + 10))
+        sleep 5
+        ELAPSED=$((ELAPSED + 5))
       done
       echo "ERROR: Rollout $ROLLOUT did not reach expected state in ${TIMEOUT}s"
       exit 1

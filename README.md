@@ -1,7 +1,9 @@
 # belo-infrabase-k3d
 
 Stack completo de CI/CD y deployment strategies sobre Kubernetes local con **k3d**.
-Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD, y pipelines de 6 stages completamente automatizados con Tekton — sin dependencias de nube.
+Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD, y un pipeline de 6 stages completamente automatizado con Tekton — desde `git push tag` hasta `Rollout Healthy` con la nueva imagen activa, sin intervención manual.
+
+**Run end-to-end típico** (cold cache, primera vez con esa imagen base): clone (10s) → kaniko build+push (31s) → bump-gitops (11s) → wait-argocd (23s) → k6 load-test (68s) → promote-rollback (11s) = **~2m 30s** desde el push del tag hasta la nueva versión sirviendo el 100% del tráfico. Cada PipelineRun se nombra `<app>-pipelinerun-<tag>` (ej: `webserver-api01-pipelinerun-v1.2.0`).
 
 ---
 
@@ -13,8 +15,10 @@ Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD,
 - [Acceso a los dashboards](#acceso-a-los-dashboards)
 - [Configurar el webhook](#configurar-el-webhook)
 - [Correr el pipeline](#correr-el-pipeline)
+- [Stages del pipeline](#stages-del-pipeline)
 - [Deployment strategies](#deployment-strategies)
 - [Estructura del repo](#estructura-del-repo)
+- [Troubleshooting](#troubleshooting)
 - [Documentación adicional](#documentación-adicional)
 
 ---
@@ -27,11 +31,12 @@ Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD,
 | Deployment strategies | Argo Rollouts — BlueGreen, Canary, RollingUpdate |
 | GitOps | ArgoCD (apps-of-apps) |
 | CI/CD | Tekton Pipelines + Triggers |
+| **CI/CD UI** | **Tekton Dashboard (equivalente a OpenShift Pipelines)** |
 | Build de imágenes | Kaniko (sin Docker daemon) |
 | Ingress | nginx-ingress (NodePort :8888→:80) |
 | Logging | EFK — Elasticsearch + Fluent-bit + Kibana |
 | Monitoring | kube-prometheus-stack — Prometheus + Grafana |
-| Dashboard | Headlamp |
+| Dashboard general | Headlamp |
 | Load testing | k6 (in-cluster) |
 | Apps de demo | Python FastAPI + structlog + prometheus-client |
 | Packaging | Helm (chart maestro `pythonapps`) |
@@ -50,8 +55,10 @@ Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD,
 | make | cualquiera | incluido en Git Bash / `winget install GnuWin32.Make` |
 | k6 (opcional) | v0.50+ | `winget install k6` |
 | tkn CLI (opcional) | latest | `winget install tektoncd.cli` |
-| ngrok (para webhook) | latest | `winget install ngrok.ngrok` |
+| ngrok (para webhook) | **v3.20+** | `winget install ngrok.ngrok` |
 
+> **Importante sobre ngrok:** la cuenta gratuita ahora exige cliente ≥ 3.20.0. Si ya lo tenías instalado, actualizá con `ngrok update`.
+>
 > **Recursos mínimos**: 8 GB RAM, 4 CPU cores, 20 GB de disco libre.
 >
 > **Windows**: después de instalar k3d con winget, reiniciá la terminal para que el PATH se actualice.
@@ -94,10 +101,14 @@ make images-initial DOCKERHUB_USER=<tu-usuario-dockerhub>
 ```bash
 # 5. Bootstrap: aplicar root Application de ArgoCD + manifests de Tekton
 make bootstrap
+
+# 6. Instalar Tekton Dashboard (UI visual de los PipelineRuns — tipo OpenShift Pipelines)
+kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
+kubectl apply -f manifests/tekton/dashboard-ingress.yaml
 ```
 
 ```bash
-# 6. Verificar el estado (esperar ~2 min después del bootstrap)
+# 7. Verificar el estado (esperar ~2 min después del bootstrap)
 make cluster-status
 make cluster-info
 ```
@@ -112,14 +123,14 @@ kubectl -n argocd get applications
 # webserver-api01-dev    Synced        Healthy
 # webserver-api02-dev    Synced        Healthy
 
-kubectl -n dev get pods
+# Cada app vive en su propio namespace = <app>-<env>
+kubectl -n webserver-api01-dev get pods
 # NAME                                   READY   STATUS    RESTARTS   AGE
 # webserver-api01-dev-xxx-xxx            1/1     Running   0          2m
-# webserver-api02-dev-xxx-xxx            1/1     Running   0          2m
 ```
 
 > **Nota sobre Kibana**: el pod de Kibana puede tardar hasta 3-5 minutos en responder luego de que aparezca como `Running`. Es normal — el proceso de inicialización de Kibana 8.x es lento.
-
+>
 > **Nota sobre `make all`**: hace `cluster-up + bootstrap` en un solo comando, pero **omite** el paso de secretos y el push de imágenes iniciales. Corré siempre los pasos 3 y 4 antes o las apps van a quedar en `ImagePullBackOff`.
 
 ---
@@ -135,6 +146,7 @@ Editar `C:\Windows\System32\drivers\etc\hosts` **como Administrador**:
 127.0.0.1 grafana.localhost
 127.0.0.1 kibana.localhost
 127.0.0.1 headlamp.localhost
+127.0.0.1 tekton.localhost
 127.0.0.1 api01.localhost
 127.0.0.1 preview-api01.localhost
 127.0.0.1 api02.localhost
@@ -149,6 +161,7 @@ Todos los servicios son accesibles en el puerto **:8888** a través de nginx-ing
 | Servicio | URL | Credenciales |
 |----------|-----|--------------|
 | **ArgoCD** | http://argocd.localhost:8888 | admin / `make argocd-password` |
+| **Tekton Dashboard** | http://tekton.localhost:8888 | — (tree view de PipelineRuns) |
 | **Grafana** | http://grafana.localhost:8888 | admin / belo-challenge |
 | **Kibana** | http://kibana.localhost:8888 | sin autenticación (dev) |
 | **Headlamp** | http://headlamp.localhost:8888 | token: ver abajo |
@@ -164,6 +177,24 @@ Todos los servicios son accesibles en el puerto **:8888** a través de nginx-ing
 kubectl create token headlamp --namespace kube-system
 ```
 
+### Tekton Dashboard — visualización de PipelineRuns
+
+Es el equivalente exacto a la sección **Pipelines / PipelineRuns** de OpenShift Console (que internamente *es* Tekton). Provee:
+
+- Listado completo de PipelineRuns con status badges en vivo
+- **Tree/DAG view** de las stages con dependencias
+- Logs streaming por step
+- Botones de retry/cancel
+- Detalle de Tasks, TriggerTemplates, EventListeners
+
+**Nombre del PipelineRun (determinístico):** cada run se crea con el nombre `<app>-pipelinerun-<image-tag>`. Por ejemplo, pushear `release/v1.2.0/dev` desde el repo `webserver-api01` crea el run `webserver-api01-pipelinerun-v1.2.0`. Esto hace trivial identificar qué deploy corresponde a cada run en el dashboard, en `kubectl get pipelinerun`, o en los nombres de pods de TaskRuns (e.g., `webserver-api01-pipelinerun-v1.2.0-build-push-pod`).
+
+> Re-pushear el mismo tag falla con `AlreadyExists` — usá un semver nuevo o eliminá el run anterior con `kubectl delete pipelinerun <name> -n tekton-pipelines`.
+
+Direct links útiles:
+- Lista: http://tekton.localhost:8888/#/pipelineruns
+- Detalle de un run: http://tekton.localhost:8888/#/namespaces/tekton-pipelines/pipelineruns/webserver-api01-pipelinerun-v1.2.0
+
 ---
 
 ## Configurar el webhook
@@ -173,17 +204,18 @@ Para que el pipeline se dispare automáticamente al pushear un tag de Git, neces
 ### Opción rápida — ngrok
 
 ```bash
-# Iniciar tunnel (en una terminal aparte)
+# Iniciar tunnel (deja una terminal corriendo)
 make tunnel
 
 # ngrok muestra: Forwarding https://abc123.ngrok-free.app → http://localhost:8888
-# Copiar esa URL
+# (--host-header=tekton-webhook.localhost ya viene seteado en el Makefile,
+#  para que nginx-ingress sepa rutear al EventListener correcto)
 ```
 
 En GitHub → repo de la app → **Settings → Webhooks → Add webhook**:
 - **Payload URL**: `https://abc123.ngrok-free.app`
 - **Content type**: `application/json`
-- **Events**: `Just the push event`
+- **Events**: `Just the push event` (cubre push de tags)
 
 Ver la [guía completa de webhook](docs/webhook-setup.md) para otras opciones (smee.io, IP directa, HMAC).
 
@@ -193,105 +225,163 @@ Ver la [guía completa de webhook](docs/webhook-setup.md) para otras opciones (s
 
 ### Automático (vía webhook + git tag)
 
-El formato del tag es `<env>/<strategy>/<semver>`:
+El formato del tag que dispara el pipeline es **`refs/tags/release/<semver>/<envs>`**:
 
 ```bash
-# Ir al repo de la app
+# Ir al repo de la app (debe llamarse igual que el app-name en ArgoCD)
 cd /ruta/a/webserver-api01
 
-# BlueGreen
-git tag dev/bluegreen/v1.2.0
-git push origin dev/bluegreen/v1.2.0
+# Tag estándar — un env
+git tag release/v1.2.0/dev
+git push origin release/v1.2.0/dev
 
-# Canary
-git tag dev/canary/v1.2.0
-git push origin dev/canary/v1.2.0
-
-# Rolling Update
-git tag dev/rollingupdate/v1.2.0
-git push origin dev/rollingupdate/v1.2.0
+# Tag multi-env (envs separados por coma)
+git tag release/v1.2.0/dev,staging
+git push origin release/v1.2.0/dev,staging
 ```
 
-El tag dispara el webhook → CEL extrae `env`, `strategy` e `image_tag` → crea el PipelineRun.
+El CEL interceptor del EventListener filtra el push, extrae `image_tag` y `environments`, y crea el PipelineRun. La estrategia (bluegreen/canary/rollingupdate) **NO** se pasa por el tag — viene del valor `rollout.strategy` del chart Helm de la app, y el pipeline la auto-detecta inspeccionando el Rollout en vivo.
 
-> **Importante**: el nombre del repo de la app en GitHub debe coincidir con el `app-name` en ArgoCD (`webserver-api01` / `webserver-api02`).
+| Tag pusheado | `image_tag` | `environments` | Dispara pipeline |
+|--------------|-------------|----------------|------------------|
+| `release/v1.0.0/dev` | `v1.0.0` | `dev` | ✅ |
+| `release/v1.0.0/dev,staging` | `v1.0.0` | `dev,staging` | ✅ |
+| `v1.0.0` | — | — | ❌ formato inválido |
+| `release/v1.0.0` | — | — | ❌ falta env |
+
+> **Importante**: el nombre del repo de la app en GitHub debe coincidir con el `app-name` en ArgoCD (`webserver-api01` / `webserver-api02`) — el TriggerBinding lo extrae de `body.repository.name`.
 
 ### Manual (sin webhook)
 
 ```bash
-# Sin pushear tags — dispara el pipeline directamente
+# Sin pushear tags — crea un PipelineRun directamente
 make pipeline-run APP=webserver-api01 TAG=v1.2.0
 
-# Monitorear
+# Monitorear (CLI tkn)
 tkn pipelinerun logs -n tekton-pipelines --last -f
+
+# O visualmente en el dashboard
+# http://tekton.localhost:8888/#/pipelineruns
 ```
 
-### Stages del pipeline
+---
+
+## Stages del pipeline
+
+Las 6 stages del pipeline `pythonapps-pipeline` (definido en `charts/pythonapps/templates/pipeline-templates/pipeline-pythonapps.yaml`):
+
+```mermaid
+flowchart LR
+    A[1. clone] --> B[2. build-push]
+    B --> C[3. bump-gitops]
+    C --> D[4. wait-argocd]
+    D --> E[5. load-test]
+    E --> F[6. promote-rollback]
+
+    classDef done fill:#dcfce7,stroke:#16a34a
+    class A,B,C,D,E,F done
+```
+
+| # | Task | Image | Qué hace | Output / Result |
+|---|------|-------|----------|------------------|
+| 1 | `git-clone-app` | `alpine/git` | `git clone --depth 1` del repo de la app al workspace `source` en la ref del tag | Código en `/workspace/source/src` |
+| 2 | `kaniko-build-push` | `gcr.io/kaniko-project/executor` | Build de `src/Dockerfile` + push a Docker Hub como `<user>/<app>:<tag>` | Imagen publicada |
+| 3 | `bump-gitops-image` | `alpine/git` + `mikefarah/yq` | Clone del repo gitops, `yq` setea `image.tag` en el `values.yaml` de cada env, commit + push | **Result: `commit-sha`** (full SHA del bump commit) |
+| 4 | `wait-argocd-sync` | `bitnami/kubectl` | (a) Force-refresh ArgoCD app (annotation `argocd.argoproj.io/refresh=normal`); (b) Espera `.status.sync.revision == commit-sha`; (c) Auto-detecta strategy; (d) Espera `Rollout.spec.template.spec.containers[0].image` tag = `image-tag` Y `phase=Paused` (BG/Canary) o `phase=Healthy` (Rolling) | **Results: `primary-env`, `strategy`** |
+| 5 | `run-load-test` | `grafana/k6` | k6 contra preview/stable según strategy. Lee el script desde el repo de la app (`loadtest/`). **Fail-fast** si el script no existe (no promueve sin tests). Si existe pero los thresholds fallan, exit 0 con `outcome=failed` | **Result: `outcome`** = `passed` \| `failed` |
+| 6 | `promote-or-rollback` | `bitnami/kubectl` | Patches directos a la spec/status del Rollout (sin plugin) + verifica transición:<br/>• BG passed → `--subresource=status -p '{"status":{"pauseConditions":null}}'` → espera `phase=Healthy`<br/>• Canary passed → `--subresource=status -p '{"status":{"promoteFull":true}}'` → espera `phase=Healthy`<br/>• Cualquier failed → `--type=merge -p '{"spec":{"abort":true}}'` → espera `phase=Degraded` | — |
+
+### Contrato del repo de la app — scripts de load test
+
+El Stage 5 lee los scripts k6 desde el **repo de la app**, no desde este repo. El repo de la app debe tener:
 
 ```
-Stage 1  git-clone-app       → clona el repo de la app (tag ref exacto)
-Stage 2  kaniko-build-push   → build Dockerfile + push a Docker Hub
-Stage 3  bump-gitops-image   → yq actualiza image.tag y rollout.strategy → git commit+push
-Stage 4  wait-argocd-sync    → espera ArgoCD Synced+Healthy y Rollout Paused/Healthy
-Stage 5  run-load-test       → k6 contra preview/stable (siempre exits 0; emite outcome)
-Stage 6  promote-rollback    → promote si outcome=passed; abort/undo si outcome=failed
+<app-repo>/                 (e.g. github.com/Valentino-33/webserver-api01)
+├── Dockerfile              ← usado por Stage 2 (kaniko)
+├── app/                    ← código fuente
+├── loadtest/               ← scripts k6 (uno por strategy posible)
+│   ├── smoke.js
+│   ├── load-bluegreen.js   ← si rollout.strategy = bluegreen
+│   └── load-canary.js      ← si rollout.strategy = canary
+└── pyproject.toml
 ```
+
+| strategy del Helm chart | Script requerido |
+|-------------------------|------------------|
+| `bluegreen` | `loadtest/load-bluegreen.js` |
+| `canary` | `loadtest/load-canary.js` |
+| `rollingupdate` | `loadtest/smoke.js` |
+
+**Si el script no existe, el pipeline falla ruidosamente** (Stage 5 exit 1). Esto previene que cambiar la strategy del chart sin tener el load test correspondiente termine en un "verde fantasma". Si querés que la app soporte cualquier strategy futura, agregá los 3 scripts.
+
+El task pasa al script las env vars `BASE_URL` y `PREVIEW_URL` apuntando a los services internos del cluster (`<release>-stable.<ns>.svc:8080` / `<release>-preview.<ns>.svc:8080`). Los fallbacks hardcodeados en los .js solo se usan para corridas locales (`make load-test-*`).
+
+### Por qué Stage 4 es así (race condition fix)
+
+ArgoCD pollea su repo gitops cada ~3 minutos por default. Sin forzar refresh, el step `wait-argocd` puede ver el sync.revision **viejo** como `Synced` y avanzar — el load test correría contra la versión anterior, y `promote-rollback` haría no-op sobre un Rollout ya `Healthy`. El pipeline reportaría todo verde sin haber desplegado nada.
+
+La fix:
+1. `bump-gitops` emite el SHA del commit como Task result.
+2. `wait-argocd` recibe ese SHA como param, hace `kubectl annotate app ... argocd.argoproj.io/refresh=normal` para forzar polling inmediato, y espera que ArgoCD reporte ese SHA específico como `sync.revision`.
+3. Step 2 además verifica que el Rollout spec ya tenga el `image-tag` esperado y esté `phase=Paused` (BG/Canary) — eso garantiza que el green/canary RS está ready para el load test.
+
+### Por qué Stage 6 patchea directo y no usa el plugin
+
+El plugin `kubectl argo rollouts promote` reportaba éxito pero el Rollout volvía a `BlueGreenPause` ~10s después (causa exacta sin aislar — posiblemente race con ArgoCD reaplicando el manifest). Los patches directos al `status.pauseConditions=null` o `status.promoteFull=true` (los mismos que el plugin emite internamente, según [su código fuente](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)) **son persistentes**. Además, eliminar el download del plugin reduce ~15s del pipeline y elimina una dependencia externa.
 
 ---
 
 ## Deployment strategies
 
+La strategy de cada app está fijada en su `values.yaml` (campo `rollout.strategy`) y el chart Helm renderiza el `kind: Rollout` correspondiente. El pipeline auto-detecta la strategy en vivo y aplica el comportamiento correcto en `wait-argocd` y `promote-rollback`.
+
 ### Blue/Green — webserver-api01
 
-La nueva versión (Green) se despliega en paralelo al stable (Blue). El tráfico no cambia hasta que el k6 pase y el Stage 6 ejecute el promote.
+La nueva versión (Green) se despliega en paralelo al stable (Blue). El tráfico no cambia hasta que el k6 pase y Stage 6 ejecute el promote.
 
 ```bash
 # Guía interactiva
 make demo-bluegreen
 
 # Monitorear el rollout
-kubectl argo rollouts get rollout webserver-api01 -n dev --watch
+kubectl argo rollouts get rollout webserver-api01-dev -n webserver-api01-dev --watch
 
 # Verificar que el preview responde
 curl http://preview-api01.localhost:8888/version
 
-# El pipeline promueve automáticamente si k6 pasa
-# Si querés hacerlo a mano:
-make rollout-promote APP=webserver-api01
+# El pipeline promueve automáticamente si k6 pasa.
+# Si querés hacerlo a mano (equivalente al patch que hace el pipeline):
+kubectl patch rollout webserver-api01-dev -n webserver-api01-dev \
+  --subresource=status --type=merge -p '{"status":{"pauseConditions":null}}'
 
-# Rollback
-make rollout-abort APP=webserver-api01
+# Rollback (abort)
+kubectl patch rollout webserver-api01-dev -n webserver-api01-dev \
+  --type=merge -p '{"spec":{"abort":true}}'
 ```
 
 ### Canary — webserver-api02
 
-El tráfico se mueve gradualmente: **5% → 25% → 50% → promote-full** con k6 en cada step.
+El tráfico se mueve gradualmente: **5% → 25% → 50% → promote-full** con k6 en cada step (cuando se corre con multi-step, ver chart). En el pipeline actual, `promote-full` lleva el canary a 100% de una si k6 pasó.
 
 ```bash
 # Guía interactiva
 make demo-canary
 
 # Monitorear la distribución de tráfico en vivo
-kubectl argo rollouts get rollout webserver-api02 -n dev --watch
+kubectl argo rollouts get rollout webserver-api02-dev -n webserver-api02-dev --watch
 
-# Avanzar steps manualmente (si no usás el pipeline automatizado)
-make rollout-promote APP=webserver-api02  # step 5%→25%
-make rollout-promote APP=webserver-api02  # step 25%→50%
-make rollout-promote APP=webserver-api02  # step 50%→100%
+# Avanzar a 100% manualmente (lo que hace el pipeline)
+kubectl patch rollout webserver-api02-dev -n webserver-api02-dev \
+  --subresource=status --type=merge -p '{"status":{"promoteFull":true}}'
 
-# Rollback en cualquier momento
-make rollout-abort APP=webserver-api02
+# Rollback
+kubectl patch rollout webserver-api02-dev -n webserver-api02-dev \
+  --type=merge -p '{"spec":{"abort":true}}'
 ```
 
-### RollingUpdate — cualquier app
+### RollingUpdate — opcional
 
-Deployment estándar. Los pods se actualizan uno a uno sin pauses. El pipeline corre un smoke test al final y hace rollback si falla.
-
-```bash
-git tag dev/rollingupdate/v1.2.0
-git push origin dev/rollingupdate/v1.2.0
-# El Rollout completa directamente (fase Healthy, sin Paused)
-```
+Deployment estándar. Los pods se actualizan uno a uno sin pauses. El pipeline corre un smoke test al final y aborta si falla.
 
 ---
 
@@ -302,35 +392,44 @@ belo-infrabase-k3d/
 ├── Makefile                            ← Entrada principal (make help)
 ├── k3d/
 │   └── config.yaml                     ← Definición del cluster k3d (4 nodos)
-├── apps/
+├── apps/                               ← copia del código fuente solo para referencia/build local
 │   ├── webserver-api01/
-│   │   ├── src/                        ← Código Python FastAPI
+│   │   ├── app/                        ← Código Python FastAPI
 │   │   ├── Dockerfile
-│   │   └── loadtest/
-│   │       ├── smoke.js
-│   │       ├── load-bluegreen.js
-│   │       └── load-canary.js
+│   │   └── pyproject.toml
 │   └── webserver-api02/
-│       ├── src/
+│       ├── app/
 │       ├── Dockerfile
-│       └── loadtest/
-│           ├── smoke.js
-│           ├── load-bluegreen.js
-│           └── load-canary.js
+│       └── pyproject.toml
+│   ★ Los scripts de loadtest (k6) viven en el REPO REMOTO de cada app
+│     (loadtest/ en la raíz), no acá. El pipeline los clona en Stage 1.
 ├── charts/
 │   └── pythonapps/                     ← Helm chart maestro
 │       ├── templates/
-│       │   ├── rollout.yaml            ← ArgoRollout (BG/Canary/Rolling)
+│       │   ├── rollout.yaml            ← ArgoRollout (BG/Canary/Rolling según values.rollout.strategy)
 │       │   ├── service.yaml            ← stable + preview (siempre)
 │       │   ├── ingress.yaml            ← stable + preview (siempre)
+│       │   ├── hpa.yaml
+│       │   ├── servicemonitor.yaml
 │       │   └── pipeline-templates/     ← Tekton Tasks, Pipeline, Triggers
+│       │       ├── tekton-sa.yaml          ← SAs + ClusterRoles (patch rollouts/status, applications)
+│       │       ├── task-clone.yaml
+│       │       ├── task-build-kaniko.yaml
+│       │       ├── task-bump-gitops.yaml   ← emite result `commit-sha`
+│       │       ├── task-wait-argocd.yaml   ← espera revision específica + image-tag + phase=Paused
+│       │       ├── task-load-test.yaml
+│       │       ├── task-promote-rollback.yaml  ← kubectl patch directo (sin plugin)
+│       │       ├── pipeline-pythonapps.yaml
+│       │       ├── trigger-binding.yaml
+│       │       ├── trigger-template.yaml
+│       │       └── event-listener.yaml
 │       └── apps/
 │           ├── webserver-api01/
-│           │   ├── build-time/app.yaml ← image.repository, rollout defaults
-│           │   └── dev/values-*.yaml   ← image.tag actualizado por el pipeline
+│           │   ├── build-time/app.yaml ← ArgoCD Application + Helm chart wiring
+│           │   └── dev/values.yaml     ← image.tag actualizado por el pipeline
 │           └── webserver-api02/
 │               ├── build-time/app.yaml
-│               └── dev/values-*.yaml
+│               └── dev/values.yaml
 ├── gitops/
 │   ├── apps-of-apps.yaml               ← Root Application de ArgoCD
 │   └── gitops-core-dev/
@@ -348,72 +447,86 @@ belo-infrabase-k3d/
 │   ├── argocd/bootstrap.yaml           ← Root Application (make bootstrap)
 │   └── tekton/
 │       ├── pipelinerun-manual.yaml     ← Pipeline manual sin webhook
-│       └── github-secret.yaml.example ← Template de secret de GitHub
+│       ├── dashboard-ingress.yaml      ← Ingress para Tekton Dashboard en tekton.localhost
+│       └── github-secret.yaml.example  ← Template de secret de GitHub
 └── docs/
     ├── architecture.md                 ← Diagramas Mermaid de la arquitectura
+    ├── pipeline-internals.md           ← Detalle técnico de cada Task del pipeline
+    ├── security-and-rbac.md            ← PodSecurity, securityContext, ClusterRoles
+    ├── troubleshooting.md              ← Gotchas detallados y soluciones
     ├── demo-guide.md                   ← Guía paso a paso de cada estrategia
-    └── webhook-setup.md               ← Configuración del webhook GitHub → Tekton
+    └── webhook-setup.md                ← Configuración del webhook GitHub → Tekton
 ```
 
 ---
 
 ## Troubleshooting
 
-### Pods en `ImagePullBackOff` al hacer bootstrap
+### Pipeline corre verde pero la imagen no se actualizó
 
-Las imágenes `<dockerhub-user>/api01:latest` y `api02:latest` deben existir en Docker Hub **antes** de que ArgoCD haga el primer sync. Si los pods arrancan en error:
+Era el bug **del race condition**, ya corregido. Si volvés a verlo:
+- Verificá que `task-bump-gitops` esté emitiendo el result `commit-sha`
+- Verificá que el Pipeline pase `tasks.bump-gitops.results.commit-sha` y `params.image-tag` a `wait-argocd`
+- Verificá que la SA `tekton-pipeline-runner` tenga verb `patch` sobre `applications` (necesario para el annotate refresh)
+
+### kaniko falla con `PodAdmissionFailed`
+
+El namespace `tekton-pipelines` tiene `pod-security.kubernetes.io/enforce` que rechaza pods con root. Kaniko **necesita** root.
 
 ```bash
-# Verificar el error exacto
-kubectl -n dev describe pod <pod-name> | grep -A5 "Events:"
+# Verificar el label actual
+kubectl get ns tekton-pipelines -o jsonpath='{.metadata.labels}'
 
-# Solución: publicar las imágenes y forzar un retry
+# Si dice "restricted", bajalo a "baseline" (kaniko cumple baseline, no restricted)
+kubectl label namespace tekton-pipelines pod-security.kubernetes.io/enforce=baseline --overwrite
+```
+
+> El bootstrap inicial deja `enforce=restricted` (viene del `release.yaml` oficial de Tekton). Las Tasks no-kaniko tienen su propio `stepTemplate.securityContext` compliant con `restricted`. Solo el namespace tiene que estar en `baseline`.
+
+### bump-gitops falla con `URL rejected: Port number was not a decimal number`
+
+Era el bug **del token-en-URL doble**, ya corregido. El step `commit-and-push` ahora usa `$(params.gitops-repo-url)` (pristine, sin auth) para construir el push URL, en vez de `git remote get-url origin` (que ya tiene el token del clone).
+
+### Pods de la app en `ImagePullBackOff` al hacer bootstrap
+
+Las imágenes `<dockerhub-user>/api01:latest` y `api02:latest` deben existir en Docker Hub **antes** de que ArgoCD haga el primer sync.
+
+```bash
 make images-initial DOCKERHUB_USER=<tu-usuario>
-kubectl -n dev delete pod --all   # fuerza re-pull inmediato
+kubectl -n webserver-api01-dev delete pod --all   # fuerza re-pull
+kubectl -n webserver-api02-dev delete pod --all
 ```
 
-### Kibana en `CrashLoopBackOff` o `OOMKilled`
+### El Rollout vuelve a `Paused` después del promote
 
-Kibana 8.x requiere al menos **1Gi de RAM**. Si el pod crashea:
+Ver [troubleshooting.md → "Plugin promote no persiste"](docs/troubleshooting.md). Ya está mitigado en el pipeline actual (usa `kubectl patch` directo), pero si lo ves al promover manualmente desde la línea de comandos, usá el patch en vez del plugin:
 
 ```bash
-# Ver el error exacto
-kubectl -n logging logs -l app=kibana --tail=20
-
-# Si dice "definition for this key is missing" con xpack.security.enabled:
-# Esa opción fue eliminada en Kibana 8.x — ya está corregida en helm/addons/kibana/values.yaml
-
-# Re-aplicar con los valores correctos
-helm upgrade --install kibana elastic/kibana \
-  --namespace logging \
-  --values helm/addons/kibana/values.yaml \
-  --no-hooks --timeout 6m
+kubectl patch rollout <name> -n <ns> --subresource=status --type=merge \
+  -p '{"status":{"pauseConditions":null}}'
 ```
 
-### ArgoCD muestra `OutOfSync` para las webserver apps
+### ngrok: `Your ngrok-agent version is too old`
 
-Si ambas apps (api01-dev, api02-dev) muestran `SharedResourceWarning` o `OutOfSync`:
+Las cuentas gratuitas ahora exigen ≥ 3.20.0:
 
 ```bash
-# Forzar refresh desde Git
-kubectl -n argocd annotate app webserver-api01-dev argocd.argoproj.io/refresh=normal --overwrite
-kubectl -n argocd annotate app webserver-api02-dev argocd.argoproj.io/refresh=normal --overwrite
+ngrok update
+# O si fue instalado con winget:
+winget upgrade ngrok.ngrok
 ```
 
-Los recursos de Tekton (Tasks, Pipeline, EventListener) son gestionados exclusivamente por `make tekton-apply` y **no** por ArgoCD. Si los Tekton resources fueron prunados:
+### EventListener `MinimumReplicasUnavailable`
+
+Normal durante el primer minuto después de `make tekton-apply`. Esperá 60s y verificá:
 
 ```bash
-make tekton-apply
+kubectl -n tekton-pipelines get pods -l eventlistener=github-tag-listener
 ```
 
-### EventListener no disponible (`MinimumReplicasUnavailable`)
+### Más
 
-Normal durante el primer minuto después de `make tekton-apply`. Esperá 60 segundos y verificá:
-
-```bash
-kubectl -n tekton-pipelines get eventlisteners
-kubectl -n tekton-pipelines get pods | grep el-github
-```
+Ver [docs/troubleshooting.md](docs/troubleshooting.md) para los gotchas completos.
 
 ---
 
@@ -421,7 +534,11 @@ kubectl -n tekton-pipelines get pods | grep el-github
 
 | Documento | Descripción |
 |-----------|-------------|
-| [docs/architecture.md](docs/architecture.md) | Diagramas de topología del cluster, componentes y flujo CI/CD completo |
+| [docs/daily-ops.md](docs/daily-ops.md) | **Cómo apagar y encender el cluster cada día sin perder estado** — make cluster-stop / cluster-start |
+| [docs/architecture.md](docs/architecture.md) | Diagramas Mermaid: topología del cluster, componentes y flujo CI/CD profesional |
+| [docs/pipeline-internals.md](docs/pipeline-internals.md) | Detalle técnico por cada Task: image, results, params, comandos exactos |
+| [docs/security-and-rbac.md](docs/security-and-rbac.md) | PodSecurity Standards, securityContext en Tasks, ClusterRoles del pipeline runner |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Gotchas detallados (race conditions, plugin issues, token quirks) con causa raíz y fix |
 | [docs/demo-guide.md](docs/demo-guide.md) | Guía paso a paso para demostrar cada estrategia |
 | [docs/webhook-setup.md](docs/webhook-setup.md) | Configuración del webhook GitHub → Tekton (ngrok, smee.io, HMAC) |
 | [MAKEFILE_GUIDE.md](MAKEFILE_GUIDE.md) | Referencia completa de todos los targets del Makefile |

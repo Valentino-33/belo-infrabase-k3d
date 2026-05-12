@@ -17,7 +17,11 @@ spec:
   - apiVersion: tekton.dev/v1
     kind: PipelineRun
     metadata:
-      generateName: $(tt.params.app-name)-run-
+      # Deterministic name: <app>-pipelinerun-<release-tag>
+      # Makes it trivial to identify which deploy a run corresponds to.
+      # Re-pushing the same tag fails with AlreadyExists, which is desirable
+      # (force a new semver instead of silently re-running an old one).
+      name: $(tt.params.app-name)-pipelinerun-$(tt.params.image-tag)
       namespace: tekton-pipelines
     spec:
       pipelineRef:

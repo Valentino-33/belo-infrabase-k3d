@@ -24,6 +24,9 @@ spec:
     type: string
   workspaces:
   - name: gitops
+  results:
+  - name: commit-sha
+    description: "Full SHA of the bump commit (empty string if no changes)"
   volumes:
   - name: git-token
     secret:
@@ -99,6 +102,7 @@ spec:
       git add .
       if git diff --staged --quiet; then
         echo "Sin cambios que commitear"
+        printf "" > "$(results.commit-sha.path)"
         exit 0
       fi
       ENVS_LABEL=$(echo "$(params.environments)" | tr ',' '+')
@@ -107,4 +111,7 @@ spec:
       # the token (origin remote already contains auth from the clone step).
       PUSH_URL=$(echo "$(params.gitops-repo-url)" | sed "s|https://|https://x-access-token:${TOKEN}@|")
       git push "$PUSH_URL" main
+      SHA=$(git rev-parse HEAD)
+      printf "%s" "$SHA" > "$(results.commit-sha.path)"
+      echo "Commit SHA: $SHA"
 {{- end }}
