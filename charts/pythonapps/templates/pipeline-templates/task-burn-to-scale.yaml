@@ -1,0 +1,173 @@
+{{- if .Values.tekton.enabled }}
+# Burn-to-scale: valida que el HPA escala el Rollout cuando el CPU sustained
+# supera targetCPUUtilizationPercentage. Corre k6 como sidecar (carga
+# continua) mientras el step principal hace polling del replica count.
+# Condición de éxito: replicas > baseline al menos una vez dentro de la
+# ventana de monitoreo.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: run-burn-to-scale
+  namespace: tekton-pipelines
+spec:
+  description: |
+    Valida HPA scale-up bajo carga sostenida. Sidecar k6 quema CPU contra
+    el stable service; el step principal monitorea replicas vía kubectl y
+    marca outcome=passed si vio scale-up dentro del timeout.
+  params:
+  - name: app-name
+    type: string
+  - name: environments
+    type: string
+    default: dev
+  - name: strategy
+    type: string
+    default: ""
+  - name: monitor-timeout-seconds
+    type: string
+    default: "180"
+    description: "Ventana total de monitoreo (incluye warmup + sustained)."
+  results:
+  - name: outcome
+    description: "passed (scale-up detectado) o failed (replicas nunca subieron)"
+  - name: baseline-replicas
+    description: "Replicas observadas al inicio del burn"
+  - name: max-replicas
+    description: "Máximo de replicas observado durante el burn"
+  workspaces:
+  - name: source
+  # Carga generada en paralelo a la observación. El sidecar arranca con el
+  # TaskRun y queda corriendo hasta que el step principal termina.
+  sidecars:
+  - name: loadgen
+    image: grafana/k6:latest
+    workingDir: $(workspaces.source.path)
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+    env:
+    - name: HOME
+      value: /tekton/home
+    script: |
+      #!/bin/sh
+      # Esperar a que el step principal arranque y capture baseline antes
+      # de empezar a generar carga.
+      sleep 10
+
+      PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
+      APP="$(params.app-name)"
+      NS="${APP}-${PRIMARY_ENV}"
+      RELEASE="${APP}-${PRIMARY_ENV}"
+      # Apuntamos al STABLE service: cuando este Task corre (Stage 7) la
+      # nueva versión ya fue promovida → stable es la versión bajo prueba.
+      TARGET_URL="http://${RELEASE}-stable.${NS}.svc.cluster.local:8080"
+      SCRIPT_PATH="$(workspaces.source.path)/src/loadtest/burn-to-scale.js"
+
+      if [ ! -f "$SCRIPT_PATH" ]; then
+        echo "ERROR: $SCRIPT_PATH no existe en el repo de la app."
+        echo "       Agregar loadtest/burn-to-scale.js al repo de la app."
+        exit 1
+      fi
+
+      echo "=== Sidecar loadgen: k6 burn contra $TARGET_URL ==="
+      # No thresholds en k6: este test es de capacidad, no de latencia.
+      # El éxito o falla lo decide el step principal según replicas.
+      k6 run -e TARGET_URL="$TARGET_URL" "$SCRIPT_PATH" || true
+      echo "=== Sidecar loadgen: k6 finalizado ==="
+      # Mantener el sidecar vivo hasta que el step termine para que Tekton
+      # no lo marque como Error.
+      sleep 600
+  stepTemplate:
+    env:
+    - name: HOME
+      value: /tekton/home
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+  steps:
+  - name: monitor-hpa
+    image: bitnami/kubectl:latest
+    script: |
+      #!/bin/sh
+      set -e
+      PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
+      APP="$(params.app-name)"
+      NS="${APP}-${PRIMARY_ENV}"
+      ROLLOUT="${APP}-${PRIMARY_ENV}"
+      HPA="${APP}-${PRIMARY_ENV}"
+      TIMEOUT=$(params.monitor-timeout-seconds)
+
+      # Producción no se quema: el Task termina ok sin tocar nada.
+      if [ "$PRIMARY_ENV" = "production" ]; then
+        echo "PRODUCTION: burn-to-scale skipped."
+        printf "skipped" > "$(results.outcome.path)"
+        printf "0" > "$(results.baseline-replicas.path)"
+        printf "0" > "$(results.max-replicas.path)"
+        exit 0
+      fi
+
+      # Verificación previa: si no hay HPA, el test no aplica.
+      if ! kubectl get hpa "$HPA" -n "$NS" >/dev/null 2>&1; then
+        echo "WARN: HPA $HPA no existe en $NS. Habilita hpa.enabled en values.yaml."
+        echo "       Marcando como failed para que el equipo lo arregle."
+        printf "failed" > "$(results.outcome.path)"
+        printf "0" > "$(results.baseline-replicas.path)"
+        printf "0" > "$(results.max-replicas.path)"
+        exit 0
+      fi
+
+      get_replicas() {
+        kubectl get rollout "$ROLLOUT" -n "$NS" \
+          -o jsonpath='{.status.replicas}' 2>/dev/null || echo "0"
+      }
+      get_hpa_cpu() {
+        kubectl get hpa "$HPA" -n "$NS" \
+          -o jsonpath='{.status.currentCPUUtilizationPercentage}' 2>/dev/null \
+          || echo "?"
+      }
+
+      BASELINE=$(get_replicas)
+      [ -z "$BASELINE" ] && BASELINE=1
+      printf "%s" "$BASELINE" > "$(results.baseline-replicas.path)"
+      echo "=== Burn-to-scale: rollout=$ROLLOUT ns=$NS baseline=$BASELINE timeout=${TIMEOUT}s ==="
+      echo "    HPA target: $(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.metrics[0].resource.target.averageUtilization}')% CPU"
+      echo "    HPA range:  $(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.minReplicas}')..$(kubectl get hpa $HPA -n $NS -o jsonpath='{.spec.maxReplicas}')"
+
+      MAX_SEEN=$BASELINE
+      ELAPSED=0
+      SCALED=0
+      while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+        R=$(get_replicas)
+        [ -z "$R" ] && R=$BASELINE
+        if [ "$R" -gt "$MAX_SEEN" ]; then
+          MAX_SEEN=$R
+        fi
+        if [ "$R" -gt "$BASELINE" ]; then
+          SCALED=1
+        fi
+        CPU=$(get_hpa_cpu)
+        echo "  [${ELAPSED}s] replicas=$R max_seen=$MAX_SEEN hpa.cpu=${CPU}%"
+        sleep 10
+        ELAPSED=$((ELAPSED + 10))
+      done
+
+      printf "%s" "$MAX_SEEN" > "$(results.max-replicas.path)"
+      if [ "$SCALED" = "1" ]; then
+        echo "=== PASSED: HPA escaló $BASELINE → $MAX_SEEN replicas ==="
+        printf "passed" > "$(results.outcome.path)"
+      else
+        echo "=== FAILED: replicas nunca subieron de $BASELINE (CPU no alcanzó target) ==="
+        printf "failed" > "$(results.outcome.path)"
+      fi
+{{- end }}

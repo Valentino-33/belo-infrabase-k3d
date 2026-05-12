@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-api02
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  api02.json: |
+    {
+      "title": "webserver-api02 — request, latency, HPA",
+      "uid": "belo-api02",
+      "schemaVersion": 36,
+      "version": 1,
+      "tags": ["belo-challenge", "webserver-api02"],
+      "timezone": "browser",
+      "time": { "from": "now-15m", "to": "now" },
+      "refresh": "10s",
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Request rate by endpoint (rps)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [{
+            "expr": "sum by (endpoint) (rate(api02_requests_total[1m]))",
+            "legendFormat": "{{endpoint}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "reqps" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Error rate (5xx) by endpoint",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "targets": [{
+            "expr": "sum by (endpoint) (rate(api02_requests_total{status_code=~\"5..\"}[1m]))",
+            "legendFormat": "{{endpoint}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "reqps" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Latency p95 (s)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "targets": [{
+            "expr": "histogram_quantile(0.95, sum by (le, endpoint) (rate(api02_request_duration_seconds_bucket[1m])))",
+            "legendFormat": "{{endpoint}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Latency p99 (s)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "targets": [{
+            "expr": "histogram_quantile(0.99, sum by (le, endpoint) (rate(api02_request_duration_seconds_bucket[1m])))",
+            "legendFormat": "{{endpoint}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Pod count (Running) — webserver-api02-dev",
+          "gridPos": { "h": 6, "w": 8, "x": 0, "y": 16 },
+          "targets": [{
+            "expr": "count(kube_pod_status_phase{namespace=\"webserver-api02-dev\", phase=\"Running\"} == 1)",
+            "legendFormat": "running"
+          }]
+        },
+        {
+          "type": "timeseries",
+          "title": "HPA replicas (current vs desired)",
+          "gridPos": { "h": 6, "w": 8, "x": 8, "y": 16 },
+          "targets": [
+            {
+              "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"webserver-api02-dev\"}",
+              "legendFormat": "current"
+            },
+            {
+              "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"webserver-api02-dev\"}",
+              "legendFormat": "desired"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU usage by pod (cores)",
+          "gridPos": { "h": 6, "w": 8, "x": 16, "y": 16 },
+          "targets": [{
+            "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"webserver-api02-dev\", container!=\"\"}[1m]))",
+            "legendFormat": "{{pod}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Memory usage by pod (bytes)",
+          "gridPos": { "h": 6, "w": 12, "x": 0, "y": 22 },
+          "targets": [{
+            "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"webserver-api02-dev\", container!=\"\"})",
+            "legendFormat": "{{pod}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "bytes" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "HPA CPU utilization vs target",
+          "gridPos": { "h": 6, "w": 12, "x": 12, "y": 22 },
+          "targets": [
+            {
+              "expr": "kube_horizontalpodautoscaler_status_current_metrics_average_utilization{namespace=\"webserver-api02-dev\"}",
+              "legendFormat": "current %"
+            },
+            {
+              "expr": "kube_horizontalpodautoscaler_spec_target_metric{namespace=\"webserver-api02-dev\", metric_target_type=\"utilization\"}",
+              "legendFormat": "target %"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "percent" } }
+        }
+      ]
+    }

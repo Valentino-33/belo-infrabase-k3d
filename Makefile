@@ -201,10 +201,17 @@ addons: helm-repos  ## Instalar todos los addons en el cluster k3d
 # GitOps Bootstrap
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: bootstrap
-bootstrap: tekton-apply  ## Aplicar root ArgoCD Application + Tekton pipeline manifests
+bootstrap: tekton-apply dashboards-apply  ## Aplicar root ArgoCD Application + Tekton + dashboards Grafana
 	@echo "$(YELLOW)→ Aplicando root Application de ArgoCD...$(NC)"
 	kubectl apply -f $(ROOT_DIR)manifests/argocd/bootstrap.yaml -n argocd
 	@echo "$(GREEN)✓ Bootstrap aplicado$(NC)"
+
+.PHONY: dashboards-apply
+dashboards-apply:  ## Aplicar dashboards Grafana (ConfigMaps con label grafana_dashboard=1)
+	@echo "$(YELLOW)→ Aplicando dashboards Grafana...$(NC)"
+	kubectl create namespace monitoring 2>/dev/null || true
+	kubectl apply -f $(ROOT_DIR)manifests/grafana/
+	@echo "$(GREEN)✓ Dashboards aplicados — aparecen en Grafana en ~30s vía sidecar$(NC)"
 	@echo ""
 	@echo "ArgoCD sincronizará gitops/ → crea webserver-api01-dev y webserver-api02-dev"
 	@echo "Monitoreá en: http://argocd.localhost:8888  (user: admin)"
@@ -226,6 +233,7 @@ tekton-apply:  ## Aplicar Tasks, Pipeline y Triggers de Tekton
 	  -s templates/pipeline-templates/task-wait-argocd.yaml \
 	  -s templates/pipeline-templates/task-load-test.yaml \
 	  -s templates/pipeline-templates/task-promote-rollback.yaml \
+	  -s templates/pipeline-templates/task-burn-to-scale.yaml \
 	  -s templates/pipeline-templates/pipeline-pythonapps.yaml \
 	  -s templates/pipeline-templates/trigger-binding.yaml \
 	  -s templates/pipeline-templates/trigger-template.yaml \

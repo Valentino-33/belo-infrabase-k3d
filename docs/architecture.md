@@ -287,8 +287,11 @@ refs/tags/release/<semver>/<envs>
 | 2 | `kaniko-build-push` | `gcr.io/kaniko-project/executor` | imagen en Docker Hub |
 | 3 | `bump-gitops-image` | `alpine/git` + `mikefarah/yq` | commit pusheado + **result `commit-sha`** |
 | 4 | `wait-argocd-sync` | `bitnami/kubectl` | sync.revision verificado + Rollout en `Paused` con el image-tag correcto |
-| 5 | `run-load-test` | `grafana/k6` | **result `outcome` = passed/failed** |
+| 5 | `run-load-test` | `grafana/k6` | **result `outcome` = passed/failed** (1000 VUs, p95/p99 thresholds) |
 | 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout `phase=Healthy` o `Degraded` (verificado) |
+| 7 | `run-burn-to-scale` | sidecar `k6` + step `bitnami/kubectl` | **result `outcome` + `max-replicas`** — valida HPA scale-up |
+
+> Ver detalle stage-por-stage y garantías de correctness en [docs/pipeline-stages.md](pipeline-stages.md).
 
 ### Naming convention del PipelineRun
 

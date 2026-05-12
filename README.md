@@ -1,9 +1,11 @@
 # belo-infrabase-k3d
 
 Stack completo de CI/CD y deployment strategies sobre Kubernetes local con **k3d**.
-Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD, y un pipeline de 6 stages completamente automatizado con Tekton — desde `git push tag` hasta `Rollout Healthy` con la nueva imagen activa, sin intervención manual.
+Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD, y un pipeline de **7 stages** completamente automatizado con Tekton — desde `git push tag` hasta `Rollout Healthy` con la nueva imagen activa y HPA validado, sin intervención manual.
 
-**Run end-to-end típico** (cold cache, primera vez con esa imagen base): clone (10s) → kaniko build+push (31s) → bump-gitops (11s) → wait-argocd (23s) → k6 load-test (68s) → promote-rollback (11s) = **~2m 30s** desde el push del tag hasta la nueva versión sirviendo el 100% del tráfico. Cada PipelineRun se nombra `<app>-pipelinerun-<tag>` (ej: `webserver-api01-pipelinerun-v1.2.0`).
+**Run end-to-end típico** (cold cache): clone (10s) → kaniko build+push (31s) → bump-gitops (11s) → wait-argocd (23s) → k6 load-test 1000 VUs (~2m) → promote-rollback (11s) → burn-to-scale (~3m, valida HPA) = **~6m** desde el push del tag hasta la nueva versión sirviendo 100% del tráfico con capacidad probada. Cada PipelineRun se nombra `<app>-pipelinerun-<tag>` (ej: `webserver-api01-pipelinerun-v1.2.0`).
+
+Para entender **qué hace cada stage del pipeline, cómo se garantiza que el load test corra sobre la versión nueva, y por qué el circuito de promote/rollback es correcto para BG y Canary**, leer [docs/pipeline-stages.md](docs/pipeline-stages.md).
 
 ---
 
@@ -268,7 +270,7 @@ tkn pipelinerun logs -n tekton-pipelines --last -f
 
 ## Stages del pipeline
 
-Las 6 stages del pipeline `pythonapps-pipeline` (definido en `charts/pythonapps/templates/pipeline-templates/pipeline-pythonapps.yaml`):
+Las **7 stages** del pipeline `pythonapps-pipeline` (definido en `charts/pythonapps/templates/pipeline-templates/pipeline-pythonapps.yaml`):
 
 ```mermaid
 flowchart LR
@@ -277,9 +279,10 @@ flowchart LR
     C --> D[4. wait-argocd]
     D --> E[5. load-test]
     E --> F[6. promote-rollback]
+    F --> G[7. burn-to-scale]
 
     classDef done fill:#dcfce7,stroke:#16a34a
-    class A,B,C,D,E,F done
+    class A,B,C,D,E,F,G done
 ```
 
 | # | Task | Image | Qué hace | Output / Result |
@@ -287,9 +290,10 @@ flowchart LR
 | 1 | `git-clone-app` | `alpine/git` | `git clone --depth 1` del repo de la app al workspace `source` en la ref del tag | Código en `/workspace/source/src` |
 | 2 | `kaniko-build-push` | `gcr.io/kaniko-project/executor` | Build de `src/Dockerfile` + push a Docker Hub como `<user>/<app>:<tag>` | Imagen publicada |
 | 3 | `bump-gitops-image` | `alpine/git` + `mikefarah/yq` | Clone del repo gitops, `yq` setea `image.tag` en el `values.yaml` de cada env, commit + push | **Result: `commit-sha`** (full SHA del bump commit) |
-| 4 | `wait-argocd-sync` | `bitnami/kubectl` | (a) Force-refresh ArgoCD app (annotation `argocd.argoproj.io/refresh=normal`); (b) Espera `.status.sync.revision == commit-sha`; (c) Auto-detecta strategy; (d) Espera `Rollout.spec.template.spec.containers[0].image` tag = `image-tag` Y `phase=Paused` (BG/Canary) o `phase=Healthy` (Rolling) | **Results: `primary-env`, `strategy`** |
-| 5 | `run-load-test` | `grafana/k6` | k6 contra preview/stable según strategy. Lee el script desde el repo de la app (`loadtest/`). **Fail-fast** si el script no existe (no promueve sin tests). Si existe pero los thresholds fallan, exit 0 con `outcome=failed` | **Result: `outcome`** = `passed` \| `failed` |
-| 6 | `promote-or-rollback` | `bitnami/kubectl` | Patches directos a la spec/status del Rollout (sin plugin) + verifica transición:<br/>• BG passed → `--subresource=status -p '{"status":{"pauseConditions":null}}'` → espera `phase=Healthy`<br/>• Canary passed → `--subresource=status -p '{"status":{"promoteFull":true}}'` → espera `phase=Healthy`<br/>• Cualquier failed → `--type=merge -p '{"spec":{"abort":true}}'` → espera `phase=Degraded` | — |
+| 4 | `wait-argocd-sync` | `bitnami/kubectl` | (a) Force-refresh ArgoCD app; (b) Espera `.status.sync.revision == commit-sha`; (c) Auto-detecta strategy; (d) Espera `Rollout.spec.image-tag == <tag>` Y `phase=Paused` (BG/Canary) o `phase=Healthy` (Rolling). **Esta task es la que garantiza que Stage 5 corre sobre la versión nueva** | **Results: `primary-env`, `strategy`** |
+| 5 | `run-load-test` | `grafana/k6` | k6 (1000 VUs ramp + sustained) contra preview/canary según strategy. Lee el script desde el repo de la app (`loadtest/`). **Fail-fast** si el script no existe. Thresholds p95<2s, p99<3s, errors<5% (laxos a propósito — solo falla en regresión real) | **Result: `outcome`** = `passed` \| `failed` |
+| 6 | `promote-or-rollback` | `bitnami/kubectl` | Patches directos a la spec/status del Rollout:<br/>• BG passed → `status.pauseConditions=null` → `phase=Healthy`<br/>• Canary passed → `status.promoteFull=true` → `phase=Healthy`<br/>• Cualquier failed → `spec.abort=true` → `phase=Degraded` | — |
+| 7 | `run-burn-to-scale` | sidecar `k6` + step `bitnami/kubectl` | Sidecar genera carga sostenida (200 VUs sin sleep) → CPU >70% → HPA debería escalar. Step principal monitorea `rollout.status.replicas`. Skip en production y si Stage 5 falló (when-clause) | **Results: `outcome`, `baseline-replicas`, `max-replicas`** |
 
 ### Contrato del repo de la app — scripts de load test
 
@@ -306,13 +310,13 @@ El Stage 5 lee los scripts k6 desde el **repo de la app**, no desde este repo. E
 └── pyproject.toml
 ```
 
-| strategy del Helm chart | Script requerido |
-|-------------------------|------------------|
-| `bluegreen` | `loadtest/load-bluegreen.js` |
-| `canary` | `loadtest/load-canary.js` |
-| `rollingupdate` | `loadtest/smoke.js` |
+| strategy del Helm chart | Script Stage 5 | Script Stage 7 (siempre) |
+|-------------------------|----------------|--------------------------|
+| `bluegreen` | `loadtest/load-bluegreen.js` | `loadtest/burn-to-scale.js` |
+| `canary` | `loadtest/load-canary.js` | `loadtest/burn-to-scale.js` |
+| `rollingupdate` | `loadtest/smoke.js` | `loadtest/burn-to-scale.js` |
 
-**Si el script no existe, el pipeline falla ruidosamente** (Stage 5 exit 1). Esto previene que cambiar la strategy del chart sin tener el load test correspondiente termine en un "verde fantasma". Si querés que la app soporte cualquier strategy futura, agregá los 3 scripts.
+**Si el script no existe, el pipeline falla ruidosamente** (exit 1). Esto previene que cambiar la strategy del chart sin tener el load test correspondiente termine en un "verde fantasma". Si querés que la app soporte cualquier strategy futura, agregá los 3 scripts.
 
 El task pasa al script las env vars `BASE_URL` y `PREVIEW_URL` apuntando a los services internos del cluster (`<release>-stable.<ns>.svc:8080` / `<release>-preview.<ns>.svc:8080`). Los fallbacks hardcodeados en los .js solo se usan para corridas locales (`make load-test-*`).
 
@@ -534,13 +538,16 @@ Ver [docs/troubleshooting.md](docs/troubleshooting.md) para los gotchas completo
 
 | Documento | Descripción |
 |-----------|-------------|
-| [docs/daily-ops.md](docs/daily-ops.md) | **Cómo apagar y encender el cluster cada día sin perder estado** — make cluster-stop / cluster-start |
-| [docs/architecture.md](docs/architecture.md) | Diagramas Mermaid: topología del cluster, componentes y flujo CI/CD profesional |
+| [docs/pipeline-stages.md](docs/pipeline-stages.md) | **Stage-by-stage del pipeline + cómo se garantiza que el load test corre sobre la versión nueva + correctness de Blue/Green y Canary** |
 | [docs/pipeline-internals.md](docs/pipeline-internals.md) | Detalle técnico por cada Task: image, results, params, comandos exactos |
+| [docs/architecture.md](docs/architecture.md) | Diagramas Mermaid: topología del cluster, componentes y flujo CI/CD |
+| [docs/logging-efk.md](docs/logging-efk.md) | **Formato de logs JSON + verificación end-to-end de EFK + queries útiles en Kibana** |
+| [docs/grafana-dashboards.md](docs/grafana-dashboards.md) | **Cómo agregar dashboards nuevos a Grafana vía ConfigMaps (sidecar auto-load) + PromQL queries útiles** |
 | [docs/security-and-rbac.md](docs/security-and-rbac.md) | PodSecurity Standards, securityContext en Tasks, ClusterRoles del pipeline runner |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Gotchas detallados (race conditions, plugin issues, token quirks) con causa raíz y fix |
 | [docs/demo-guide.md](docs/demo-guide.md) | Guía paso a paso para demostrar cada estrategia |
 | [docs/webhook-setup.md](docs/webhook-setup.md) | Configuración del webhook GitHub → Tekton (ngrok, smee.io, HMAC) |
+| [docs/daily-ops.md](docs/daily-ops.md) | Cómo apagar y encender el cluster cada día sin perder estado |
 | [MAKEFILE_GUIDE.md](MAKEFILE_GUIDE.md) | Referencia completa de todos los targets del Makefile |
 | [ROADMAP.md](ROADMAP.md) | Fases completadas y deuda técnica conocida |
 
@@ -565,8 +572,9 @@ make rollout-status APP=webserver-api01      # estado en vivo
 make rollout-promote APP=webserver-api01     # promover
 make rollout-abort APP=webserver-api01       # rollback
 make load-test-smoke APP=webserver-api01     # smoke test k6
-make load-test-bluegreen                     # load test contra preview
-make load-test-canary                        # load test canary
+make load-test-bluegreen                     # load test 1000 VUs contra preview
+make load-test-canary                        # load test 1000 VUs canary
+make dashboards-apply                        # aplicar/recargar dashboards Grafana
 make tunnel                                  # ngrok → exponer EventListener
 make port-forward                            # port-forward de fallback
 ```

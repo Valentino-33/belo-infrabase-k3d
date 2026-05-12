@@ -23,8 +23,21 @@ config:
         Kube_URL            https://kubernetes.default.svc:443
         Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
         Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        # Merge_Log On: parsea el campo `log` (que ya es JSON gracias a structlog)
+        # y promueve sus keys al nivel raíz del evento. Sin esto, las búsquedas en
+        # Kibana tendrían que ser sobre `log.event`, `log.path`, etc.
         Merge_Log           On
+        # Merge_Log_Trim On: elimina el campo `log` después del merge — evita la
+        # duplicación de datos en cada documento de Elasticsearch.
+        Merge_Log_Trim      On
+        # K8S-Logging.Parser On: permite que un Pod sobreescriba el parser usado
+        # via annotation `fluentbit.io/parser`. Apps que NO usan structlog
+        # (terceros, sidecars) pueden declarar un parser custom.
         K8S-Logging.Parser  On
+        # Anotamos cada evento con el nombre/namespace del pod — base para
+        # filtrar en Kibana por app/env.
+        Annotations         Off
+        Labels              On
 
   outputs: |
     [OUTPUT]

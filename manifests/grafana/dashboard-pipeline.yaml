@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-pipeline
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  pipeline.json: |
+    {
+      "title": "belo — pipeline & rollouts overview",
+      "uid": "belo-pipeline",
+      "schemaVersion": 36,
+      "version": 1,
+      "tags": ["belo-challenge", "pipeline", "rollouts"],
+      "timezone": "browser",
+      "time": { "from": "now-1h", "to": "now" },
+      "refresh": "30s",
+      "panels": [
+        {
+          "type": "stat",
+          "title": "PipelineRuns recientes (last 1h)",
+          "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+          "targets": [{
+            "expr": "count(tekton_pipelines_controller_pipelinerun_duration_seconds_count)",
+            "legendFormat": "runs"
+          }]
+        },
+        {
+          "type": "stat",
+          "title": "Tasks fallidas (last 1h)",
+          "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+          "targets": [{
+            "expr": "sum(tekton_pipelines_controller_taskrun_count{status=\"failed\"})",
+            "legendFormat": "failed"
+          }]
+        },
+        {
+          "type": "stat",
+          "title": "Rollouts en estado Healthy",
+          "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+          "targets": [{
+            "expr": "count(rollout_info{phase=\"Healthy\"})",
+            "legendFormat": "healthy"
+          }]
+        },
+        {
+          "type": "stat",
+          "title": "Rollouts en estado Paused/Degraded",
+          "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+          "targets": [
+            { "expr": "count(rollout_info{phase=\"Paused\"})", "legendFormat": "paused" },
+            { "expr": "count(rollout_info{phase=\"Degraded\"})", "legendFormat": "degraded" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Tekton TaskRun duration (s) — p95",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+          "targets": [{
+            "expr": "histogram_quantile(0.95, sum by (le, task) (rate(tekton_pipelines_controller_taskrun_duration_seconds_bucket[5m])))",
+            "legendFormat": "{{task}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Argo Rollouts phase transitions",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+          "targets": [{
+            "expr": "rollout_info",
+            "legendFormat": "{{name}} — {{phase}}"
+          }]
+        }
+      ]
+    }
