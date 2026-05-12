@@ -2,7 +2,7 @@ app:
   name: "webserver-api01"
   namespace: "webserver-api01-dev"
 image:
-  repository: docker.io/valentinobruno/api01
+  repository: docker.io/valentinobruno/webserver-api01
   tag: "latest"
   pullPolicy: IfNotPresent
 rollout:
