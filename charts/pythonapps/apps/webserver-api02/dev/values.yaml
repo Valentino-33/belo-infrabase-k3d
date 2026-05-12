@@ -4,7 +4,7 @@ app:
 
 image:
   repository: docker.io/valentinobruno/webserver-api02
-  tag: "latest"
+  tag: "v0.1.0"
   pullPolicy: IfNotPresent
 
 rollout:
