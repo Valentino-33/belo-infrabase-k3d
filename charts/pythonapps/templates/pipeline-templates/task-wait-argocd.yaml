@@ -1,0 +1,83 @@
+{{- if .Values.tekton.enabled }}
+# Stage 4: poll ArgoCD Application until Synced+Healthy, then poll Rollout
+# until Paused (bluegreen/canary) or Healthy (rollingupdate). Timeout 600s.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: wait-argocd-sync
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: app-name
+    type: string
+  - name: environment
+    type: string
+  - name: strategy
+    type: string
+    default: rollingupdate
+  - name: timeout-seconds
+    default: "600"
+    type: string
+  steps:
+  - name: wait-argocd
+    image: bitnami/kubectl:latest
+    script: |
+      #!/bin/sh
+      set -e
+      APP_CR="$(params.app-name)-$(params.environment)"
+      TIMEOUT=$(params.timeout-seconds)
+      ELAPSED=0
+      echo "=== Waiting for ArgoCD app $APP_CR to be Synced+Healthy ==="
+      while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+        STATUS=$(kubectl get application "$APP_CR" -n argocd \
+          -o jsonpath='{.status.sync.status},{.status.health.status}' 2>/dev/null || echo "Unknown,Unknown")
+        SYNC=$(echo "$STATUS" | cut -d',' -f1)
+        HEALTH=$(echo "$STATUS" | cut -d',' -f2)
+        echo "  [${ELAPSED}s] sync=$SYNC health=$HEALTH"
+        if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+          echo "=== ArgoCD $APP_CR is Synced+Healthy ==="
+          break
+        fi
+        sleep 10
+        ELAPSED=$((ELAPSED + 10))
+      done
+      if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+        echo "ERROR: ArgoCD app $APP_CR did not sync in ${TIMEOUT}s"
+        exit 1
+      fi
+
+  - name: wait-rollout
+    image: bitnami/kubectl:latest
+    script: |
+      #!/bin/sh
+      set -e
+      APP="$(params.app-name)"
+      NS="$(params.environment)"
+      STRATEGY="$(params.strategy)"
+      TIMEOUT=$(params.timeout-seconds)
+      ELAPSED=0
+      echo "=== Waiting for Rollout $APP in $NS (strategy=$STRATEGY) ==="
+      while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+        PHASE=$(kubectl get rollout "$APP" -n "$NS" \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+        echo "  [${ELAPSED}s] phase=$PHASE"
+        case "$STRATEGY" in
+          rollingupdate|RollingUpdate)
+            if [ "$PHASE" = "Healthy" ]; then
+              echo "=== Rollout complete (RollingUpdate) ==="
+              exit 0
+            fi
+            ;;
+          *)
+            if [ "$PHASE" = "Paused" ] || [ "$PHASE" = "Healthy" ]; then
+              echo "=== Rollout is Paused/Healthy — ready for load test ==="
+              exit 0
+            fi
+            ;;
+        esac
+        sleep 10
+        ELAPSED=$((ELAPSED + 10))
+      done
+      echo "ERROR: Rollout $APP did not reach expected state in ${TIMEOUT}s"
+      exit 1
+{{- end }}

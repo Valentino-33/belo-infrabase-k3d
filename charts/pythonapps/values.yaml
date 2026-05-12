@@ -41,5 +41,6 @@ serviceMonitor:
   interval: 30s
 
 tekton:
+  enabled: false   # true only via make tekton-apply — evita que ArgoCD intente poseer estos recursos desde ambas apps
   dockerhubUser: valentinobruno
   gitopsRepoUrl: https://github.com/Valentino-33/belo-infrabase-k3d

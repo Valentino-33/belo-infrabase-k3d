@@ -1,3 +1,5 @@
+// Smoke test básico — valida que el stable service de api02 responde correctamente.
+// Usado por el pipeline cuando strategy=rollingupdate.
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Rate } from 'k6/metrics';

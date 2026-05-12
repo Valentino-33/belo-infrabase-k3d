@@ -1,3 +1,4 @@
+{{- if .Values.tekton.enabled }}
 # Actualiza el tag de imagen en el values del ambiente y hace commit + push.
 apiVersion: tekton.dev/v1
 kind: Task
@@ -14,6 +15,9 @@ spec:
     type: string
   - name: image-tag
     type: string
+  - name: strategy
+    type: string
+    default: rollingupdate
   - name: git-user-name
     default: "tekton-bot"
     type: string
@@ -22,17 +26,36 @@ spec:
     type: string
   workspaces:
   - name: gitops
+  volumes:
+  - name: git-token
+    secret:
+      secretName: github-token
+      items:
+      - key: token
+        path: token
   steps:
   - name: clone-gitops
     image: alpine/git:latest
+    volumeMounts:
+    - name: git-token
+      mountPath: /workspace/git-token
+      readOnly: true
     script: |
       #!/bin/sh
       set -e
-      git clone "$(params.gitops-repo-url)" "$(workspaces.gitops.path)/gitops"
+      TOKEN=$(cat /workspace/git-token/token)
+      # Inject token into URL so git push in later step is authenticated.
+      AUTH_URL=$(echo "$(params.gitops-repo-url)" | sed "s|https://|https://x-access-token:${TOKEN}@|")
+      git clone "$AUTH_URL" "$(workspaces.gitops.path)/gitops"
       echo "Gitops clonado"
 
   - name: bump-tag
     image: mikefarah/yq:latest
+    env:
+    - name: IMAGE_TAG
+      value: "$(params.image-tag)"
+    - name: STRATEGY
+      value: "$(params.strategy)"
     script: |
       #!/bin/sh
       set -e
@@ -41,8 +64,11 @@ spec:
         echo "WARN: $VALUES_FILE no encontrado, skipping bump"
         exit 0
       fi
-      yq e ".image.tag = \"$(params.image-tag)\"" -i "$VALUES_FILE"
-      echo "Tag actualizado: $VALUES_FILE → $(params.image-tag)"
+      # Actualiza image.tag y rollout.strategy juntos — ambos determinan qué despliega ArgoCD.
+      yq e '.image.tag = strenv(IMAGE_TAG)' -i "$VALUES_FILE"
+      yq e '.rollout.strategy = strenv(STRATEGY)' -i "$VALUES_FILE"
+      echo "Bump OK: image.tag=$IMAGE_TAG  rollout.strategy=$STRATEGY"
+      echo "Archivo: $VALUES_FILE"
 
   - name: commit-and-push
     image: alpine/git:latest
@@ -59,3 +85,4 @@ spec:
       fi
       git commit -m "bump $(params.app-name) a $(params.image-tag) en $(params.environment)"
       git push origin main
+{{- end }}

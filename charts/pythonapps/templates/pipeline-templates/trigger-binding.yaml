@@ -1,3 +1,4 @@
+{{- if .Values.tekton.enabled }}
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerBinding
 metadata:
@@ -11,3 +12,11 @@ spec:
     value: $(body.repository.name)
   - name: image-tag
     value: $(extensions.image_tag)
+  - name: environment
+    value: $(extensions.environment)
+  - name: strategy
+    value: $(extensions.strategy)
+  - name: revision
+    # Full ref so git can fetch the exact tag commit.
+    value: $(extensions.git_revision)
+{{- end }}

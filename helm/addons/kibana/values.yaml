@@ -1,17 +1,33 @@
-elasticsearchHosts: "http://elasticsearch-master.logging.svc.cluster.local:9200"
+elasticsearchHosts: "http://elasticsearch-master:9200"
+
 resources:
   requests:
     cpu: 100m
     memory: 512Mi
   limits:
-    cpu: 500m
-    memory: 512Mi
-nodeSelector:
-  role: stateless
+    cpu: 1000m
+    memory: 1Gi
+
 ingress:
   enabled: true
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
   ingressClassName: nginx
   hosts:
   - host: kibana.localhost
     paths:
     - path: /
+
+kibanaConfig:
+  kibana.yml: |
+    server.host: "0.0.0.0"
+    elasticsearch.hosts: ["http://elasticsearch-master:9200"]
+    xpack.encryptedSavedObjects.encryptionKey: "fhjskloppd678ehkdfdlliverpoolfcr"
+
+nodeSelector:
+  role: statefulls
+tolerations:
+- key: workload
+  value: statefulls
+  operator: Equal
+  effect: NoSchedule

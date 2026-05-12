@@ -1,0 +1,36 @@
+// Load test para Canary de api01 — corre contra el stable service mientras el canary avanza.
+// Una fracción del tráfico llega al canary según el peso de ArgoRollouts.
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate, Trend } from 'k6/metrics';
+
+export const errorRate = new Rate('errors');
+export const latencyTrend = new Trend('latency_ms', true);
+
+export const options = {
+  stages: [
+    { duration: '10s', target: 5 },
+    { duration: '20s', target: 5 },
+    { duration: '10s', target: 0 },
+  ],
+  thresholds: {
+    http_req_duration: ['p(95)<600', 'p(99)<1200'],
+    errors: ['rate<0.005'],
+  },
+};
+
+const BASE_URL = __ENV.BASE_URL || 'http://webserver-api01-stable.dev.svc.cluster.local:8000';
+
+export default function () {
+  const healthRes = http.get(`${BASE_URL}/health`);
+  check(healthRes, { 'health 200': (r) => r.status === 200 });
+
+  const apiRes = http.get(`${BASE_URL}/api01/hello`);
+  const ok = check(apiRes, {
+    'api 200': (r) => r.status === 200,
+    'version present': (r) => JSON.parse(r.body).version !== undefined,
+  });
+  errorRate.add(!ok);
+  latencyTrend.add(apiRes.timings.duration);
+  sleep(0.5);
+}

@@ -7,6 +7,9 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 SHELL := /bin/bash
+# Fijar contexto k3d para evitar interferencia con sesión EKS
+export KUBECONFIG := $(HOME)/.kube/config
+K3D_CONTEXT := k3d-belo-challenge
 .DEFAULT_GOAL := help
 
 K3D_CLUSTER   := belo-challenge
@@ -19,6 +22,9 @@ GREEN  := \033[0;32m
 YELLOW := \033[0;33m
 RED    := \033[0;31m
 NC     := \033[0m
+
+# Directorio raíz del repo — siempre relativo al Makefile, sin importar desde dónde se corra make.
+ROOT_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Help
@@ -44,14 +50,15 @@ all: cluster-up bootstrap  ## Levantar cluster + instalar addons + bootstrap Arg
 .PHONY: cluster-up
 cluster-up: helm-repos  ## Crear cluster k3d, labeling de nodos e instalar addons
 	@echo "$(YELLOW)→ Creando cluster k3d '$(K3D_CLUSTER)'...$(NC)"
-	k3d cluster create --config k3d/config.yaml
+	k3d cluster create --config $(ROOT_DIR)k3d/config.yaml
+	kubectl config use-context $(K3D_CONTEXT)
 	@echo "$(YELLOW)→ Aplicando labels y taints a los nodos...$(NC)"
 	kubectl label node k3d-$(K3D_CLUSTER)-agent-0 role=statefulls workload=statefulls --overwrite
 	kubectl taint node k3d-$(K3D_CLUSTER)-agent-0 workload=statefulls:NoSchedule --overwrite
 	kubectl label node k3d-$(K3D_CLUSTER)-agent-1 role=stateless workload=stateless --overwrite
 	kubectl label node k3d-$(K3D_CLUSTER)-agent-2 role=cicd workload=cicd --overwrite
 	kubectl taint node k3d-$(K3D_CLUSTER)-agent-2 workload=cicd:NoSchedule --overwrite
-	$(MAKE) addons
+	"$(MAKE)" addons
 	@echo ""
 	@echo "$(GREEN)✓ Cluster k3d listo. Siguiente: make secrets && make bootstrap$(NC)"
 
@@ -83,30 +90,26 @@ helm-repos:  ## Agregar y actualizar repos Helm (idempotente)
 	helm repo add elastic https://helm.elastic.co 2>/dev/null || true
 	helm repo add fluent https://fluent.github.io/helm-charts 2>/dev/null || true
 	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
-	helm repo add headlamp https://headlamp-k8s.github.io/headlamp/ 2>/dev/null || true
+	helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/ 2>/dev/null || true
 	helm repo update
 	@echo "$(GREEN)✓ Repos Helm actualizados$(NC)"
 
 .PHONY: addons
 addons: helm-repos  ## Instalar todos los addons en el cluster k3d
-	@echo "$(YELLOW)→ 1/8 metrics-server...$(NC)"
-	helm upgrade --install metrics-server eks/metrics-server \
-	  --namespace kube-system \
-	  --set args[0]=--kubelet-insecure-tls \
-	  --wait --timeout 2m
+	@echo "$(YELLOW)→ 1/8 metrics-server (incluido en k3s, skip)...$(NC)"
 
 	@echo "$(YELLOW)→ 2/8 nginx-ingress (NodePort 8888→80)...$(NC)"
 	kubectl create namespace ingress-nginx 2>/dev/null || true
 	helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
 	  --namespace ingress-nginx \
-	  --values helm/addons/nginx-ingress/values.yaml \
+	  --values $(ROOT_DIR)helm/addons/nginx-ingress/values.yaml \
 	  --wait --timeout 2m
 
 	@echo "$(YELLOW)→ 3/8 ArgoCD...$(NC)"
 	kubectl create namespace argocd 2>/dev/null || true
 	helm upgrade --install argocd argo/argo-cd \
 	  --namespace argocd \
-	  --values helm/addons/argocd/values.yaml \
+	  --values $(ROOT_DIR)helm/addons/argocd/values.yaml \
 	  --wait --timeout 5m
 
 	@echo "$(YELLOW)→ 4/8 Argo Rollouts...$(NC)"
@@ -121,32 +124,38 @@ addons: helm-repos  ## Instalar todos los addons en el cluster k3d
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/interceptors.yaml
 	kubectl -n tekton-pipelines rollout status deployment/tekton-pipelines-controller --timeout=3m
 
-	@echo "$(YELLOW)→ 6/8 EFK stack (local-path)...$(NC)"
+	@echo "$(YELLOW)→ 6/8 EFK stack (local-path, TLS deshabilitado para dev)...$(NC)"
 	kubectl create namespace logging 2>/dev/null || true
 	helm upgrade --install elasticsearch elastic/elasticsearch \
 	  --namespace logging \
-	  --values helm/addons/elasticsearch/values.yaml \
-	  --wait --timeout 5m
+	  --values $(ROOT_DIR)helm/addons/elasticsearch/values.yaml \
+	  --wait --timeout 6m
 	helm upgrade --install fluent-bit fluent/fluent-bit \
 	  --namespace logging \
-	  --values helm/addons/fluent-bit/values.yaml \
+	  --values $(ROOT_DIR)helm/addons/fluent-bit/values.yaml \
 	  --wait --timeout 2m
+	kubectl create secret generic elasticsearch-master-certs \
+	  --from-literal=tls.crt="" --from-literal=tls.key="" --from-literal=ca.crt="" \
+	  -n logging --dry-run=client -o yaml | kubectl apply -f -
+	kubectl create secret generic kibana-kibana-es-token \
+	  --from-literal=token="" -n logging --dry-run=client -o yaml | kubectl apply -f -
 	helm upgrade --install kibana elastic/kibana \
 	  --namespace logging \
-	  --values helm/addons/kibana/values.yaml \
-	  --wait --timeout 2m
+	  --values $(ROOT_DIR)helm/addons/kibana/values.yaml \
+	  --no-hooks \
+	  --wait --timeout 4m
 
 	@echo "$(YELLOW)→ 7/8 kube-prometheus-stack...$(NC)"
 	kubectl create namespace monitoring 2>/dev/null || true
 	helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
 	  --namespace monitoring \
-	  --values helm/addons/kube-prometheus/values.yaml \
+	  --values $(ROOT_DIR)helm/addons/kube-prometheus/values.yaml \
 	  --wait --timeout 5m
 
 	@echo "$(YELLOW)→ 8/8 Headlamp...$(NC)"
 	helm upgrade --install headlamp headlamp/headlamp \
 	  --namespace kube-system \
-	  --values helm/addons/headlamp/values.yaml \
+	  --values $(ROOT_DIR)helm/addons/headlamp/values.yaml \
 	  --wait --timeout 2m
 
 	@echo "$(GREEN)✓ Todos los addons instalados$(NC)"
@@ -157,7 +166,7 @@ addons: helm-repos  ## Instalar todos los addons en el cluster k3d
 .PHONY: bootstrap
 bootstrap: tekton-apply  ## Aplicar root ArgoCD Application + Tekton pipeline manifests
 	@echo "$(YELLOW)→ Aplicando root Application de ArgoCD...$(NC)"
-	kubectl apply -f manifests/argocd/bootstrap.yaml -n argocd
+	kubectl apply -f $(ROOT_DIR)manifests/argocd/bootstrap.yaml -n argocd
 	@echo "$(GREEN)✓ Bootstrap aplicado$(NC)"
 	@echo ""
 	@echo "ArgoCD sincronizará gitops/ → crea webserver-api01-dev y webserver-api02-dev"
@@ -168,15 +177,18 @@ bootstrap: tekton-apply  ## Aplicar root ArgoCD Application + Tekton pipeline ma
 tekton-apply:  ## Aplicar Tasks, Pipeline y Triggers de Tekton
 	@echo "$(YELLOW)→ Aplicando manifests de Tekton desde el chart...$(NC)"
 	kubectl create namespace tekton-pipelines 2>/dev/null || true
-	helm template tekton-pipeline charts/pythonapps \
-	  -f charts/pythonapps/apps/webserver-api01/build-time/app.yaml \
+	helm template tekton-pipeline $(ROOT_DIR)charts/pythonapps \
+	  -f $(ROOT_DIR)charts/pythonapps/apps/webserver-api01/build-time/app.yaml \
+	  --set tekton.enabled=true \
 	  --set tekton.dockerhubUser=$(DOCKERHUB_USER) \
 	  --set tekton.gitopsRepoUrl=https://github.com/Valentino-33/belo-infrabase-k3d \
 	  -s templates/pipeline-templates/tekton-sa.yaml \
 	  -s templates/pipeline-templates/task-clone.yaml \
 	  -s templates/pipeline-templates/task-build-kaniko.yaml \
-	  -s templates/pipeline-templates/task-load-test.yaml \
 	  -s templates/pipeline-templates/task-bump-gitops.yaml \
+	  -s templates/pipeline-templates/task-wait-argocd.yaml \
+	  -s templates/pipeline-templates/task-load-test.yaml \
+	  -s templates/pipeline-templates/task-promote-rollback.yaml \
 	  -s templates/pipeline-templates/pipeline-pythonapps.yaml \
 	  -s templates/pipeline-templates/trigger-binding.yaml \
 	  -s templates/pipeline-templates/trigger-template.yaml \
@@ -230,7 +242,7 @@ secrets-apply:  ## Crear secretos: make secrets-apply DOCKERHUB_USER=x DOCKERHUB
 pipeline-run:  ## Disparar pipeline manual: make pipeline-run APP=webserver-api01 TAG=v0.1.0
 	@echo "$(YELLOW)→ Iniciando PipelineRun para $(APP):$(TAG)...$(NC)"
 	APP=$(APP) TAG=$(TAG) DOCKERHUB_USER=$(DOCKERHUB_USER) \
-	  envsubst < manifests/tekton/pipelinerun-manual.yaml | kubectl apply -f -
+	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl apply -f -
 	@echo "$(GREEN)✓ PipelineRun creado — monitoreá con:$(NC)"
 	@echo "   tkn pipelinerun logs -n tekton-pipelines --last -f"
 
@@ -257,13 +269,14 @@ demo-bluegreen:  ## Guía interactiva de demo Blue/Green (api01)
 	@echo "  3. ArgoCD detecta el commit → actualiza el Rollout → aparece el pod GREEN."
 	@echo ""
 	@echo "  4. Verificar que el preview (green) responde:"
-	@echo "     curl http://api01-preview.localhost:8888/version"
+	@echo "     curl http://preview-api01.localhost:8888/version"
 	@echo ""
 	@echo "  5. Promover (switchear tráfico a green):"
 	@echo "     kubectl argo rollouts promote webserver-api01 -n $(NAMESPACE)"
 	@echo ""
 	@echo "  6. Verificar que el stable (ahora green) sirve 100% del tráfico:"
 	@echo "     curl http://api01.localhost:8888/version"
+
 	@echo ""
 	@echo "  7. Rollback (si fuera necesario):"
 	@echo "     kubectl argo rollouts abort webserver-api01 -n $(NAMESPACE)"
@@ -321,7 +334,7 @@ rollout-abort:  ## Abortar rollout (rollback): make rollout-abort APP=webserver-
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: build
 build:  ## Build local: make build APP=webserver-api01 TAG=v0.1.0
-	docker build -t $(DOCKERHUB_USER)/$(APP):$(TAG) apps/$(APP)/
+	docker build -t $(DOCKERHUB_USER)/$(APP):$(TAG) $(ROOT_DIR)apps/$(APP)/
 
 .PHONY: push
 push:  ## Push a DockerHub: make push APP=webserver-api01 TAG=v0.1.0
@@ -334,20 +347,24 @@ build-push: build push  ## Build + push en un paso
 # Acceso a UIs
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: port-forward
-port-forward:  ## Port-forward a todas las UIs (background)
-	@echo "$(YELLOW)→ Iniciando port-forwards...$(NC)"
+port-forward:  ## Port-forward de fallback (usar URLs :8888 es preferible)
+	@echo "$(YELLOW)→ Iniciando port-forwards de fallback...$(NC)"
 	kubectl -n argocd port-forward svc/argocd-server 8080:80 > /tmp/pf-argocd.log 2>&1 &
 	kubectl -n monitoring port-forward svc/kube-prometheus-grafana 8082:80 > /tmp/pf-grafana.log 2>&1 &
 	kubectl -n logging port-forward svc/kibana-kibana 8083:5601 > /tmp/pf-kibana.log 2>&1 &
 	kubectl -n kube-system port-forward svc/headlamp 8081:80 > /tmp/pf-headlamp.log 2>&1 &
 	@echo ""
-	@echo "  ArgoCD   → http://localhost:8080  (o http://argocd.localhost:8888)"
-	@echo "  Grafana  → http://localhost:8082  (user: admin / pass: belo-challenge)"
+	@echo "$(GREEN)Acceso preferido vía nginx (requiere entradas en /etc/hosts):$(NC)"
+	@echo "  ArgoCD   → http://argocd.localhost:8888   (admin / make argocd-password)"
+	@echo "  Grafana  → http://grafana.localhost:8888  (admin / belo-challenge)"
+	@echo "  Kibana   → http://kibana.localhost:8888"
+	@echo "  Headlamp → http://headlamp.localhost:8888 (token: kubectl create token headlamp -n kube-system)"
+	@echo ""
+	@echo "$(YELLOW)Fallback port-forward:$(NC)"
+	@echo "  ArgoCD   → http://localhost:8080"
+	@echo "  Grafana  → http://localhost:8082"
 	@echo "  Kibana   → http://localhost:8083"
 	@echo "  Headlamp → http://localhost:8081"
-	@echo ""
-	@echo "  api01    → http://api01.localhost:8888"
-	@echo "  api02    → http://api02.localhost:8888"
 	@echo ""
 	@echo "Para detener: pkill -f 'kubectl.*port-forward'"
 
@@ -360,16 +377,46 @@ argocd-password:  ## Mostrar password inicial de ArgoCD
 # ──────────────────────────────────────────────────────────────────────────────
 # Load testing
 # ──────────────────────────────────────────────────────────────────────────────
+.PHONY: cluster-info
+cluster-info:  ## Mostrar URLs, passwords y comandos útiles de un vistazo
+	@echo ""
+	@echo "$(GREEN)=== Acceso a dashboards (agregar al archivo hosts primero) ===$(NC)"
+	@echo "  ArgoCD   → http://argocd.localhost:8888   (admin / $$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || echo 'ver: make argocd-password'))"
+	@echo "  Grafana  → http://grafana.localhost:8888  (admin / belo-challenge)"
+	@echo "  Kibana   → http://kibana.localhost:8888"
+	@echo "  Headlamp → http://headlamp.localhost:8888 (token: kubectl create token headlamp -n kube-system)"
+	@echo "  api01    → http://api01.localhost:8888"
+	@echo "  api02    → http://api02.localhost:8888"
+	@echo ""
+	@echo "$(GREEN)=== Hosts que deben estar en C:\\Windows\\System32\\drivers\\etc\\hosts ===$(NC)"
+	@echo "  127.0.0.1 argocd.localhost grafana.localhost kibana.localhost headlamp.localhost"
+	@echo "  127.0.0.1 api01.localhost preview-api01.localhost"
+	@echo "  127.0.0.1 api02.localhost preview-api02.localhost"
+	@echo "  127.0.0.1 tekton-webhook.localhost"
+	@echo ""
+	@echo "$(GREEN)=== Estado del cluster ===$(NC)"
+	kubectl get nodes -L role,workload 2>/dev/null || echo "Cluster no disponible"
+	@echo ""
+
+.PHONY: tunnel
+tunnel:  ## Exponer EventListener a internet con ngrok (requiere ngrok instalado)
+	@echo "$(YELLOW)→ Iniciando ngrok en puerto 8888...$(NC)"
+	@echo "$(YELLOW)  Una vez activo, copiá la URL https:// y configurala en GitHub:"$(NC)
+	@echo "  Settings → Webhooks → Payload URL: <ngrok-url>"
+	@echo "  Content type: application/json  |  Events: Push"
+	@echo ""
+	ngrok http 8888
+
 .PHONY: load-test-smoke
 load-test-smoke:  ## Smoke test: make load-test-smoke APP=webserver-api01
-	k6 run -e BASE_URL=http://$(APP).localhost:8888 apps/$(APP)/loadtest/smoke.js
+	k6 run -e BASE_URL=http://$(APP).localhost:8888 $(ROOT_DIR)apps/$(APP)/loadtest/smoke.js
 
 .PHONY: load-test-bluegreen
 load-test-bluegreen:  ## Load test BlueGreen (contra preview): make load-test-bluegreen
-	k6 run -e PREVIEW_URL=http://api01-preview.localhost:8888 \
-	  apps/webserver-api01/loadtest/load-bluegreen.js
+	k6 run -e PREVIEW_URL=http://preview-api01.localhost:8888 \
+	  $(ROOT_DIR)apps/webserver-api01/loadtest/load-bluegreen.js
 
 .PHONY: load-test-canary
 load-test-canary:  ## Load test Canary (contra stable con canary activo): make load-test-canary
 	k6 run -e BASE_URL=http://api02.localhost:8888 \
-	  apps/webserver-api02/loadtest/load-canary.js
+	  $(ROOT_DIR)apps/webserver-api02/loadtest/load-canary.js

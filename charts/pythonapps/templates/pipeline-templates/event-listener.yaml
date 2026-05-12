@@ -1,3 +1,4 @@
+{{- if .Values.tekton.enabled }}
 apiVersion: triggers.tekton.dev/v1beta1
 kind: EventListener
 metadata:
@@ -13,11 +14,20 @@ spec:
         kind: ClusterInterceptor
       params:
       - name: filter
-        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/')"
+        # Require 5-segment tag: refs/tags/<env>/<strategy>/<semver>
+        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/') && body.ref.split('/').size() >= 5"
       - name: overlays
         value:
-        - key: image_tag
+        - key: environment
           expression: "body.ref.split('/')[2]"
+        - key: strategy
+          expression: "body.ref.split('/')[3]"
+        - key: image_tag
+          # refs/tags/dev/rollingupdate/v1.0.0 → split → [refs,tags,dev,rollingupdate,v1.0.0] → index 4
+          expression: "body.ref.split('/')[4]"
+        - key: git_revision
+          # Full tag ref for git checkout (e.g. refs/tags/dev/rollingupdate/v1.0.0)
+          expression: "body.ref"
     bindings:
     - ref: github-tag-binding
     template:
@@ -44,3 +54,4 @@ spec:
             name: el-github-tag-listener
             port:
               number: 8080
+{{- end }}

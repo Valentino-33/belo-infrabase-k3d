@@ -1,24 +1,42 @@
 replicas: 1
 minimumMasterNodes: 1
+
+esJavaOpts: "-Xmx512m -Xms512m"
+
 resources:
   requests:
-    cpu: "500m"
-    memory: "1Gi"
+    cpu: 100m
+    memory: 512Mi
   limits:
-    cpu: "1000m"
-    memory: "1.5Gi"
+    cpu: 1000m
+    memory: 1Gi
+
 volumeClaimTemplate:
   storageClassName: local-path
   resources:
     requests:
-      storage: 10Gi
+      storage: 5Gi
+
+persistence:
+  enabled: true
+
+# Single-node cluster needs soft anti-affinity.
+antiAffinity: soft
+
+# Disable TLS and security for local dev.
+createCert: false
+secret:
+  enabled: false
+
+esConfig:
+  elasticsearch.yml: |
+    xpack.security.enabled: false
+    xpack.security.transport.ssl.enabled: false
+
 nodeSelector:
   role: statefulls
 tolerations:
 - key: workload
-  operator: Equal
   value: statefulls
+  operator: Equal
   effect: NoSchedule
-podAnnotations:
-  co.elastic.logs/enabled: "false"
-esJavaOpts: "-Xmx512m -Xms512m"

@@ -1,9 +1,19 @@
-# k3d: NodePort en lugar de LoadBalancer — el puerto 8888 está mapeado en k3d/config.yaml
 controller:
+  # hostPort binds :80/:443 on the node; k3d loadbalancer maps host:8888 -> node:80 -> nginx.
+  hostPort:
+    enabled: true
+    ports:
+      http: 80
+      https: 443
   service:
     type: NodePort
-    nodePorts:
-      http: 30080
-      https: 30443
-  metrics:
-    enabled: true
+  # Tolerate all taints so nginx can run on any node (stateless has no taint).
+  tolerations:
+  - operator: Exists
+  nodeSelector: {}
+  # Skip admission webhook cert setup -- simplifies k3d installation.
+  admissionWebhooks:
+    enabled: false
+  config:
+    use-forwarded-headers: "true"
+    proxy-body-size: "50m"

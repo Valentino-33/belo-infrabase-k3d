@@ -9,6 +9,8 @@ metadata:
 spec:
   pipelineRef:
     name: pythonapps-pipeline
+  taskRunTemplate:
+    serviceAccountName: tekton-pipeline-runner
   podTemplate:
     tolerations:
     - key: workload

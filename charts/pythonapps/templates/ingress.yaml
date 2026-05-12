@@ -1,6 +1,10 @@
 {{- if .Values.ingress.enabled }}
 {{- $fullname := include "pythonapps.fullname" . -}}
-{{- if or (eq .Values.rollout.strategy "bluegreen") (eq .Values.rollout.strategy "canary") }}
+{{/*
+  Topología invariante: stable + preview siempre existen.
+  - stable: hostname principal (api01.localhost). ArgoRollouts agrega annotations de canary-weight aquí.
+  - preview: acceso directo a la nueva versión (preview-api01.localhost) antes del promote.
+*/}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -18,7 +22,7 @@ spec:
   - host: {{ .Values.ingress.hostname }}
     http:
       paths:
-      - path: /{{ .Values.app.pathPrefix }}
+      - path: /
         pathType: Prefix
         backend:
           service:
@@ -33,6 +37,8 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "pythonapps.labels" . | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   ingressClassName: {{ .Values.ingress.ingressClassName }}
   rules:
@@ -46,26 +52,4 @@ spec:
             name: {{ $fullname }}-preview
             port:
               number: 8000
-{{- else }}
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {{ $fullname }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "pythonapps.labels" . | nindent 4 }}
-spec:
-  ingressClassName: {{ .Values.ingress.ingressClassName }}
-  rules:
-  - host: {{ .Values.ingress.hostname }}
-    http:
-      paths:
-      - path: /{{ .Values.app.pathPrefix }}
-        pathType: Prefix
-        backend:
-          service:
-            name: {{ $fullname }}
-            port:
-              number: 8000
-{{- end }}
 {{- end }}

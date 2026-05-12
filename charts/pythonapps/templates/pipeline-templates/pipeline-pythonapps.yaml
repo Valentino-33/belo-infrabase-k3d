@@ -1,3 +1,4 @@
+{{- if .Values.tekton.enabled }}
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
@@ -34,7 +35,9 @@ spec:
   workspaces:
   - name: source
   - name: gitops
+
   tasks:
+  # Stage 1: clone app source at the exact tag ref
   - name: clone
     taskRef:
       name: git-clone-app
@@ -47,6 +50,7 @@ spec:
     - name: revision
       value: $(params.revision)
 
+  # Stage 2: build image with Kaniko and push to Docker Hub
   - name: build-push
     taskRef:
       name: kaniko-build-push
@@ -60,10 +64,44 @@ spec:
     - name: context
       value: src
 
+  # Stage 3: update image.tag + rollout.strategy in gitops repo and push — triggers ArgoCD sync
+  - name: bump-gitops
+    taskRef:
+      name: bump-gitops-image
+    runAfter: [build-push]
+    workspaces:
+    - name: gitops
+      workspace: gitops
+    params:
+    - name: gitops-repo-url
+      value: $(params.gitops-repo-url)
+    - name: app-name
+      value: $(params.app-name)
+    - name: environment
+      value: $(params.environment)
+    - name: image-tag
+      value: $(params.image-tag)
+    - name: strategy
+      value: $(params.strategy)
+
+  # Stage 4: poll ArgoCD until Synced+Healthy, then wait for Rollout to Pause
+  - name: wait-argocd
+    taskRef:
+      name: wait-argocd-sync
+    runAfter: [bump-gitops]
+    params:
+    - name: app-name
+      value: $(params.app-name)
+    - name: environment
+      value: $(params.environment)
+    - name: strategy
+      value: $(params.strategy)
+
+  # Stage 5: k6 load test against preview/stable; always exits 0; emits outcome result
   - name: load-test
     taskRef:
       name: run-load-test
-    runAfter: [build-push]
+    runAfter: [wait-argocd]
     workspaces:
     - name: source
       workspace: source
@@ -77,19 +115,18 @@ spec:
     - name: base-url
       value: $(params.base-url)
 
-  - name: bump-gitops
+  # Stage 6: promote or abort based on load test outcome
+  - name: promote-rollback
     taskRef:
-      name: bump-gitops-image
+      name: promote-or-rollback
     runAfter: [load-test]
-    workspaces:
-    - name: gitops
-      workspace: gitops
     params:
-    - name: gitops-repo-url
-      value: $(params.gitops-repo-url)
     - name: app-name
       value: $(params.app-name)
     - name: environment
       value: $(params.environment)
-    - name: image-tag
-      value: $(params.image-tag)
+    - name: strategy
+      value: $(params.strategy)
+    - name: outcome
+      value: $(tasks.load-test.results.outcome)
+{{- end }}

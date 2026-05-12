@@ -1,252 +1,21 @@
 # belo-infrabase-k3d
 
 Stack completo de CI/CD y deployment strategies sobre Kubernetes local con **k3d**.
-Demuestra BlueGreen y Canary con ArgoRollouts, GitOps con ArgoCD, y pipelines automatizados con Tekton — sin dependencias de nube.
-
-## Quick Start
-
-```bash
-# 1. Pre-requisitos: Docker, k3d, kubectl, helm (ver sección Prereqs)
-make cluster-up          # cluster k3d + todos los addons (~10 min)
-
-# 2. Crear secretos para el pipeline (DockerHub + GitHub)
-make secrets             # muestra instrucciones
-make secrets-apply DOCKERHUB_USER=<tu_user> DOCKERHUB_TOKEN=<token> GITHUB_TOKEN=<token>
-
-# 3. Bootstrap GitOps (requiere que el repo esté en GitHub y sea accesible)
-make bootstrap           # aplica ArgoCD root app + Tekton pipeline manifests
-
-# 4. Ver que todo sincronizó
-make cluster-status
-
-# 5. Ver demos interactivas
-make demo-bluegreen
-make demo-canary
-```
-
-**Acceso a UIs** (tras `make port-forward` o directo via `*.localhost:8888`):
-
-| Servicio | URL |
-|----------|-----|
-| ArgoCD | http://argocd.localhost:8888 |
-| Grafana | http://grafana.localhost:8888 (admin / belo-challenge) |
-| Kibana | http://kibana.localhost:8888 |
-| Headlamp | http://headlamp.localhost:8888 |
-| api01 | http://api01.localhost:8888/api01/hello |
-| api02 | http://api02.localhost:8888/api02/hello |
-| Webhook Tekton | http://tekton-webhook.localhost:8888 |
-
-> Para que los hostnames `.localhost` funcionen, agregá al `/etc/hosts`:
-> `127.0.0.1 argocd.localhost grafana.localhost kibana.localhost headlamp.localhost api01.localhost api02.localhost preview-api01.localhost tekton-webhook.localhost`
+Demuestra BlueGreen, Canary y RollingUpdate con ArgoRollouts, GitOps con ArgoCD, y pipelines de 6 stages completamente automatizados con Tekton — sin dependencias de nube.
 
 ---
 
-## Arquitectura
+## Índice
 
-```
-k3d Cluster (4 nodos: 1 server + 3 agents)
-┌──────────────────────────────────────────────────────────────────┐
-│ agent-0 [statefulls, tainted]   Elasticsearch, Prometheus        │
-│ agent-1 [stateless]             api01, api02, ArgoCD, Grafana    │
-│ agent-2 [cicd, tainted]         Tekton PipelineRuns              │
-│ server-0                        k3s control plane                │
-├──────────────────────────────────────────────────────────────────┤
-│ nginx-ingress (NodePort :8888→80) — todos los hostnames *.localhost │
-└──────────────────────────────────────────────────────────────────┘
-
-CI/CD Flow:
-  git push tag v1.x.x
-    → GitHub webhook → EventListener (Tekton Triggers)
-    → CEL filter: refs/tags/*
-    → PipelineRun en nodo cicd:
-        clone → kaniko build+push → k6 load test → bump image.tag en este repo
-    → ArgoCD detecta commit → actualiza Rollout
-    → BlueGreen/Canary avanza según strategy
-```
-
-## Pre-requisitos
-
-| Herramienta | Versión mínima | Instalación |
-|-------------|----------------|-------------|
-| Docker | 24+ | https://docs.docker.com/get-docker/ |
-| k3d | v5.6+ | `brew install k3d` / https://k3d.io |
-| kubectl | 1.28+ | https://kubernetes.io/docs/tasks/tools/ |
-| helm | v3.14+ | `brew install helm` |
-| k6 (opcional) | v0.50+ | `brew install k6` (solo para load tests locales) |
-| tkn (opcional) | latest | `brew install tektoncd-cli` (para monitorear pipelines) |
-
-> **Recursos mínimos**: 8 GB RAM, 4 CPU cores, 20 GB disco libre.
-
----
-
-## Deployment Strategies
-
-### Blue/Green — webserver-api01
-
-La nueva versión (green) corre en paralelo al stable (blue). El tráfico no se redirige hasta que:
-1. La nueva versión pase el health check
-2. Se corra el load test `load-bluegreen.js` contra el preview service
-3. El operador ejecute `kubectl argo rollouts promote webserver-api01 -n dev`
-
-```bash
-# Ver estado en tiempo real
-kubectl argo rollouts get rollout webserver-api01 -n dev --watch
-
-# Guía interactiva completa
-make demo-bluegreen
-
-# Disparar nueva versión
-make pipeline-run APP=webserver-api01 TAG=v1.1.0
-
-# Promover cuando estés listo
-make rollout-promote APP=webserver-api01
-
-# Rollback si algo falla
-make rollout-abort APP=webserver-api01
-```
-
-**Verificar que el preview sirve la nueva versión antes de promover:**
-```bash
-curl http://preview-api01.localhost:8888/version
-```
-
-### Canary — webserver-api02
-
-El tráfico se mueve gradualmente al canary: **5% → 25% → 50% → 100%**. Cada step requiere una promoción manual o se puede automatizar con análisis de métricas.
-
-```bash
-# Guía interactiva completa
-make demo-canary
-
-# Disparar nueva versión
-make pipeline-run APP=webserver-api02 TAG=v1.1.0
-
-# Avanzar steps (ejecutar 3 veces para llegar al 100%)
-make rollout-promote APP=webserver-api02
-
-# Ver distribución de tráfico en vivo
-kubectl argo rollouts get rollout webserver-api02 -n dev --watch
-```
-
----
-
-## Tekton CI/CD Pipeline
-
-### Trigger automático (webhook GitHub)
-
-Cada push de tag al repo dispara el pipeline automáticamente:
-
-```bash
-git tag v1.2.0
-git push origin v1.2.0
-# → webhook → EventListener → PipelineRun
-```
-
-**Configurar el webhook en GitHub:**
-1. Settings → Webhooks → Add webhook
-2. Payload URL: `http://tekton-webhook.localhost:8888` (o la IP pública del cluster si es accesible)
-3. Content type: `application/json`
-4. Events: `Push`
-
-### Trigger manual (sin webhook)
-
-```bash
-make pipeline-run APP=webserver-api01 TAG=v0.2.0
-
-# Monitorear con tkn CLI
-tkn pipelinerun logs -n tekton-pipelines --last -f
-
-# O con kubectl
-kubectl -n tekton-pipelines get pipelineruns
-kubectl -n tekton-pipelines logs -l tekton.dev/pipelineRun=<name> -f
-```
-
-### Flujo del pipeline
-
-```
-Task 1: git-clone-app
-  └── clone del repo a /workspace/source/src
-
-Task 2: kaniko-build-push
-  └── build Dockerfile → push docker.io/<user>/<app>:<tag>
-  └── requiere secret: dockerhub-credentials
-
-Task 3: run-load-test
-  └── k6 smoke.js | load-bluegreen.js | load-canary.js (según strategy)
-  └── WARN y continúa si no existen los scripts
-
-Task 4: bump-gitops-image
-  └── git clone este repo
-  └── yq: .image.tag = "<tag>" en charts/pythonapps/apps/<app>/dev/values-*.yaml
-  └── git commit + push
-  └── requiere secret: github-token
-```
-
----
-
-## Observabilidad
-
-### Logs (Kibana)
-- Fluent-bit recolecta logs de todos los pods → Elasticsearch
-- Acceder a `http://kibana.localhost:8888`
-- Index pattern: `k8s-*`
-- Los logs de las apps son JSON estructurado (structlog)
-
-### Métricas (Grafana)
-- Prometheus scrapeía las apps via ServiceMonitor
-- Acceder a `http://grafana.localhost:8888` (admin / belo-challenge)
-- Métricas disponibles: `api01_requests_total`, `api01_request_duration_seconds`, etc.
-
-### Load testing
-```bash
-# Smoke test
-make load-test-smoke APP=webserver-api01
-
-# BlueGreen (contra preview)
-make load-test-bluegreen
-
-# Canary (contra stable con canary activo)
-make load-test-canary
-```
-
----
-
-## Estructura del repo
-
-```
-belo-infrabase-k3d/
-├── apps/
-│   ├── webserver-api01/        ← FastAPI app (BlueGreen), Dockerfile, k6 scripts
-│   └── webserver-api02/        ← FastAPI app (Canary), Dockerfile, k6 scripts
-├── charts/
-│   └── pythonapps/             ← Helm chart: Rollout + Service + Ingress + Tekton Tasks + Pipeline
-│       └── apps/               ← values por app y ambiente
-├── gitops/
-│   ├── apps-of-apps.yaml       ← Root Applications de ArgoCD
-│   └── gitops-core-dev/        ← Application CRs para namespace dev
-├── helm/addons/                ← Values de cada addon (nginx, argocd, elk, prometheus...)
-├── k3d/config.yaml             ← Definición del cluster k3d
-├── manifests/
-│   ├── argocd/bootstrap.yaml   ← Root Application (make bootstrap)
-│   └── tekton/                 ← Ejemplos de secrets + PipelineRun manual
-└── Makefile                    ← Entrada principal
-```
-
----
-
-## Comandos útiles
-
-```bash
-make help                                    # ver todos los targets
-make cluster-status                          # estado del cluster
-make argocd-password                         # password de ArgoCD
-make rollout-status APP=webserver-api01      # estado del rollout en vivo
-make rollout-promote APP=webserver-api01     # promover blue→green
-make rollout-abort APP=webserver-api01       # rollback
-make build APP=webserver-api01 TAG=v0.1.0   # build imagen local
-make build-push APP=webserver-api01 TAG=v0.1.0  # build + push
-make cluster-down                            # destruir todo
-```
+- [Stack de tecnologías](#stack-de-tecnologías)
+- [Pre-requisitos](#pre-requisitos)
+- [Levantado desde cero](#levantado-desde-cero)
+- [Acceso a los dashboards](#acceso-a-los-dashboards)
+- [Configurar el webhook](#configurar-el-webhook)
+- [Correr el pipeline](#correr-el-pipeline)
+- [Deployment strategies](#deployment-strategies)
+- [Estructura del repo](#estructura-del-repo)
+- [Documentación adicional](#documentación-adicional)
 
 ---
 
@@ -255,15 +24,346 @@ make cluster-down                            # destruir todo
 | Capa | Tecnología |
 |------|-----------|
 | Kubernetes local | k3d (k3s en Docker) |
-| Deployment strategies | Argo Rollouts |
-| GitOps | ArgoCD |
+| Deployment strategies | Argo Rollouts — BlueGreen, Canary, RollingUpdate |
+| GitOps | ArgoCD (apps-of-apps) |
 | CI/CD | Tekton Pipelines + Triggers |
-| Build | Kaniko (sin Docker daemon) |
-| Ingress | nginx-ingress (NodePort) |
-| Logging | EFK (Elasticsearch + Fluent-bit + Kibana) |
-| Monitoring | kube-prometheus-stack (Prometheus + Grafana) |
+| Build de imágenes | Kaniko (sin Docker daemon) |
+| Ingress | nginx-ingress (NodePort :8888→:80) |
+| Logging | EFK — Elasticsearch + Fluent-bit + Kibana |
+| Monitoring | kube-prometheus-stack — Prometheus + Grafana |
 | Dashboard | Headlamp |
-| Load testing | k6 |
-| Apps | Python FastAPI + structlog + prometheus-client |
+| Load testing | k6 (in-cluster) |
+| Apps de demo | Python FastAPI + structlog + prometheus-client |
 | Packaging | Helm (chart maestro `pythonapps`) |
 | Storage | local-path (provisioner nativo de k3s) |
+
+---
+
+## Pre-requisitos
+
+| Herramienta | Versión mínima | Instalación en Windows |
+|-------------|----------------|------------------------|
+| Docker Desktop | 24+ | https://docs.docker.com/get-docker/ |
+| k3d | v5.6+ | `winget install k3d` |
+| kubectl | 1.28+ | `winget install Kubernetes.kubectl` |
+| helm | v3.14+ | `winget install Helm.Helm` |
+| make | cualquiera | incluido en Git Bash / `winget install GnuWin32.Make` |
+| k6 (opcional) | v0.50+ | `winget install k6` |
+| tkn CLI (opcional) | latest | `winget install tektoncd.cli` |
+| ngrok (para webhook) | latest | `winget install ngrok.ngrok` |
+
+> **Recursos mínimos**: 8 GB RAM, 4 CPU cores, 20 GB de disco libre.
+>
+> **Windows**: después de instalar k3d con winget, reiniciá la terminal para que el PATH se actualice.
+> Si usás `make` desde Git Bash, todos los comandos de esta guía asumen Git Bash o WSL2.
+
+---
+
+## Levantado desde cero
+
+```bash
+# 1. Clonar este repo
+git clone https://github.com/Valentino-33/belo-infrabase-k3d
+cd belo-infrabase-k3d
+
+# 2. Crear el cluster k3d e instalar todos los addons (~10 min)
+make cluster-up
+
+# 3. Crear los secretos necesarios para el pipeline
+make secrets-apply \
+  DOCKERHUB_USER=<tu-usuario-dockerhub> \
+  DOCKERHUB_TOKEN=<tu-token-dockerhub> \
+  GITHUB_TOKEN=<tu-personal-access-token>
+
+# 4. Bootstrap: aplicar root Application de ArgoCD + manifests de Tekton
+make bootstrap
+
+# 5. Ver el estado de todo
+make cluster-status
+make cluster-info
+```
+
+Después de `make bootstrap`, ArgoCD sincroniza las apps automáticamente. En ~2 minutos:
+
+```bash
+kubectl -n argocd get applications
+# NAME                   SYNC STATUS   HEALTH STATUS
+# gitops-core-dev        Synced        Healthy
+# webserver-api01-dev    Synced        Healthy
+# webserver-api02-dev    Synced        Healthy
+```
+
+> **Atajo**: `make all` hace cluster-up + bootstrap en un solo comando, pero omite el paso de secretos.
+> Corré `make secrets-apply ...` antes de disparar el primer pipeline.
+
+---
+
+## Acceso a los dashboards
+
+### 1. Agregar entradas al archivo hosts
+
+Editar `C:\Windows\System32\drivers\etc\hosts` **como Administrador**:
+
+```
+127.0.0.1 argocd.localhost
+127.0.0.1 grafana.localhost
+127.0.0.1 kibana.localhost
+127.0.0.1 headlamp.localhost
+127.0.0.1 api01.localhost
+127.0.0.1 preview-api01.localhost
+127.0.0.1 api02.localhost
+127.0.0.1 preview-api02.localhost
+127.0.0.1 tekton-webhook.localhost
+```
+
+### 2. Abrir en el browser
+
+Todos los servicios son accesibles en el puerto **:8888** a través de nginx-ingress:
+
+| Servicio | URL | Credenciales |
+|----------|-----|--------------|
+| **ArgoCD** | http://argocd.localhost:8888 | admin / `make argocd-password` |
+| **Grafana** | http://grafana.localhost:8888 | admin / belo-challenge |
+| **Kibana** | http://kibana.localhost:8888 | sin autenticación (dev) |
+| **Headlamp** | http://headlamp.localhost:8888 | token: ver abajo |
+| **api01** (stable) | http://api01.localhost:8888 | — |
+| **api01** (preview) | http://preview-api01.localhost:8888 | — |
+| **api02** (stable) | http://api02.localhost:8888 | — |
+| **api02** (preview) | http://preview-api02.localhost:8888 | — |
+| **Tekton webhook** | http://tekton-webhook.localhost:8888 | configurar en GitHub |
+
+**Token de Headlamp** (expira en 1 hora):
+
+```bash
+kubectl create token headlamp --namespace kube-system
+```
+
+---
+
+## Configurar el webhook
+
+Para que el pipeline se dispare automáticamente al pushear un tag de Git, necesitás exponer el EventListener de Tekton a internet.
+
+### Opción rápida — ngrok
+
+```bash
+# Iniciar tunnel (en una terminal aparte)
+make tunnel
+
+# ngrok muestra: Forwarding https://abc123.ngrok-free.app → http://localhost:8888
+# Copiar esa URL
+```
+
+En GitHub → repo de la app → **Settings → Webhooks → Add webhook**:
+- **Payload URL**: `https://abc123.ngrok-free.app`
+- **Content type**: `application/json`
+- **Events**: `Just the push event`
+
+Ver la [guía completa de webhook](docs/webhook-setup.md) para otras opciones (smee.io, IP directa, HMAC).
+
+---
+
+## Correr el pipeline
+
+### Automático (vía webhook + git tag)
+
+El formato del tag es `<env>/<strategy>/<semver>`:
+
+```bash
+# Ir al repo de la app
+cd /ruta/a/webserver-api01
+
+# BlueGreen
+git tag dev/bluegreen/v1.2.0
+git push origin dev/bluegreen/v1.2.0
+
+# Canary
+git tag dev/canary/v1.2.0
+git push origin dev/canary/v1.2.0
+
+# Rolling Update
+git tag dev/rollingupdate/v1.2.0
+git push origin dev/rollingupdate/v1.2.0
+```
+
+El tag dispara el webhook → CEL extrae `env`, `strategy` e `image_tag` → crea el PipelineRun.
+
+> **Importante**: el nombre del repo de la app en GitHub debe coincidir con el `app-name` en ArgoCD (`webserver-api01` / `webserver-api02`).
+
+### Manual (sin webhook)
+
+```bash
+# Sin pushear tags — dispara el pipeline directamente
+make pipeline-run APP=webserver-api01 TAG=v1.2.0
+
+# Monitorear
+tkn pipelinerun logs -n tekton-pipelines --last -f
+```
+
+### Stages del pipeline
+
+```
+Stage 1  git-clone-app       → clona el repo de la app (tag ref exacto)
+Stage 2  kaniko-build-push   → build Dockerfile + push a Docker Hub
+Stage 3  bump-gitops-image   → yq actualiza image.tag y rollout.strategy → git commit+push
+Stage 4  wait-argocd-sync    → espera ArgoCD Synced+Healthy y Rollout Paused/Healthy
+Stage 5  run-load-test       → k6 contra preview/stable (siempre exits 0; emite outcome)
+Stage 6  promote-rollback    → promote si outcome=passed; abort/undo si outcome=failed
+```
+
+---
+
+## Deployment strategies
+
+### Blue/Green — webserver-api01
+
+La nueva versión (Green) se despliega en paralelo al stable (Blue). El tráfico no cambia hasta que el k6 pase y el Stage 6 ejecute el promote.
+
+```bash
+# Guía interactiva
+make demo-bluegreen
+
+# Monitorear el rollout
+kubectl argo rollouts get rollout webserver-api01 -n dev --watch
+
+# Verificar que el preview responde
+curl http://preview-api01.localhost:8888/version
+
+# El pipeline promueve automáticamente si k6 pasa
+# Si querés hacerlo a mano:
+make rollout-promote APP=webserver-api01
+
+# Rollback
+make rollout-abort APP=webserver-api01
+```
+
+### Canary — webserver-api02
+
+El tráfico se mueve gradualmente: **5% → 25% → 50% → promote-full** con k6 en cada step.
+
+```bash
+# Guía interactiva
+make demo-canary
+
+# Monitorear la distribución de tráfico en vivo
+kubectl argo rollouts get rollout webserver-api02 -n dev --watch
+
+# Avanzar steps manualmente (si no usás el pipeline automatizado)
+make rollout-promote APP=webserver-api02  # step 5%→25%
+make rollout-promote APP=webserver-api02  # step 25%→50%
+make rollout-promote APP=webserver-api02  # step 50%→100%
+
+# Rollback en cualquier momento
+make rollout-abort APP=webserver-api02
+```
+
+### RollingUpdate — cualquier app
+
+Deployment estándar. Los pods se actualizan uno a uno sin pauses. El pipeline corre un smoke test al final y hace rollback si falla.
+
+```bash
+git tag dev/rollingupdate/v1.2.0
+git push origin dev/rollingupdate/v1.2.0
+# El Rollout completa directamente (fase Healthy, sin Paused)
+```
+
+---
+
+## Estructura del repo
+
+```
+belo-infrabase-k3d/
+├── Makefile                            ← Entrada principal (make help)
+├── k3d/
+│   └── config.yaml                     ← Definición del cluster k3d (4 nodos)
+├── apps/
+│   ├── webserver-api01/
+│   │   ├── src/                        ← Código Python FastAPI
+│   │   ├── Dockerfile
+│   │   └── loadtest/
+│   │       ├── smoke.js
+│   │       ├── load-bluegreen.js
+│   │       └── load-canary.js
+│   └── webserver-api02/
+│       ├── src/
+│       ├── Dockerfile
+│       └── loadtest/
+│           ├── smoke.js
+│           ├── load-bluegreen.js
+│           └── load-canary.js
+├── charts/
+│   └── pythonapps/                     ← Helm chart maestro
+│       ├── templates/
+│       │   ├── rollout.yaml            ← ArgoRollout (BG/Canary/Rolling)
+│       │   ├── service.yaml            ← stable + preview (siempre)
+│       │   ├── ingress.yaml            ← stable + preview (siempre)
+│       │   └── pipeline-templates/     ← Tekton Tasks, Pipeline, Triggers
+│       └── apps/
+│           ├── webserver-api01/
+│           │   ├── build-time/app.yaml ← image.repository, rollout defaults
+│           │   └── dev/values-*.yaml   ← image.tag actualizado por el pipeline
+│           └── webserver-api02/
+│               ├── build-time/app.yaml
+│               └── dev/values-*.yaml
+├── gitops/
+│   ├── apps-of-apps.yaml               ← Root Application de ArgoCD
+│   └── gitops-core-dev/
+│       ├── webserver-api01.yaml        ← Application CR (apunta a charts/pythonapps)
+│       └── webserver-api02.yaml
+├── helm/addons/                        ← Values de cada addon Helm
+│   ├── argocd/values.yaml
+│   ├── nginx-ingress/values.yaml
+│   ├── elasticsearch/values.yaml
+│   ├── fluent-bit/values.yaml
+│   ├── kibana/values.yaml
+│   ├── kube-prometheus/values.yaml
+│   └── headlamp/values.yaml
+├── manifests/
+│   ├── argocd/bootstrap.yaml           ← Root Application (make bootstrap)
+│   └── tekton/
+│       ├── pipelinerun-manual.yaml     ← Pipeline manual sin webhook
+│       └── github-secret.yaml.example ← Template de secret de GitHub
+└── docs/
+    ├── architecture.md                 ← Diagramas Mermaid de la arquitectura
+    ├── demo-guide.md                   ← Guía paso a paso de cada estrategia
+    └── webhook-setup.md               ← Configuración del webhook GitHub → Tekton
+```
+
+---
+
+## Documentación adicional
+
+| Documento | Descripción |
+|-----------|-------------|
+| [docs/architecture.md](docs/architecture.md) | Diagramas de topología del cluster, componentes y flujo CI/CD completo |
+| [docs/demo-guide.md](docs/demo-guide.md) | Guía paso a paso para demostrar cada estrategia |
+| [docs/webhook-setup.md](docs/webhook-setup.md) | Configuración del webhook GitHub → Tekton (ngrok, smee.io, HMAC) |
+| [MAKEFILE_GUIDE.md](MAKEFILE_GUIDE.md) | Referencia completa de todos los targets del Makefile |
+| [ROADMAP.md](ROADMAP.md) | Fases completadas y deuda técnica conocida |
+
+---
+
+## Comandos de referencia rápida
+
+```bash
+make help                                    # todos los targets
+make cluster-up                              # crear cluster + instalar addons
+make cluster-down                            # destruir todo
+make cluster-status                          # nodos + apps + rollouts
+make cluster-info                            # URLs, hosts, passwords
+make secrets-apply DOCKERHUB_USER=x DOCKERHUB_TOKEN=x GITHUB_TOKEN=x
+make bootstrap                               # aplicar ArgoCD root + Tekton
+make tekton-apply                            # re-aplicar tasks/pipeline (si cambia el chart)
+make argocd-password                         # password de ArgoCD
+make pipeline-run APP=webserver-api01 TAG=v1.0.0
+make demo-bluegreen                          # guía interactiva BlueGreen
+make demo-canary                             # guía interactiva Canary
+make rollout-status APP=webserver-api01      # estado en vivo
+make rollout-promote APP=webserver-api01     # promover
+make rollout-abort APP=webserver-api01       # rollback
+make load-test-smoke APP=webserver-api01     # smoke test k6
+make load-test-bluegreen                     # load test contra preview
+make load-test-canary                        # load test canary
+make tunnel                                  # ngrok → exponer EventListener
+make port-forward                            # port-forward de fallback
+```

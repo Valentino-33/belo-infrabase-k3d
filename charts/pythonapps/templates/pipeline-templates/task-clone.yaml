@@ -1,3 +1,4 @@
+{{- if .Values.tekton.enabled }}
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -26,3 +27,4 @@ spec:
       git checkout "$(params.revision)"
       echo "Clonado OK: $(params.url) @ $(params.revision)"
       ls -la "$DEST"
+{{- end }}
