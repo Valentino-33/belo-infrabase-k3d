@@ -78,7 +78,16 @@
       "Bash(git checkout *)",
       "PowerShell(ngrok config *)",
       "Bash(xargs grep -l \"eventlistener\\\\|tekton-webhook\\\\|EventListener\")",
-      "Bash(xargs grep -l \"TriggerBinding\\\\|TriggerTemplate\\\\|github-tag-binding\")"
+      "Bash(xargs grep -l \"TriggerBinding\\\\|TriggerTemplate\\\\|github-tag-binding\")",
+      "Read(//c/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api01/**)",
+      "Read(//c/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api02/**)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(git stash *)",
+      "Bash(curl -s http://api01.localhost:8888/api01/version)",
+      "Bash(curl -s http://api01.localhost:8888/api01/hello)",
+      "Bash(curl -s http://api02.localhost:8888/api02/version)",
+      "Bash(curl -s http://api02.localhost:8888/api02/items)"
     ]
   }
 }

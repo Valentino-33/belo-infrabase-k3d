@@ -1,0 +1,35 @@
+# Service + ServiceMonitor para que Prometheus scrape los /metrics del
+# controller de Argo Rollouts. Métricas resultantes: rollout_info,
+# rollout_phase, rollout_reconcile_*, etc. Necesarias para el dashboard
+# pipeline (panel "Rollouts en estado Healthy/Paused/Degraded").
+apiVersion: v1
+kind: Service
+metadata:
+  name: argo-rollouts-metrics
+  namespace: argo-rollouts
+  labels:
+    app.kubernetes.io/name: argo-rollouts
+spec:
+  selector:
+    app.kubernetes.io/name: argo-rollouts
+  ports:
+  - name: metrics
+    port: 8090
+    targetPort: 8090
+    protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: argo-rollouts
+  namespace: argo-rollouts
+  labels:
+    release: kube-prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argo-rollouts
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics

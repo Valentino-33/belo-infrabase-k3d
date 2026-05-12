@@ -37,9 +37,12 @@ readinessProbe:
   failureThreshold: 3
 hpa:
   enabled: true
-  minReplicas: 2
-  maxReplicas: 5
-  targetCPUUtilizationPercentage: 70
+  minReplicas: 3
+  maxReplicas: 7
+  # Target 50% (no 70%): k3d local — queremos ver el HPA gatillar scale-up
+  # en la demo. Con 50% basta saturar ~50% del CPU de UN pod para que el
+  # promedio del rollout cruce el threshold.
+  targetCPUUtilizationPercentage: 50
 ingress:
   enabled: true
   hostname: api01.localhost

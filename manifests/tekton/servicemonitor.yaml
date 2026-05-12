@@ -1,0 +1,44 @@
+# ServiceMonitor para que Prometheus scrape los /metrics del controller
+# de Tekton Pipelines. Sin esto, el Grafana dashboard "belo-pipeline" no
+# tiene datos (tekton_pipelines_controller_* viene de acá).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tekton-pipelines-controller
+  namespace: tekton-pipelines
+  labels:
+    # El operator de kube-prometheus-stack scrapea ServiceMonitors con
+    # release=kube-prometheus por default. Sin este label no detecta.
+    release: kube-prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: controller
+      app.kubernetes.io/part-of: tekton-pipelines
+  namespaceSelector:
+    matchNames:
+    - tekton-pipelines
+  endpoints:
+  - port: http-metrics
+    interval: 30s
+    path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tekton-triggers-controller
+  namespace: tekton-pipelines
+  labels:
+    release: kube-prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: controller
+      app.kubernetes.io/part-of: tekton-triggers
+  namespaceSelector:
+    matchNames:
+    - tekton-pipelines
+  endpoints:
+  - port: http-metrics
+    interval: 30s
+    path: /metrics

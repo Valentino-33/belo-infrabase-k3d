@@ -11,7 +11,7 @@ data:
       "title": "belo — pipeline & rollouts overview",
       "uid": "belo-pipeline",
       "schemaVersion": 36,
-      "version": 1,
+      "version": 2,
       "tags": ["belo-challenge", "pipeline", "rollouts"],
       "timezone": "browser",
       "time": { "from": "now-1h", "to": "now" },
@@ -19,58 +19,103 @@ data:
       "panels": [
         {
           "type": "stat",
-          "title": "PipelineRuns recientes (last 1h)",
-          "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
-          "targets": [{
-            "expr": "count(tekton_pipelines_controller_pipelinerun_duration_seconds_count)",
-            "legendFormat": "runs"
-          }]
+          "title": "Rollouts Healthy",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "targets": [{ "expr": "count(rollout_info{phase=\"Healthy\"})" }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null }, { "color": "yellow", "value": 1 }, { "color": "green", "value": 2 }
+          ] } } }
         },
         {
           "type": "stat",
-          "title": "Tasks fallidas (last 1h)",
-          "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
-          "targets": [{
-            "expr": "sum(tekton_pipelines_controller_taskrun_count{status=\"failed\"})",
-            "legendFormat": "failed"
-          }]
+          "title": "Rollouts Paused",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "targets": [{ "expr": "count(rollout_info{phase=\"Paused\"}) or vector(0)" }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "yellow", "value": 1 }
+          ] } } }
         },
         {
           "type": "stat",
-          "title": "Rollouts en estado Healthy",
-          "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
-          "targets": [{
-            "expr": "count(rollout_info{phase=\"Healthy\"})",
-            "legendFormat": "healthy"
-          }]
+          "title": "Rollouts Degraded",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "targets": [{ "expr": "count(rollout_info{phase=\"Degraded\"}) or vector(0)" }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "red", "value": 1 }
+          ] } } }
         },
         {
           "type": "stat",
-          "title": "Rollouts en estado Paused/Degraded",
-          "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
-          "targets": [
-            { "expr": "count(rollout_info{phase=\"Paused\"})", "legendFormat": "paused" },
-            { "expr": "count(rollout_info{phase=\"Degraded\"})", "legendFormat": "degraded" }
+          "title": "Pipeline Runs Running ahora",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "targets": [{ "expr": "sum(tekton_pipelines_controller_running_pipelineruns) or vector(0)" }]
+        },
+        {
+          "type": "table",
+          "title": "Rollouts — estado actual (todos los namespaces)",
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 4 },
+          "targets": [{ "expr": "rollout_info", "format": "table", "instant": true }],
+          "transformations": [
+            { "id": "organize", "options": {
+              "excludeByName": { "Time": true, "__name__": true, "container": true, "endpoint": true, "instance": true, "job": true, "namespace": true, "pod": true, "service": true, "Value": true },
+              "renameByName": { "exported_namespace": "namespace", "name": "rollout", "strategy": "strategy", "phase": "phase", "traffic_router": "traffic_router" }
+            } }
           ]
         },
         {
           "type": "timeseries",
-          "title": "Tekton TaskRun duration (s) — p95",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+          "title": "Tekton TaskRun duration p95 — por task",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
           "targets": [{
-            "expr": "histogram_quantile(0.95, sum by (le, task) (rate(tekton_pipelines_controller_taskrun_duration_seconds_bucket[5m])))",
+            "expr": "histogram_quantile(0.95, sum by (le, task) (rate(tekton_pipelines_controller_taskrun_duration_seconds_bucket[10m])))",
             "legendFormat": "{{task}}"
           }],
           "fieldConfig": { "defaults": { "unit": "s" } }
         },
         {
           "type": "timeseries",
-          "title": "Argo Rollouts phase transitions",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+          "title": "Pipeline duration p95 (end-to-end)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
           "targets": [{
-            "expr": "rollout_info",
-            "legendFormat": "{{name}} — {{phase}}"
+            "expr": "histogram_quantile(0.95, sum by (le, pipeline) (rate(tekton_pipelines_controller_pipelinerun_duration_seconds_bucket[10m])))",
+            "legendFormat": "{{pipeline}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "TaskRuns counter por status",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+          "targets": [
+            { "expr": "sum by (status) (tekton_pipelines_controller_taskrun_count) or vector(0)", "legendFormat": "{{status}}" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "PipelineRuns counter por status",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+          "targets": [
+            { "expr": "sum by (status) (tekton_pipelines_controller_pipelinerun_count) or vector(0)", "legendFormat": "{{status}}" }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Pods en tekton-pipelines (PipelineRun pods)",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 28 },
+          "targets": [{
+            "expr": "count by (phase) (kube_pod_status_phase{namespace=\"tekton-pipelines\"} == 1)",
+            "legendFormat": "{{phase}}"
           }]
+        },
+        {
+          "type": "timeseries",
+          "title": "Argo Rollouts reconciliation duration p95",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 28 },
+          "targets": [{
+            "expr": "histogram_quantile(0.95, sum by (le, name) (rate(rollout_reconcile_bucket[5m])))",
+            "legendFormat": "{{name}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "s" } }
         }
       ]
     }
