@@ -1,20 +1,15 @@
 app:
   name: "webserver-api01"
   namespace: "webserver-api01-dev"
-
 image:
-  repository: docker.io/valentinobruno/webserver-api01
+  repository: docker.io/valentinobruno/api01
   tag: "latest"
   pullPolicy: IfNotPresent
-
 rollout:
   strategy: bluegreen
-
 replicas: 1
-
 ports:
   containerPort: 8000
-
 resources:
   requests:
     cpu: "100m"
@@ -22,7 +17,6 @@ resources:
   limits:
     cpu: "300m"
     memory: "256Mi"
-
 livenessProbe:
   httpGet:
     path: /health
@@ -30,7 +24,6 @@ livenessProbe:
   initialDelaySeconds: 10
   periodSeconds: 10
   failureThreshold: 3
-
 readinessProbe:
   httpGet:
     path: /health
@@ -38,20 +31,17 @@ readinessProbe:
   initialDelaySeconds: 5
   periodSeconds: 5
   failureThreshold: 3
-
 hpa:
   enabled: false
   minReplicas: 1
   maxReplicas: 3
   targetCPUUtilizationPercentage: 70
-
 ingress:
   enabled: true
   hostname: api01.localhost
   ingressClassName: nginx
   annotations:
     nginx.ingress.kubernetes.io/rewrite-target: /
-
 serviceMonitor:
   enabled: true
   interval: 30s
