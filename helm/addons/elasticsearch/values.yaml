@@ -1,6 +1,12 @@
 replicas: 1
 minimumMasterNodes: 1
 
+# Single-node cluster: el readiness probe default exige status=green, pero
+# cualquier índice creado con number_of_replicas>=1 (default de ES) deja
+# shards huérfanos al no haber segundo nodo → cluster yellow permanente y
+# el pod nunca pasa a Ready, trabando make cluster-start. Aceptamos yellow.
+clusterHealthCheckParams: "wait_for_status=yellow&timeout=1s"
+
 esJavaOpts: "-Xmx512m -Xms512m"
 
 resources:
