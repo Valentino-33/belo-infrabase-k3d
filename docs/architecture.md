@@ -228,36 +228,43 @@ sequenceDiagram
     end
 
     rect rgb(220,252,231)
-    Note over TR: Stage 5 — load-test (~60-90s si enabled, ~2s si skipped)
-    alt run-load-test=true (flag explícito en el tag)
-        Note over TR: Lee script desde el repo de la app:<br/>/workspace/source/src/loadtest/<script>.js<br/>(fail-fast si no existe — no se permite verde sin tests)
-        TR->>K6: k6 run load-bluegreen.js<br/>(o canary/smoke según strategy)
-        K6->>ARO: HTTP → preview svc (BG)<br/>o stable svc (Canary/Rolling)
+    Note over TR: Stage 5 — load-test
+    alt MODO ENTERPRISE (Rollout con AnalysisTemplate)
+        Note over TR: k6 GENERA TRÁFICO (corre siempre, ignora flag loadtest).<br/>Argo Rollouts corre el AnalysisRun EN PARALELO consultando<br/>Prometheus (success-rate, latency-p95) sobre ese tráfico.
+        TR->>K6: k6 run (preview svc BG / stable svc Canary)
+        K6->>ARO: HTTP → genera tráfico para el AnalysisRun
+    else MODO LEGACY + run-load-test=true
+        TR->>K6: k6 run load-bluegreen.js (o canary/smoke)
         K6-->>TR: result outcome=passed|failed
-    else run-load-test=false (default)
-        Note over TR: Skipea k6 — log "loadtest disabled by tag flag"<br/>Emite outcome=passed para auto-promote downstream.<br/>El Rollout no sufre HPA scale por carga sintética.
+    else MODO LEGACY + run-load-test=false (default)
+        Note over TR: Skipea k6 — emite outcome=passed para auto-promote.
     end
     end
 
     rect rgb(254,243,199)
-    Note over TR: Stage 6 — promote-rollback (~10s)<br/>SIN PLUGIN — kubectl patch directo
-    alt outcome=passed AND strategy=bluegreen
-        TR->>ARO: kubectl patch rollout<br/>--subresource=status<br/>{"status":{"pauseConditions":null}}
-        ARO->>ARO: switch active svc → green<br/>+ scaleDown blue (30s delay)
-    else outcome=passed AND strategy=canary
-        TR->>ARO: kubectl patch rollout<br/>--subresource=status<br/>{"status":{"promoteFull":true}}
-        ARO->>ARO: skipea steps restantes<br/>→ 100% canary
-    else outcome=failed (cualquier strategy)
-        TR->>ARO: kubectl patch rollout<br/>{"spec":{"abort":true}}
-        ARO->>ARO: destruye green/canary<br/>stable intacto
-    end
-    loop polling each 5s
-        TR->>ARO: get rollout.status.phase
-        Note over TR: ¿== Healthy (passed)<br/>o Degraded (failed)?
+    Note over TR: Stage 6 — promote-rollback (detecta modo por introspección)
+    alt MODO ENTERPRISE
+        Note over ARO: Argo Rollouts ejecutó los AnalysisRun:<br/>BG → pre + postPromotionAnalysis<br/>Canary → analysis en cada setWeight (5/25/50/100)
+        ARO->>ARO: análisis OK → promote automático<br/>análisis FALLA → abort + rollback automático
+        loop polling cada 10s (timeout 600s)
+            TR->>ARO: get rollout.status.phase
+            Note over TR: solo OBSERVA — Healthy o Degraded
+        end
+    else MODO LEGACY — kubectl patch directo
+        alt outcome=passed AND strategy=bluegreen
+            TR->>ARO: patch status.pauseConditions=null
+            ARO->>ARO: switch active svc → green
+        else outcome=passed AND strategy=canary
+            TR->>ARO: patch status.promoteFull=true
+            ARO->>ARO: skip steps → 100% canary
+        else outcome=failed
+            TR->>ARO: patch spec.abort=true
+            ARO->>ARO: destruye green/canary, stable intacto
+        end
     end
     end
 
-    Note over Dev,K6: ✅ ~2-3 min end-to-end<br/>desde push del tag hasta nueva versión sirviendo 100% del tráfico
+    Note over Dev,K6: ✅ Legacy ~2-3 min · Enterprise ~5-6 min (incluye<br/>pre+post analysis BG / 4 AnalysisRun en canary multi-step)
 ```
 
 ### Convención de tag (real)
@@ -297,9 +304,11 @@ El **release pipeline** (`pythonapps-pipeline`) tiene 6 stages:
 | 1 | `git-clone-app` | `alpine/git` | repo en `/workspace/source/src` |
 | 2 | `kaniko-build-push` | `gcr.io/kaniko-project/executor` | imagen en Docker Hub |
 | 3 | `bump-gitops-image` | `alpine/git` + `mikefarah/yq` | commit pusheado + **result `commit-sha`** |
-| 4 | `wait-argocd-sync` | `bitnami/kubectl` | sync.revision verificado + Rollout en `Paused` con el image-tag correcto |
-| 5 | `run-load-test` | `grafana/k6` | **result `outcome` = passed/failed** (1000 VUs, p95/p99 thresholds). Gated por param `enabled` (default `false`) → skipea k6 y emite `outcome=passed` si el flag del tag no lo activó |
-| 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout `phase=Healthy` o `Degraded` (verificado) — **dueño de la verdad del release** |
+| 4 | `wait-argocd-sync` | `bitnami/kubectl` | sync.revision verificado + Rollout listo (`Paused` en legacy / RS-ready en enterprise) |
+| 5 | `run-load-test` | `bitnami/kubectl` + `grafana/k6` | **result `outcome`**. Legacy: k6 valida (gated por flag `loadtest`). Enterprise: k6 genera tráfico para el `AnalysisRun` (corre siempre) |
+| 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout `phase=Healthy` o `Degraded`. Legacy: patchea promote/abort. Enterprise: solo observa — **Argo Rollouts es el dueño de la verdad** |
+
+> **Modelo enterprise** (`analysis.enabled: true` en el chart): el Rollout lleva `AnalysisTemplate` que consultan Prometheus (success-rate ≥ 99%, latency-p95 < 1s). Argo Rollouts ejecuta `prePromotionAnalysis` + `postPromotionAnalysis` (BG) o un `analysis` en cada `setWeight` (Canary), decide promote/abort y hace **rollback automático** si falla. El pipeline pasa de orquestador a observador. Ver [deployment-strategies.md → dos modelos de promoción](deployment-strategies.md#dos-modelos-de-promoción-legacy-y-enterprise).
 
 El pipeline **auxiliar** (`pythonapps-burn-pipeline`) corre on-demand para validar HPA capacity:
 

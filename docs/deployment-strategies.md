@@ -43,9 +43,54 @@ Por qué el default es `false`: el k6 fuerza CPU → HPA scale durante el Rollou
 
 ---
 
+## Dos modelos de promoción: legacy y enterprise
+
+El chart soporta **dos modelos** para decidir si un release se promueve o se aborta. La diferencia es **quién toma la decisión**.
+
+### Modelo LEGACY (`analysis.enabled: false` — default del chart)
+
+El **pipeline es el dueño de la verdad**. El Stage 5 corre k6, emite `outcome=passed|failed`, y el Stage 6 hace `kubectl patch` directo sobre el Rollout (`pauseConditions=null` para promover, `spec.abort=true` para abortar). El Rollout BG usa `autoPromotionEnabled: false` y se queda en `Paused` esperando al pipeline.
+
+Apropiado para apps sin métricas Prometheus, o entornos donde la simplicidad importa más que la rigurosidad.
+
+### Modelo ENTERPRISE (`analysis.enabled: true` — opt-in por app+env)
+
+**Argo Rollouts es el dueño de la verdad.** El Rollout tiene `AnalysisTemplate` configurados que consultan Prometheus:
+
+- **success-rate**: `sum(rate(reqs sin 5xx)) / sum(rate(reqs total)) >= 0.99`
+- **latency-p95**: `histogram_quantile(0.95, ...) < 1.0s`
+
+El controller de Argo Rollouts ejecuta estos análisis (`AnalysisRun`), decide promote/abort, y hace **rollback automático** si fallan. El pipeline cambia de rol:
+
+| Stage | Rol en modelo LEGACY | Rol en modelo ENTERPRISE |
+|-------|----------------------|--------------------------|
+| **Stage 4** (wait-argocd) | espera `phase=Paused` | espera que el RS nuevo esté ready (NO `Paused` — Argo no pausa con `autoPromotionEnabled=true`) |
+| **Stage 5** (load-test) | k6 **valida** (emite outcome) | k6 **genera tráfico** para que el `AnalysisRun` tenga data en Prometheus — corre siempre, ignora el flag `loadtest` |
+| **Stage 6** (promote-rollback) | hace los `kubectl patch` de promote/abort | solo **observa** `phase=Healthy` o `Degraded` — Argo ya decidió |
+
+El Stage 6 detecta el modo por introspección del Rollout vivo (¿tiene `prePromotionAnalysis` / `steps[*].analysis`?), sin params extra en el pipeline.
+
+**Por qué el k6 es obligatorio en modo enterprise**: el `AnalysisRun` consulta `rate(...[1m])` — sin tráfico, las queries dan `NaN` y el Rollout queda `Degraded`. El k6 del Stage 5 cumple el rol que en producción cumpliría el tráfico real. El timing del `AnalysisTemplate` (`initialDelay 60s`, `count 2`, `interval 15s` ≈ 90s por análisis) está calibrado para caber dentro de la ventana del k6 (~3min).
+
+> En una infra con tráfico real sostenido (producción real, o un load-generator permanente en staging), el k6 del pipeline deja de ser necesario — el `AnalysisRun` usa el tráfico que ya existe. El acople k6↔análisis es una conveniencia para entornos sin tráfico, no parte del modelo.
+
+Configuración (en `<app>/<env>/values.yaml`):
+
+```yaml
+analysis:
+  enabled: true
+  metricPrefix: api01   # prefijo de las métricas: api01_requests_total, etc.
+```
+
+Defaults (thresholds, timing, `prometheusAddress`) en `charts/pythonapps/values.yaml` — overridables por app.
+
+---
+
 ## Blue/Green — api01
 
 ### Manifest generado por el chart (`templates/rollout.yaml`)
+
+**Modo legacy** (`analysis.enabled: false`):
 
 ```yaml
 spec:
@@ -53,65 +98,82 @@ spec:
     blueGreen:
       activeService:        webserver-api01-dev-stable    # ← donde el tráfico real
       previewService:       webserver-api01-dev-preview   # ← donde la nueva versión
-      autoPromotionEnabled: false                          # ← gate manual obligatorio
+      autoPromotionEnabled: false                          # ← gate manual del pipeline
       scaleDownDelaySeconds: 30                            # ← ventana de rollback
 ```
 
-### Flujo de un release
+**Modo enterprise** (`analysis.enabled: true` — el que usa api01-dev):
 
-```
-T=0    Estado inicial — solo blue (v0.6.0) está vivo
-       ┌──────────────────────────────────────────────────────┐
-       │ stable svc → ReplicaSet blue (v0.6.0)  [3 pods]      │ ← 100% tráfico
-       │ preview svc → ReplicaSet blue (v0.6.0)               │
-       └──────────────────────────────────────────────────────┘
-
-T+30s  Pipeline Stage 3 bumpea image.tag a v0.7.0 en gitops
-       ArgoCD aplica el cambio → Argo Rollouts detecta nuevo image
-
-T+1m   Argo Rollouts crea green RS con v0.7.0 + lo escala a 3 pods
-       Pero el switch de tráfico NO ocurre (autoPromotionEnabled: false)
-       phase=Paused
-       ┌──────────────────────────────────────────────────────┐
-       │ stable svc → blue (v0.6.0)   [3 pods, sirviendo]     │ ← 100% real
-       │ preview svc → green (v0.7.0) [3 pods, ready]         │ ← 0% real
-       └──────────────────────────────────────────────────────┘
-       Stage 4 confirma: rollout.spec.image=v0.7.0 + phase=Paused
-
-T+3m   Stage 5 (si el tag fue release/v0.7.0/dev/loadtest=true):
-         k6 corre contra preview-api01.localhost:8888
-         → enrutea al preview svc → enrutea SOLO al green RS
-         → todos los hits llegan a v0.7.0
-         Si k6 pasa (errors<20%, p95<3s, p99<5s):
-           outcome=passed
-
-       Si el tag fue release/v0.7.0/dev (sin /loadtest=true):
-         Stage 5 skipea k6 inmediatamente (log "loadtest disabled by tag flag")
-         outcome=passed por construcción → Stage 6 auto-promueve.
-
-T+3m30s Stage 6: kubectl patch rollout webserver-api01-dev \
-                  --subresource=status --type=merge \
-                  -p '{"status":{"pauseConditions":null}}'
-       ↓
-       Argo Rollouts SWITCH: activeService ahora apunta al green RS
-       ┌──────────────────────────────────────────────────────┐
-       │ stable svc → green (v0.7.0)  [3 pods]                │ ← 100% real
-       │ preview svc → green (v0.7.0)                          │
-       │ blue (v0.6.0) [3 pods, scale-down en 30s]            │ ← rollback ventana
-       └──────────────────────────────────────────────────────┘
-
-T+4m   Pasados los 30s de scaleDownDelay, blue pods eliminados.
-       phase=Healthy. Pipeline termina.
+```yaml
+spec:
+  strategy:
+    blueGreen:
+      activeService:        webserver-api01-dev-stable
+      previewService:       webserver-api01-dev-preview
+      autoPromotionEnabled: true                           # ← Argo decide (no el pipeline)
+      scaleDownDelaySeconds: 120                           # ← 120s: da espacio al postPromotionAnalysis
+      prePromotionAnalysis:                                # ← corre ANTES del switch, sobre preview svc
+        templates: [{ templateName: webserver-api01-dev-app-health }]
+        args: [{ name: service, value: ...-preview }, { name: namespace, value: ... }]
+      postPromotionAnalysis:                               # ← corre DESPUÉS del switch, sobre stable svc
+        templates: [{ templateName: webserver-api01-dev-app-health }]
+        args: [{ name: service, value: ...-stable }, { name: namespace, value: ... }]
 ```
 
-### Si k6 falla (Stage 5 outcome=failed)
+El `postPromotionAnalysis` es la pieza clave del rollback automático: corre durante los 120s de `scaleDownDelaySeconds`, **mientras el blue RS todavía está vivo**. Si las métricas del green (ya sirviendo tráfico real) fallan, Argo Rollouts aborta → el blue sigue ahí → rollback instantáneo, cero downtime, sin intervención humana.
+
+### Flujo de un release — modo ENTERPRISE (api01-dev, validado E2E)
 
 ```
-Stage 6: kubectl patch rollout ... --type=merge -p '{"spec":{"abort":true}}'
-       ↓
-       Argo Rollouts destruye el green RS, blue sigue intacto sirviendo
-       phase=Degraded → pipeline marca rollback efectivo OK.
+T=0     Estado inicial — solo blue (v0.10.0) está vivo
+        stable svc → blue [3 pods] = 100% tráfico  ·  preview svc → blue
+
+T+30s   Stage 3 bumpea image.tag a v0.11.0 → ArgoCD aplica → Argo crea green RS
+
+T+1m    green RS (v0.11.0) con 3 pods ready.
+        Stage 4 detecta updatedReplicas>=1 (NO espera Paused) → sale.
+        autoPromotionEnabled=true → Argo arranca el prePromotionAnalysis.
+
+T+1m    Stage 5 arranca k6 contra preview-api01.localhost → genera tráfico
+        en el green RS. El AnalysisRun -pre consulta Prometheus (success-rate,
+        latency-p95) sobre el preview svc usando ese tráfico.
+
+T+2m30s prePromotionAnalysis → Successful.
+        Argo Rollouts SWITCH automático: activeService → green RS.
+        ┌──────────────────────────────────────────────────────┐
+        │ stable svc → green (v0.11.0)  [3 pods]               │ ← 100% real
+        │ blue (v0.10.0) [3 pods, scale-down en 120s]          │ ← ventana rollback
+        └──────────────────────────────────────────────────────┘
+        Argo arranca el postPromotionAnalysis sobre el stable svc.
+
+T+4m    postPromotionAnalysis → Successful (el k6 sigue generando tráfico que
+        ahora llega al green vía stable svc). Argo confirma phase=Healthy.
+        Stage 6 — que solo observaba — ve Healthy y reporta OK.
+
+T+4m    Pasados los 120s de scaleDownDelay, blue eliminado. Pipeline termina.
 ```
+
+> **Timeline real del E2E v0.11.0**: RS nuevo @T+75s · prePromotionAnalysis @T+90s · `Successful` + switch @T+165s · postPromotionAnalysis `Successful` @T+240s · pipeline `Succeeded` @T+285s.
+
+### Si el análisis falla (modo enterprise)
+
+```
+prePromotionAnalysis → Failed:
+       Argo NO switchea. green RS queda Degraded, blue sigue sirviendo 100%.
+       El switch nunca ocurrió → cero impacto en usuarios.
+
+postPromotionAnalysis → Failed (el switch YA ocurrió):
+       Argo aborta automáticamente DENTRO de los 120s de scaleDownDelay.
+       blue todavía está vivo → Argo revierte activeService → blue.
+       Rollback instantáneo, sin pipeline, sin humano.
+
+En ambos casos: Stage 6 ve phase=Degraded, imprime los AnalysisRuns que
+fallaron (kubectl get analysisrun) y marca el pipeline como Failed.
+```
+
+### Flujo modo LEGACY (`analysis.enabled: false`)
+
+Idéntico hasta el T+1m, pero el Rollout entra a `phase=Paused` (autoPromotionEnabled=false), el Stage 4 espera ese `Paused`, el Stage 5 k6 valida y emite `outcome`, y el Stage 6 hace el `kubectl patch status.pauseConditions=null` (promote) o `spec.abort=true` (rollback). `scaleDownDelaySeconds=30`.
 
 ---
 
@@ -119,70 +181,63 @@ Stage 6: kubectl patch rollout ... --type=merge -p '{"spec":{"abort":true}}'
 
 ### Manifest generado por el chart
 
+**Modo legacy** (`analysis.enabled: false`) — `pause: {}` en cada step, el pipeline promueve con `promoteFull=true`:
+
 ```yaml
-spec:
-  strategy:
-    canary:
-      stableService:  webserver-api02-dev-stable    # ← donde está la versión vieja + split
-      canaryService:  webserver-api02-dev-preview   # ← solo la versión nueva
-      trafficRouting:
-        nginx:
-          stableIngress: webserver-api02-dev-stable
-      steps:
-      - setWeight: 5
-      - pause: {}              # ← pipeline corre k6 acá
-      - setWeight: 25
-      - pause: {}              # ← y acá
-      - setWeight: 50
-      - pause: {}              # ← y acá
-      # Stage 6 patcha promoteFull=true → 100% canary
+canary:
+  steps:
+  - setWeight: 5
+  - pause: {}              # ← pipeline corre k6 y luego patcha promoteFull
+  - setWeight: 25
+  - pause: {}
+  - setWeight: 50
+  - pause: {}
 ```
 
-### Flujo de un release
+**Modo enterprise** (`analysis.enabled: true` — el que usa api02-dev) — `analysis` en cada step, Argo avanza solo:
+
+```yaml
+canary:
+  steps:
+  - setWeight: 5
+  - analysis: { templates: [{ templateName: webserver-api02-dev-app-health }], args: [...] }
+  - setWeight: 25
+  - analysis: { templates: [...], args: [...] }
+  - setWeight: 50
+  - analysis: { templates: [...], args: [...] }
+  - setWeight: 100
+  - analysis: { templates: [...], args: [...] }   # ← post-promotion: valida el RS al 100%
+```
+
+> Canary **no tiene** `prePromotionAnalysis`/`postPromotionAnalysis` como campos top-level (eso es exclusivo de BlueGreen — su switch es atómico). En canary el análisis va **inline en los steps**. El último `analysis` (tras `setWeight: 100`) cumple la función de post-promotion. Argo Rollouts avanza al siguiente step **solo si** el `AnalysisRun` del step anterior pasa; aborta automáticamente si falla.
+
+### Flujo de un release — modo ENTERPRISE (api02-dev, validado E2E)
 
 ```
-T=0    Solo stable (v0.1.0)
-       ┌──────────────────────────────────────────────────────┐
-       │ stable svc → stable RS (v0.1.0)  [3 pods]            │ ← 100% tráfico
-       │ canary svc → vacío (canary RS no existe aún)         │
-       └──────────────────────────────────────────────────────┘
+T=0     Solo stable (v1.3.0). canary RS no existe.
 
-T+1m   ArgoCD aplica image.tag=v0.2.0. Argo Rollouts crea canary RS con v0.2.0.
-       Empieza Step 1: setWeight: 5%
-       phase=Paused (esperando promote)
-       nginx-ingress recibe annotation que dice:
-         "95% al stable svc, 5% al canary svc"
-       ┌──────────────────────────────────────────────────────┐
-       │ stable svc → stable RS (v0.1.0)  [3 pods]            │ ← 95% real
-       │ canary svc → canary RS (v0.2.0)  [1 pod]             │ ← 5% real
-       └──────────────────────────────────────────────────────┘
-       Estado verificable:
-         curl api02.localhost:8888/api02/version × 20
-         → 19 hits v0.1.0, 1 hit v0.2.0 (~aproximadamente)
+T+30s   Stage 3 bumpea image.tag=v1.4.0 → ArgoCD aplica → Argo crea canary RS.
 
-T+3m   Stage 5 (si tag con /loadtest=true):
-         k6 pega al stable svc → recibe TRÁFICO REAL split
-         (no al preview/canary svc — eso solo daría 100% canary, no
-         muestra el comportamiento real del split).
+T+45s   Step 1: setWeight 5%. nginx-ingress: 95% stable / 5% canary.
+        AnalysisRun -1 (sobre canary svc) → Running. Stage 5 k6 generando tráfico.
+T+1m45s AnalysisRun -1 → Successful → Argo avanza solo al Step siguiente.
 
-         k6 cuenta canary_hits (informativo) y errors.
-         Si pasa → outcome=passed.
+T+2m    Step 3: setWeight 25%. AnalysisRun -3 → Running → Successful.
+T+3m15s Step 5: setWeight 50%. AnalysisRun -5 → Running → Successful.
+T+4m30s Step 7: setWeight 100%. AnalysisRun -7 (post-promotion, sobre stable
+        svc que ya apunta al RS nuevo) → Running → Successful.
 
-       Si tag sin flag (default): skipea k6 → outcome=passed → Stage 6
-         auto-promote (canary va directo a 100% sin esperar split-test).
-
-T+3m30s Stage 6: kubectl patch rollout webserver-api02-dev \
-                  --subresource=status --type=merge \
-                  -p '{"status":{"promoteFull":true}}'
-       ↓
-       Argo Rollouts skipea los steps restantes (25%, 50%) y va a 100%:
-       stableRS = canary RS = v0.2.0
-       ┌──────────────────────────────────────────────────────┐
-       │ stable svc → canary RS (v0.2.0)  [3 pods]            │ ← 100% real
-       │ canary svc → vacío                                    │
-       └──────────────────────────────────────────────────────┘
-       phase=Healthy.
+T+5m45s phase=Healthy. stable svc → canary RS (v1.4.0) = 100%.
+        Stage 6 — que solo observaba — ve Healthy y reporta OK.
 ```
+
+> **Timeline real del E2E v1.4.0**: 4 AnalysisRuns (`-1`, `-3`, `-5`, `-7`), todos `Successful`, canary avanzó 5%→25%→50%→100% sin intervención del pipeline. Pipeline `Succeeded` @T+345s.
+
+Si **cualquier** `AnalysisRun` falla, Argo Rollouts aborta el canary automáticamente: el `canary RS` se destruye, el `stable RS` (versión vieja) sigue sirviendo 100%. El Stage 6 ve `phase=Degraded` y marca el pipeline `Failed`.
+
+### Flujo modo LEGACY (`analysis.enabled: false`)
+
+El canary se queda en `phase=Paused` en el primer `pause: {}` (Step 1, 5%). El Stage 5 k6 valida, el Stage 6 hace `kubectl patch status.promoteFull=true` que **salta** los steps 25%/50% y va directo a 100%. Es un canary "1 step de validación + promote-full" — más rápido pero menos gradual que el enterprise.
 
 ### Avance gradual sin promoteFull (manual, no usado por pipeline)
 
@@ -204,9 +259,10 @@ El pipeline usa `promoteFull=true` para ahorrar tiempo en la demo. En prod real 
 | **Cuánta versión nueva ve tráfico real durante el rollout** | 0% hasta el switch | 5% → 25% → 50% (cada step paused) |
 | **Cuándo k6 testea la nueva versión** | Contra **preview** svc (100% green, sin tráfico real) | Contra **stable** svc (split real entre stable+canary) |
 | **Endpoint expuesto durante el rollout** | `preview-api01.localhost` = 100% green<br/>`api01.localhost` = 100% blue (aún) | `api02.localhost` = stable + N% canary (según step)<br/>`preview-api02.localhost` = 100% canary |
-| **Cómo se promueve** | `patch status.pauseConditions=null` | `patch status.promoteFull=true` (skip steps) |
-| **Cómo se rollbackea** | `patch spec.abort=true` → destruye green | `patch spec.abort=true` → destruye canary |
-| **Ventana de rollback post-promote** | 30s (`scaleDownDelaySeconds`) — blue queda vivo | inmediato — canary RS pasa a ser el stable |
+| **Cómo se promueve (legacy)** | `patch status.pauseConditions=null` | `patch status.promoteFull=true` (skip steps) |
+| **Cómo se promueve (enterprise)** | Argo switchea solo si `prePromotionAnalysis` pasa | Argo avanza step a step si cada `AnalysisRun` pasa |
+| **Cómo se rollbackea (enterprise)** | `postPromotionAnalysis` falla → abort automático, blue revive | `AnalysisRun` de un step falla → abort automático, canary se destruye |
+| **Ventana de rollback post-promote** | 30s legacy / **120s enterprise** — blue queda vivo | inmediato — canary RS pasa a ser el stable |
 | **Pods durante el rollout** | 6 pods (3 blue + 3 green) | 3 stable + 1-2 canary (depende del step) |
 | **Riesgo** | Doble de recursos durante el rollout | Tráfico productivo va a la versión nueva desde el primer step |
 | **Cuándo conviene** | Apps stateless, recursos sobrados, queremos test funcional pre-tráfico | Cambios riesgosos, queremos detectar problemas con tráfico real, recursos justos |
@@ -215,37 +271,20 @@ El pipeline usa `promoteFull=true` para ahorrar tiempo en la demo. En prod real 
 
 ## Cómo el chart elige qué template renderizar
 
-`charts/pythonapps/templates/rollout.yaml`:
+`charts/pythonapps/templates/rollout.yaml` ramifica por **dos** valores:
+- `rollout.strategy` → `bluegreen` | `canary` | `rollingupdate`
+- `analysis.enabled` → `true` (modelo enterprise) | `false` (modelo legacy)
 
-```yaml
-{{- if eq .Values.rollout.strategy "bluegreen" }}
-strategy:
-  blueGreen:
-    activeService: {{ ... }}-stable
-    previewService: {{ ... }}-preview
-    autoPromotionEnabled: false
-    scaleDownDelaySeconds: 30
-{{- else if eq .Values.rollout.strategy "canary" }}
-strategy:
-  canary:
-    stableService: {{ ... }}-stable
-    canaryService: {{ ... }}-preview
-    trafficRouting:
-      nginx:
-        stableIngress: {{ ... }}-stable
-    steps:
-    - setWeight: 5
-    - pause: {}
-    - setWeight: 25
-    - pause: {}
-    - setWeight: 50
-    - pause: {}
-{{- else }}
-# rollingupdate default
-{{- end }}
+```
+rollout.strategy=bluegreen + analysis.enabled=false → blueGreen, autoPromotionEnabled=false, scaleDownDelay=30
+rollout.strategy=bluegreen + analysis.enabled=true  → blueGreen, autoPromotionEnabled=true,  scaleDownDelay=120,
+                                                       prePromotionAnalysis + postPromotionAnalysis
+rollout.strategy=canary    + analysis.enabled=false → canary, steps con pause:{}
+rollout.strategy=canary    + analysis.enabled=true  → canary, steps con analysis:{} (5/25/50/100)
+rollout.strategy=rollingupdate                      → canary con un solo step setWeight:100
 ```
 
-Cambiar la estrategia de una app = cambiar **una línea** en `values.yaml` + commitear. ArgoCD sync + Argo Rollouts re-aplica el nuevo Rollout spec en el próximo release.
+Cambiar la estrategia o el modelo de una app = cambiar **una o dos líneas** en `<app>/<env>/values.yaml` + commitear. ArgoCD sync + Argo Rollouts re-aplica el nuevo Rollout spec en el próximo release. El `AnalysisTemplate` lo genera el mismo chart (`templates/analysis-template.yaml`) cuando `analysis.enabled=true`.
 
 ---
 
@@ -266,6 +305,8 @@ fi
 ```
 
 Emite `strategy` como result, que las Stages 5 y 6 consumen para elegir script de k6 y patch correspondiente. **El developer no pasa la estrategia por el tag** — viene del chart.
+
+Además, las Stages 4, 5 y 6 detectan el **modo** (legacy vs enterprise) por introspección: ¿el Rollout tiene `prePromotionAnalysis` (BG) o algún `steps[*].analysis` (canary)? Si sí → modo enterprise → el pipeline observa en vez de patchear. Esta detección tampoco requiere params extra — el pipeline se adapta solo a lo que el chart generó.
 
 ---
 

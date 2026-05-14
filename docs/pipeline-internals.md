@@ -18,9 +18,9 @@ Todos los archivos viven en `charts/pythonapps/templates/pipeline-templates/`.
 | `git-clone-app` | release + burn | `alpine/git:latest` | UID 65532 (nonroot) | HOME=/tekton/home para `git config` |
 | `kaniko-build-push` | release | `gcr.io/kaniko-project/executor:latest` | **root** (UID 0) | Único Task que necesita root → el NS está en PSA `baseline` |
 | `bump-gitops-image` | release | `alpine/git:latest` + `mikefarah/yq:latest` | UID 65532 | 3 steps: clone-gitops, bump-all-envs (yq), commit-and-push |
-| `wait-argocd-sync` | release | `bitnami/kubectl:latest` | UID 65532 | 2 steps: wait-argocd, detect-strategy-and-wait-rollout |
-| `run-load-test` | release | `grafana/k6:latest` | UID 65532 | Llama scripts en `loadtest/` del repo de la app |
-| `promote-or-rollback` | release | `bitnami/kubectl:latest` | UID 65532 | Patches directos al Rollout (sin plugin) |
+| `wait-argocd-sync` | release | `bitnami/kubectl:latest` | UID 65532 | 2 steps: wait-argocd, detect-strategy-and-wait-rollout (detecta strategy + modo) |
+| `run-load-test` | release | `bitnami/kubectl:latest` + `grafana/k6:latest` | UID 65532 | 2 steps: detect-mode (kubectl), run-k6. Scripts en `loadtest/` del repo de la app |
+| `promote-or-rollback` | release | `bitnami/kubectl:latest` | UID 65532 | Legacy: patches directos al Rollout. Enterprise: solo observa phase |
 | `run-burn-to-scale` | burn | sidecar `grafana/k6:latest` + step `bitnami/kubectl:latest` | UID 65532 | Sidecar genera carga, step monitorea HPA replicas |
 
 > **Nota PSA**: el namespace `tekton-pipelines` está labeleado `pod-security.kubernetes.io/enforce=baseline` (no `restricted`) porque kaniko no puede correr restricted. Las Tasks no-kaniko declaran su propio `stepTemplate.securityContext` compliant con `restricted` (defense in depth). Ver [security-and-rbac.md](security-and-rbac.md).
@@ -242,34 +242,28 @@ else
 fi
 ```
 
-Espera del Rollout:
+Después de detectar la strategy, detecta el **modo** (¿el Rollout tiene `prePromotionAnalysis` / `steps[*].analysis`?) y espera la condición correspondiente:
 
 ```sh
 while [ $ELAPSED -lt $TIMEOUT ]; do
   PHASE=$(kubectl get rollout ... -o jsonpath='{.status.phase}')
-  SPEC_TAG=$(kubectl get rollout ... \
-    -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's|.*:||')
+  SPEC_TAG=$(kubectl get rollout ... image | sed 's|.*:||')
+  UPDATED=$(kubectl get rollout ... -o jsonpath='{.status.updatedReplicas}')
 
-  # 🔑 La spec del Rollout DEBE reflejar el nuevo image-tag.
-  if [ -n "$IMAGE_TAG" ] && [ "$SPEC_TAG" != "$IMAGE_TAG" ]; then
-    sleep 5; continue
-  fi
+  [ "$SPEC_TAG" != "$IMAGE_TAG" ] && { sleep 5; continue; }   # spec DEBE reflejar el bump
 
-  case "$STRATEGY" in
-    rollingupdate)
-      [ "$PHASE" = "Healthy" ] && exit 0
-      ;;
-    bluegreen|canary)
-      # Para BG/Canary requerimos Paused — green/canary RS ready esperando promote.
-      # Healthy aquí sería estado stale de un deploy previo.
-      [ "$PHASE" = "Paused" ] && exit 0
-      ;;
+  case "${STRATEGY}/${MODE}" in
+    rollingupdate/*)  [ "$PHASE" = "Healthy" ] && exit 0 ;;
+    */legacy)         [ "$PHASE" = "Paused" ]  && exit 0 ;;   # RS nuevo ready esperando promote del pipeline
+    */enterprise)     [ "$UPDATED" -ge 1 ]     && exit 0 ;;   # RS nuevo ready; Argo ya corre el AnalysisRun
   esac
   sleep 5
 done
 ```
 
-**Por qué `Paused` y no `Paused OR Healthy`**: si el Rollout ya está `Healthy` con la versión nueva (porque un run previo promovió), entonces no hay green RS para testear. Tomar el Stage 5 desde ahí correría load test contra el active (ya promovido) — válido pero confuso. Más limpio fallar fast si la spec aún no refleja el bump.
+**Modo legacy — por qué `Paused` y no `Paused OR Healthy`**: si el Rollout ya está `Healthy` con la versión nueva (run previo promovió), no hay green RS para testear. Más limpio fallar fast si la spec aún no refleja el bump.
+
+**Modo enterprise — por qué NO `Paused`**: con `autoPromotionEnabled=true` + análisis, el Rollout no pausa — arranca el `AnalysisRun` apenas el RS nuevo está ready y promueve solo. Esperar `Paused` colgaría el Stage 4. Se espera `updatedReplicas>=1` y el Stage 5 genera tráfico en paralelo con el análisis.
 
 ---
 
@@ -283,6 +277,7 @@ done
 | `app-name` | string | — | Para construir endpoints |
 | `environments` | string | `dev` | Toma primer env |
 | `strategy` | string | `""` | Auto-detectado de wait-argocd |
+| `enabled` | string | `"false"` | Derivado del flag `loadtest=true|false` del tag. En modo legacy gobierna si el k6 corre; en modo enterprise se ignora (ver abajo) |
 
 **Results**:
 | Name | Descripción |
@@ -290,6 +285,15 @@ done
 | `outcome` | `passed` o `failed` |
 
 **Workspaces**: `source` (compartido con `git-clone-app`, contiene el repo de la app clonado en Stage 1).
+
+**Steps**: el task tiene **dos steps**:
+1. `detect-mode` (`bitnami/kubectl`) — introspecciona el Rollout: ¿tiene `prePromotionAnalysis` (BG) o `steps[*].analysis` (Canary)? Escribe `legacy` o `enterprise` a `$(workspaces.source.path)/.rollout-mode`.
+2. `run-k6` (`grafana/k6`) — lee `.rollout-mode` y decide.
+
+### Doble rol del k6 según el modo
+
+- **Modo LEGACY**: el k6 **valida**. Si `enabled != "true"` (flag `loadtest` no presente), skipea k6 y emite `outcome=passed`. Si `enabled == "true"`, corre k6 y el `outcome` refleja los thresholds.
+- **Modo ENTERPRISE**: el k6 **genera tráfico** para el `AnalysisRun` de Argo Rollouts. Corre **siempre** — el script fuerza `enabled=true` ignorando el flag del tag, porque sin tráfico las queries Prometheus dan `NaN` y el Rollout queda `Degraded`. El `outcome` que emite es irrelevante (el Stage 6 enterprise no lo mira).
 
 ### Source of truth de los scripts k6
 
@@ -362,7 +366,16 @@ printf "%s" "$([ $OUTCOME -eq 0 ] && echo passed || echo failed)" > "$(results.o
 | `app-name` | string | — | |
 | `environments` | string | `dev` | |
 | `strategy` | string | `""` | Bluegreen, canary, o rollingupdate |
-| `outcome` | string | `passed` | Del result de load-test |
+| `outcome` | string | `passed` | Del result de load-test (solo se usa en modo legacy) |
+| `enterprise-timeout` | string | `"600"` | Timeout (s) para esperar fase terminal en modo enterprise — un canary multi-step puede tardar |
+
+**Detección de modo**: el script arranca introspeccionando el Rollout. Si BG tiene `prePromotionAnalysis` o Canary tiene `steps[*].analysis` → `MODE=enterprise`, si no → `MODE=legacy`. No requiere params extra del pipeline.
+
+### Modo ENTERPRISE — solo observa
+
+Argo Rollouts ya está ejecutando los `AnalysisRun` (pre/post en BG, uno por step en canary) y decide promote/abort. El task hace `wait_terminal` — poll cada 10s hasta `phase=Healthy` (exit 0) o `phase=Degraded` (exit 1, e imprime los `AnalysisRun` fallidos via `kubectl get analysisrun`). No patchea nada.
+
+### Modo LEGACY — patchea según `outcome`
 
 **Producción gate**: si `PRIMARY_ENV=production`, NO promueve — solo annotates la ArgoCD app y exit OK. Requiere intervención manual para promover prod.
 
@@ -426,6 +439,49 @@ Ventajas:
 - Sin descarga de binarios externos (~15s ahorrados por run)
 - Sin override del `PATH` (que rompía `kubectl` en la imagen `bitnami/kubectl` cuya bin está en `/opt/bitnami/kubectl/bin`)
 - Menos superficie de fallo
+
+---
+
+## 7. `AnalysisTemplate` (modo enterprise)
+
+**Archivo**: `charts/pythonapps/templates/analysis-template.yaml` — NO es una Task de Tekton, es un recurso de Argo Rollouts que el chart genera cuando `analysis.enabled: true`. Lo aplica ArgoCD junto al Rollout, no `make tekton-apply`.
+
+**Args** (inyectados por el Rollout en cada `AnalysisRun`):
+| Name | Valor en BG | Valor en Canary |
+|------|-------------|-----------------|
+| `service` | `<release>-preview` (prePromotion) / `<release>-stable` (postPromotion) | `<release>-preview` (steps 5/25/50) / `<release>-stable` (step 100) |
+| `namespace` | `<app>-<env>` | `<app>-<env>` |
+
+**Metrics** (ambas deben pasar — son ortogonales):
+
+```yaml
+- name: success-rate
+  successCondition: result[0] >= 0.99       # 99% de requests sin 5xx
+  query: |
+    sum(rate(<prefix>_requests_total{namespace="{{args.namespace}}",service="{{args.service}}",status_code!~"5.."}[1m]))
+    / (sum(rate(<prefix>_requests_total{namespace="{{args.namespace}}",service="{{args.service}}"}[1m])) > 0)
+- name: latency-p95
+  successCondition: result[0] < 1.0         # p95 < 1 segundo
+  query: |
+    histogram_quantile(0.95, sum(rate(<prefix>_request_duration_seconds_bucket{namespace="{{args.namespace}}",service="{{args.service}}"}[1m])) by (le))
+```
+
+- `<prefix>` lo interpola Helm desde `analysis.metricPrefix` (`api01`, `api02`). `{{args.*}}` lo interpola Argo Rollouts en runtime (escapado en el template con `` {{`{{args.x}}`}} ``).
+- El `> 0` en el denominador de success-rate evita división por cero: sin tráfico el query da `NaN`, la condición falla, el Rollout queda `Degraded`. Es intencional — no se promueve algo que no se puede medir.
+
+**Timing** (configurable desde `values.yaml`, calibrado para caber en la ventana del k6 del Stage 5):
+| Param | Default | Rol |
+|-------|---------|-----|
+| `initialDelay` | `60s` | margen para que el Stage 5 levante el k6 (scheduling + image pull + ramp) antes del primer sample |
+| `interval` | `15s` | entre samples |
+| `count` | `2` | samples antes de declarar success — `60s + 2*15s ≈ 90s` por análisis |
+| `failureLimit` | `1` | samples FAILED tolerados antes de abortar |
+| `successRateThreshold` | `0.99` | umbral de la metric success-rate |
+| `latencyP95Seconds` | `1.0` | umbral de la metric latency-p95 |
+
+**Dónde lo referencia el Rollout**:
+- BG → `spec.strategy.blueGreen.prePromotionAnalysis` + `postPromotionAnalysis`
+- Canary → `spec.strategy.canary.steps[*].analysis` (uno tras cada `setWeight`, incluido el `100`). Canary **no** tiene `pre/postPromotionAnalysis` top-level — es exclusivo de BG.
 
 ---
 
@@ -611,4 +667,6 @@ Resumen:
 - `tekton-pipeline-runner` — la usa cada PipelineRun pod. Permisos:
   - `argoproj.io/rollouts` y `rollouts/status`: `get, list, watch, update, patch` (para promote/abort)
   - `argoproj.io/applications`: `get, list, watch, patch, update` (`patch` para el refresh annotation)
+  - `argoproj.io/analysisruns, analysistemplates`: `get, list, watch` (modo enterprise — el Stage 6 lee los `AnalysisRun` para reportar cuál falló; la creación la hace el controller de Argo Rollouts)
   - `apps/deployments`: `get, list, watch, patch` (legacy)
+  - `autoscaling/horizontalpodautoscalers`: `get, list, watch` (burn pipeline)

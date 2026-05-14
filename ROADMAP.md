@@ -133,6 +133,28 @@ Lo que se hizo:
   - `docs/grafana-dashboards.md`: guía completa para agregar dashboards nuevos + PromQL queries.
 - [x] **`.tekton/` borrado** de los app repos: era código muerto (el TriggerTemplate del infra repo genera el PipelineRun en vivo). Centralización completa de YAMLs de Tekton.
 
+### Fase 15 — Flag `loadtest` opt-in en el tag (nuevo)
+
+- [x] **Formato de tag extendido**: `refs/tags/release/<ver>/<env>[/loadtest=<bool>]`. 5º segmento opcional, default `false`, fail-closed. CEL del EventListener filtra 4-6 segmentos y extrae `run_load_test`.
+- [x] **Stage 5 gated por `enabled`**: en modo legacy, `loadtest=false` (default) skipea k6 y emite `outcome=passed`. Evita que el k6 fuerce HPA scale y "ensucie" la visualización del Rollout en releases normales.
+- [x] **E2E validado**: api01 BG con `loadtest=true` (k6 + switchover), api02 canary con `loadtest=false` (skip k6 + auto-promote).
+
+### Fase 16 — Modelo enterprise: AnalysisTemplate + promoción automática (nuevo)
+
+El pipeline pasa de "el pipeline decide promote/abort" a "**Argo Rollouts decide basándose en métricas Prometheus**". Opt-in por app+env vía `analysis.enabled: true`.
+
+- [x] **`AnalysisTemplate`** (`charts/pythonapps/templates/analysis-template.yaml`): dos metrics — `success-rate` (≥99% requests sin 5xx) y `latency-p95` (<1s vía `histogram_quantile`). Args parametrizables (`service`, `namespace`), thresholds y timing configurables desde `values.yaml`.
+- [x] **Rollout BG enterprise**: `autoPromotionEnabled=true` + `prePromotionAnalysis` (sobre preview svc) + `postPromotionAnalysis` (sobre stable svc). `scaleDownDelaySeconds=120` para que el postPromotion corra mientras el blue sigue vivo → rollback automático instantáneo si falla.
+- [x] **Rollout Canary enterprise**: `analysis` step en cada `setWeight` (5/25/50/100). Argo avanza al siguiente step solo si el `AnalysisRun` previo pasa, aborta automáticamente si falla. Canary genuinamente gradual (no "1 step + promoteFull").
+- [x] **Pipeline consciente del modo** — detección por introspección del Rollout, sin params extra:
+  - Stage 4: en enterprise espera RS-ready (no `Paused` — con autoPromotion el Rollout no pausa).
+  - Stage 5: en enterprise el k6 es generador de tráfico para el `AnalysisRun` — corre siempre, ignora el flag `loadtest`.
+  - Stage 6: en enterprise solo observa `phase=Healthy`/`Degraded` — Argo ya decidió. Imprime los `AnalysisRun` fallidos para debug.
+- [x] **CRD de Argo Rollouts actualizada a v1.9.0** — la instalada vía Helm chart estaba desactualizada y dropeaba campos de análisis. (Nota: canary NO tiene `postPromotionAnalysis` top-level — es exclusivo de BG; en canary el post-análisis es un `analysis` step tras `setWeight: 100`.)
+- [x] **RBAC**: SA `tekton-pipeline-runner` con `get/list/watch` sobre `analysisruns`/`analysistemplates`.
+- [x] **E2E validado**: api01 BG `v0.11.0` (prePromotionAnalysis `Successful` → switch → postPromotionAnalysis `Successful` → Healthy, ~5min) y api02 canary `v1.4.0` (4 `AnalysisRun` `Successful`, 5%→25%→50%→100%, ~6min). El pipeline solo observó en ambos.
+- [x] **Legacy preservado**: `analysis.enabled: false` (default del chart) mantiene el modelo previo intacto. Production envs siguen en legacy hasta definir el gating con análisis (`autoPromotionEnabled=false` + `prePromotionAnalysis` = análisis on-demand al hacer promote manual).
+
 ### Fase 13 — Source-of-truth de loadtest scripts + fail-fast (nuevo)
 - [x] **Eliminado** `belo-infrabase-k3d/apps/<app>/loadtest/` (era una copia inerte que el pipeline NO usaba — solo confundía)
 - [x] Los scripts k6 ahora viven **únicamente en el repo de cada app** (`loadtest/` en la raíz del repo)

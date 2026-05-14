@@ -29,11 +29,23 @@ Cada stage **bloquea** los siguientes hasta cumplir su contrato. Si cualquiera f
 | 1 | `git-clone-app` | `alpine/git` | repo de la app (en GitHub) | tree en `/workspace/source/src/` |
 | 2 | `kaniko-build-push` | `kaniko-project/executor` | imagen Docker | imagen pusheada a Docker Hub con tag `<semver>` |
 | 3 | `bump-gitops-image` | `alpine/git` + `mikefarah/yq` | gitops repo (`values.yaml` de cada env) | commit pusheado + result `commit-sha` |
-| 4 | `wait-argocd-sync` | `bitnami/kubectl` | ArgoCD Application + Rollout (cluster) | Rollout en `Paused` con `image-tag` correcto + result `strategy` |
-| 5 | `run-load-test` | `grafana/k6` | preview svc (BG/Canary) o stable svc (Rolling) | result `outcome` ∈ {passed, failed}. Gated por param `enabled` derivado del tag flag `loadtest=true|false` — si `false` (default), skipea k6 y emite `outcome=passed` |
-| 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout (patch subresource) | Rollout `Healthy` (promote) o `Degraded` (abort) |
+| 4 | `wait-argocd-sync` | `bitnami/kubectl` | ArgoCD Application + Rollout (cluster) | Rollout listo (Paused legacy / RS-ready enterprise) + result `strategy` |
+| 5 | `run-load-test` | `bitnami/kubectl` + `grafana/k6` | preview/stable svc | result `outcome`. Gated por `enabled` (legacy) o forzado (enterprise — el k6 es generador de tráfico) |
+| 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout (patch subresource o solo observación) | Rollout `Healthy` o `Degraded` |
 
-**El promote (Stage 6) es el dueño de la verdad del release.** Validaciones de **capacidad** (HPA scale-up) viven en un [**pipeline separado**](#pipeline-auxiliar--burn-to-scale-capacity-test) que se dispara on-demand. Ver el final de este documento.
+### Dos modelos: legacy y enterprise
+
+El pipeline soporta **dos modelos de promoción**, y se adapta solo según lo que el chart generó (introspección del Rollout vivo, sin params extra):
+
+| | **LEGACY** (`analysis.enabled: false`) | **ENTERPRISE** (`analysis.enabled: true`) |
+|---|---|---|
+| Dueño de la decisión | el **pipeline** (Stage 6 patchea) | **Argo Rollouts** (vía `AnalysisRun` sobre Prometheus) |
+| Stage 4 espera | `phase=Paused` | RS nuevo ready (`updatedReplicas>=1`) |
+| Stage 5 (k6) | **valida** — emite `outcome`, gated por flag `loadtest` | **genera tráfico** para el `AnalysisRun` — corre siempre |
+| Stage 6 | `kubectl patch` promote/abort | **observa** `phase=Healthy`/`Degraded` |
+| Rollback | el pipeline lo dispara si k6 falla | Argo lo hace **automático** si el análisis falla |
+
+**El dueño de la verdad** es el Stage 6 en modo legacy, o **Argo Rollouts** en modo enterprise. Validaciones de **capacidad** (HPA scale-up) viven en un [**pipeline separado**](#pipeline-auxiliar--burn-to-scale-capacity-test) que se dispara on-demand. Ver el final de este documento.
 
 ---
 
@@ -96,39 +108,31 @@ done
 
 **Garantía 1**: hasta que `app.status.sync.revision == commit-sha del Stage 3`, no se avanza. Si ArgoCD aplicó un commit más viejo (porque el polling todavía no detectó el bump), el stage sigue esperando. **Sin esto** habría una race condition: Stage 5 podría correr cuando ArgoCD todavía tiene la versión vieja.
 
-### 4.2 Polling del Rollout: "¿la spec ya tiene el image-tag nuevo Y está paused?"
+### 4.2 Polling del Rollout: "¿la spec ya tiene el image-tag nuevo Y el estado correcto?"
+
+El estado esperado depende de **strategy** + **modo**:
 
 ```sh
 while [ $ELAPSED -lt $TIMEOUT ]; do
   PHASE=$(kubectl get rollout $ROLLOUT -n $NS -o jsonpath='{.status.phase}')
-  SPEC_TAG=$(kubectl get rollout $ROLLOUT -n $NS \
-    -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's|.*:||')
+  SPEC_TAG=$(... image | sed 's|.*:||')
+  UPDATED=$(kubectl get rollout $ROLLOUT -n $NS -o jsonpath='{.status.updatedReplicas}')
 
-  # La spec DEBE reflejar el image-tag nuevo
-  if [ "$SPEC_TAG" != "$IMAGE_TAG" ]; then
-    continue
-  fi
+  [ "$SPEC_TAG" != "$IMAGE_TAG" ] && continue   # la spec DEBE reflejar el tag nuevo
 
-  case "$STRATEGY" in
-    bluegreen|canary)
-      # Para BG/Canary requerimos Paused — green/canary RS está ready
-      # esperando promote. Si estuviera Healthy sería estado stale.
-      [ "$PHASE" = "Paused" ] && exit 0
-      ;;
-    rollingupdate)
-      [ "$PHASE" = "Healthy" ] && exit 0
-      ;;
+  case "${STRATEGY}/${MODE}" in
+    rollingupdate/*)   [ "$PHASE" = "Healthy" ] && exit 0 ;;
+    */legacy)          [ "$PHASE" = "Paused" ]  && exit 0 ;;   # espera el promote del pipeline
+    */enterprise)      [ "$UPDATED" -ge 1 ]     && exit 0 ;;   # RS nuevo ready, Argo ya corre el AnalysisRun
   esac
 done
 ```
 
-**Garantía 2**: `rollout.spec.template.spec.containers[0].image` debe terminar con el `image-tag` del pipeline run. Esto verifica que el Rollout objeto en el cluster **ya está apuntando a la imagen recién buildeada** — no a una vieja.
+**Garantía 2**: `rollout.spec...image` debe terminar con el `image-tag` del pipeline run — el Rollout vivo ya apunta a la imagen recién buildeada.
 
-**Garantía 3 (BG/Canary)**: el Rollout tiene que estar en `Paused`. Esto significa que:
-- Argo Rollouts creó un nuevo ReplicaSet con la imagen nueva
-- Ese RS está atado al **preview** service (BG) o al **canary** service (Canary)
-- El traffic switch o el `setWeight` NO se aplicó todavía (autoPromotionEnabled: false / `pause: {}` en steps)
-- Stage 5 puede pegarle al preview/canary URL y va a hablar **exclusivamente con el RS nuevo**
+**Garantía 3 — modo LEGACY (BG/Canary)**: el Rollout está en `Paused`. Argo creó el RS nuevo atado al preview/canary svc, el switch NO ocurrió (`autoPromotionEnabled: false` / `pause: {}`). Stage 5 le pega al preview/canary y habla **exclusivamente con el RS nuevo**, después Stage 6 promueve.
+
+**Garantía 3 — modo ENTERPRISE (BG/Canary)**: NO esperamos `Paused`. Con `autoPromotionEnabled: true` + análisis, el Rollout **no pausa** — apenas el RS nuevo está ready, Argo arranca el `AnalysisRun`. El Stage 4 sale en cuanto `updatedReplicas>=1` y deja que el Stage 5 genere tráfico **en paralelo** con el análisis de Argo. Si esperáramos `Paused`, el Stage 4 colgaría (ese estado nunca llega) y el análisis correría sin tráfico → `Degraded`.
 
 **Garantía 4 (RollingUpdate)**: tiene que estar `Healthy`. Como rollingupdate no tiene preview, el load test va contra el stable directo — pero recién después de que todos los pods fueron actualizados.
 
@@ -154,24 +158,32 @@ Esto emite el result `strategy` que consume Stage 5 (para elegir script y URL) y
 
 ## Stage 5 — Load Test (¿contra qué endpoint actúa?)
 
-### Gating por flag del tag
+### Doble rol del Stage 5 según el modo
 
-Antes de cualquier ejecución de k6, el Task evalúa el param `enabled` (derivado del flag `loadtest=true|false` del tag de release):
+El Task tiene un step previo `detect-mode` (con `kubectl`) que introspecciona el Rollout y escribe `legacy` o `enterprise` a un archivo del workspace. El step `run-k6` lo lee y decide:
+
+**Modo LEGACY** — el k6 **valida**. Gating por el flag `loadtest` del tag:
 
 ```sh
 if [ "$ENABLED" != "true" ]; then
-  echo "STAGE 5 — run-load-test (SKIPPED)"
-  echo "Reason: tag flag loadtest=true no presente"
+  echo "STAGE 5 — run-load-test (SKIPPED)"   # loadtest=false o ausente
   printf "passed" > "$(results.outcome.path)"
   exit 0
 fi
+# loadtest=true → corre k6, outcome refleja el resultado real (thresholds k6)
 ```
 
-**Comportamiento**:
-- `loadtest=true` en el tag → corre k6 como se describe abajo, outcome refleja el resultado real (passed/failed según thresholds).
-- `loadtest=false` o ausente (default) → skipea k6, emite `outcome=passed`. Stage 6 hace auto-promote sin validación de carga.
+**Modo ENTERPRISE** — el k6 **genera tráfico** para el `AnalysisRun` de Argo Rollouts:
 
-**Por qué el default es `false`**: el load-test fuerza CPU → HPA scale durante el switchover, lo que enmascara la dinámica natural del Rollout (BG con 2 RSes en paralelo, Canary con setWeight progresivo). En la demo se ve más limpio el path sin scaling sintético. Para validar capacidad existe el [**pipeline burn**](#pipeline-auxiliar--burn-to-scale-capacity-test) que es independiente del release.
+```sh
+if [ "$MODE" = "enterprise" ] && [ "$ENABLED" != "true" ]; then
+  ENABLED="true"   # el k6 NO es opcional: sin tráfico el AnalysisRun da NaN → Degraded
+fi
+```
+
+En modo enterprise el k6 corre **siempre**, ignorando el flag del tag. La decisión promote/abort la toma Argo Rollouts vía Prometheus — el `outcome` que emite este task es irrelevante (el Stage 6 enterprise ni lo mira).
+
+**Por qué el default del flag `loadtest` es `false` (modo legacy)**: el load-test fuerza CPU → HPA scale durante el switchover, lo que enmascara la dinámica natural del Rollout. Para validar capacidad existe el [**pipeline burn**](#pipeline-auxiliar--burn-to-scale-capacity-test) que es independiente del release.
 
 ### Si k6 corre (loadtest=true), contra qué endpoint apunta
 
@@ -246,7 +258,28 @@ Si el repo de la app cambió de strategy (e.g. de bluegreen a canary) pero olvid
 
 ## Stage 6 — Promote o Rollback
 
-Comportamiento según `outcome` (de Stage 5) × `strategy` (de Stage 4):
+El task arranca detectando el **modo** por introspección del Rollout (¿tiene `prePromotionAnalysis` / `steps[*].analysis`?):
+
+### Modo ENTERPRISE — solo observa
+
+Argo Rollouts ya ejecutó (o está ejecutando) los `AnalysisRun` y decidió promote/abort. El Stage 6 **no patchea nada** — espera hasta una fase terminal con timeout extendido (600s, un canary multi-step puede tardar):
+
+```sh
+wait_terminal() {
+  while [ $ELAPSED -lt 600 ]; do
+    PHASE=$(kubectl get rollout $R -n $NS -o jsonpath='{.status.phase}')
+    case "$PHASE" in
+      Healthy)   return 0 ;;   # análisis pasó → release OK
+      Degraded)  return 1 ;;   # análisis falló → Argo ya hizo rollback automático
+    esac
+    sleep 10
+  done
+}
+```
+
+Si queda `Degraded`, el Stage 6 imprime los `AnalysisRun` asociados (`kubectl get analysisrun`) para debug rápido y marca el pipeline `Failed`. El rollback ya lo hizo Argo — el pipeline solo lo reporta.
+
+### Modo LEGACY — patchea según `outcome` × `strategy`
 
 | Strategy | Outcome | Acción | Patch |
 |----------|---------|--------|-------|
@@ -257,23 +290,7 @@ Comportamiento según `outcome` (de Stage 5) × `strategy` (de Stage 4):
 | **rollingupdate** | passed | no-op (rollout completa solo) | — |
 | **rollingupdate** | failed | abort | `kubectl patch rollout $R -p '{"spec":{"abort":true}}'` |
 
-### Verificación post-patch
-
-Después de patchear, el Task espera con timeout 180s la fase esperada:
-
-```sh
-wait_phase() {
-  EXPECTED="$1"   # "Healthy" si promote, "Degraded" si abort
-  while [ $ELAPSED -lt 180 ]; do
-    PHASE=$(kubectl get rollout $R -n $NS -o jsonpath='{.status.phase}')
-    [ "$PHASE" = "$EXPECTED" ] && return 0
-    sleep 5
-  done
-  return 1
-}
-```
-
-Si la fase no se alcanza en 180s, el stage falla → el PipelineRun queda Failed → el dashboard de Tekton lo muestra rojo.
+Después de patchear, el Task espera con timeout 180s la fase esperada (`Healthy` si promote, `Degraded` si abort). Si no se alcanza, el stage falla → el PipelineRun queda `Failed`.
 
 ### Production gate
 

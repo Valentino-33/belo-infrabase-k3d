@@ -2,19 +2,25 @@
 
 Comandos paso a paso, validados end-to-end.
 
-## Estado validado (2026-05-12)
+## Estado validado (2026-05-14)
 
 | Componente | Estado |
 |---|---|
-| **api01 release pipeline v0.7.0** | ✅ 6 stages Succeeded (clone → build → bump → wait-argocd → load-test → promote-rollback) |
-| **api02 release pipeline v0.2.0** | ✅ 6 stages Succeeded |
+| **api01 BG enterprise v0.11.0** | ✅ prePromotionAnalysis `Successful` → switch automático → postPromotionAnalysis `Successful` → Healthy (~5min, pipeline solo observó) |
+| **api02 Canary enterprise v1.4.0** | ✅ 4 `AnalysisRun` `Successful`, canary 5%→25%→50%→100% sin intervención del pipeline (~6min) |
+| **Modelo legacy (flag loadtest)** | ✅ validado en runs previos — `loadtest=true` corre k6, `loadtest=false` skipea k6 + auto-promote |
 | **Burn pipeline** | ✅ HPA escaló api01 de 3 → 7 replicas durante el burn |
-| **Apps healthy** | api01 v0.7.0 (3 replicas) + api02 v0.2.0 (3 replicas) |
+| **Apps healthy** | api01 v0.11.0 + api02 v1.4.0 (3 replicas baseline) |
+| **AnalysisTemplate** | ✅ `<app>-app-health` en api01-dev y api02-dev — queries success-rate + latency-p95 sobre Prometheus |
 | **EFK ingestando** | ~15k+ docs/día en `k8s-YYYY.MM.DD`, JSON parseado a campos top-level |
 | **Kibana** | 5 saved searches + dashboard `belo-cluster-overview` |
 | **Grafana** | 4 dashboards (api01, api02, dev-cluster, pipeline — todos con datos reales) |
 | **Tekton metrics** | Scrapeado por Prometheus (`tekton_pipelines_controller_*`) |
-| **Argo Rollouts metrics** | Scrapeado (`rollout_info`, `rollout_phase`, `rollout_reconcile_*`) |
+| **Argo Rollouts metrics** | Scrapeado (`rollout_info`, `rollout_phase`, `analysis_run_*`) |
+
+> **Dos modelos de promoción** (ver [docs/deployment-strategies.md](docs/deployment-strategies.md#dos-modelos-de-promoción-legacy-y-enterprise)):
+> - **Legacy** (`analysis.enabled: false`): el pipeline decide promote/abort vía `kubectl patch` según el outcome del k6.
+> - **Enterprise** (`analysis.enabled: true` — el que usan api01-dev y api02-dev): Argo Rollouts decide vía `AnalysisRun` sobre Prometheus, hace rollback automático si falla. El pipeline solo observa.
 
 ---
 
@@ -56,62 +62,73 @@ Terminal B:  kubectl get pods -n webserver-api01-dev -w
 Browser:     http://tekton.localhost:8888/#/pipelineruns
 ```
 
-### Disparar release CON load-test (k6 + HPA scale visible)
+api01-dev usa el **modelo enterprise** (`analysis.enabled: true`): Argo Rollouts decide el promote vía `AnalysisRun` sobre Prometheus.
+
+### Disparar release
 
 ```bash
 cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api01
-git tag release/v0.10.0/dev/loadtest=true
-git push origin release/v0.10.0/dev/loadtest=true
+git tag release/v0.12.0/dev/loadtest=true
+git push origin release/v0.12.0/dev/loadtest=true
 ```
 
-> **Sobre el flag `loadtest=true`**: el 5º segmento del tag activa Stage 5 (k6 ~3min contra preview + HPA scale). Si omitís el segmento o usás `loadtest=false`, el Stage 5 se ejecuta pero skipea k6 (log "loadtest disabled by tag flag" + outcome=passed) → Stage 6 auto-promueve sin tráfico sintético. El default conservador es `false` para no ensuciar el Rollout con HPA scale en releases normales.
+> En modo enterprise el flag `loadtest=true` es **recomendado**: el k6 genera el tráfico que el `AnalysisRun` necesita para medir success-rate y latency. (El Stage 5 lo fuerza igual aunque no pongas el flag, pero ser explícito es más claro.)
 
-### Stages esperados (~3-4 min total)
+### Stages esperados (~5 min total)
 
 | Stage | Duración | Qué hace |
 |---|---|---|
 | 1. clone | ~10s | git clone @ tag |
-| 2. build-push | ~30s | Kaniko build + push `webserver-api01:v0.10.0` |
+| 2. build-push | ~30s | Kaniko build + push `webserver-api01:v0.12.0` |
 | 3. bump-gitops | ~10s | yq image.tag + git push al gitops repo |
-| 4. wait-argocd | ~20s | force-refresh ArgoCD + esperar sync + Rollout Paused |
-| 5. load-test | ~3min | k6 ramp hasta 500 VUs contra preview svc (gated por `loadtest=true`) |
-| 6. promote-rollback | ~10s | patch status.pauseConditions=null → switchover blue→green |
+| 4. wait-argocd | ~30s | force-refresh ArgoCD + esperar que el green RS esté ready (NO espera Paused — Argo no pausa en enterprise) |
+| 5. load-test | ~3min | k6 contra preview svc — **genera tráfico** para el `AnalysisRun` |
+| 6. promote-rollback | ~variable | **solo observa** — Argo corrió pre+postPromotionAnalysis y decidió. Espera `phase=Healthy` |
 
-### Verificación durante Stage 4-5
+Lo que hace Argo Rollouts en paralelo con el Stage 5: green RS ready → `prePromotionAnalysis` (success-rate ≥99%, latency-p95 <1s sobre preview svc) → si pasa, **switch automático** → `postPromotionAnalysis` sobre stable svc durante los 120s de `scaleDownDelay` → si pasa, `Healthy`.
 
-Terminal A va a mostrar el Rollout Paused con blue (v0.7.0 activo) y green (v0.8.0 preview):
+### Verificación en vivo
 
 ```bash
-# Vivo, mientras el k6 corre:
-curl http://preview-api01.localhost:8888/api01/version   # → v0.8.0 (green RS preview)
-curl http://api01.localhost:8888/api01/version            # → v0.7.0 (blue todavía activo)
+# Ver los AnalysisRun corriendo:
+kubectl get analysisrun -n webserver-api01-dev -w
+
+# Mientras el preview todavía no switcheó:
+curl http://preview-api01.localhost:8888/api01/version   # → v0.12.0 (green RS preview)
+curl http://api01.localhost:8888/api01/version            # → v0.11.0 (blue todavía activo)
 ```
 
-Después del Stage 6, ambos URLs devuelven v0.8.0.
+Después del switch automático (cuando prePromotionAnalysis pasa), ambos URLs devuelven v0.12.0.
+
+**Para ver un rollback automático**: si las métricas del green fallaran (success-rate <99% o latency alta), el `prePromotionAnalysis` daría `Failed` → Argo NO switchea, o el `postPromotionAnalysis` daría `Failed` → Argo revierte al blue dentro de los 120s. El Stage 6 vería `phase=Degraded` y marcaría el pipeline `Failed` — sin que ningún humano toque nada.
 
 ---
 
 ## 2. Demo Canary — api02 (~5 min)
 
 ```bash
-cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api02
-# Release rápido sin load-test (default, ideal para mostrar el canary "limpio"):
-git tag release/v1.3.0/dev
-git push origin release/v1.3.0/dev
-
-# O con load-test explícito (k6 contra stable mientras el canary está en setWeight):
-# git tag release/v1.3.0/dev/loadtest=true
-# git push origin release/v1.3.0/dev/loadtest=true
-```
-
-Durante el canary paused (setWeight 5 o 25), mostrar el split de tráfico:
+api02-dev usa el **modelo enterprise** con canary multi-step: Argo Rollouts corre un `AnalysisRun` en cada `setWeight` y solo avanza si pasa.
 
 ```bash
-for i in $(seq 1 30); do curl -s http://api02.localhost:8888/api02/version | jq -r .version; done | sort | uniq -c
-# Esperás algo como:
-#   27 v0.2.0   ← stable
-#    3 v0.3.0   ← canary 10% (aprox)
+cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api02
+git tag release/v1.5.0/dev/loadtest=true
+git push origin release/v1.5.0/dev/loadtest=true
 ```
+
+El canary avanza solo: `setWeight 5` → `AnalysisRun` → `setWeight 25` → `AnalysisRun` → `setWeight 50` → `AnalysisRun` → `setWeight 100` → `AnalysisRun` (post-promotion) → `Healthy`. El pipeline no interviene en ningún step — solo observa.
+
+```bash
+# Ver los 4 AnalysisRun en orden:
+kubectl get analysisrun -n webserver-api02-dev -w
+
+# Durante un setWeight, mostrar el split de tráfico real:
+for i in $(seq 1 30); do curl -s http://api02.localhost:8888/api02/version | jq -r .version; done | sort | uniq -c
+# Esperás algo como (en setWeight 25%):
+#   22 v1.4.0   ← stable
+#    8 v1.5.0   ← canary 25% (aprox)
+```
+
+Si **cualquier** `AnalysisRun` falla, Argo aborta el canary automáticamente: el canary RS se destruye, el stable (versión vieja) sigue 100%. El Stage 6 ve `phase=Degraded` y marca el pipeline `Failed`.
 
 Endpoints exclusivos de api02 (api01 no los tiene):
 
@@ -328,12 +345,14 @@ make refresh
 - **Pipelines viejos con `generateName`**: si hay runs anteriores con nombres random, limpialos antes (`kubectl delete pipelinerun --all -n tekton-pipelines`)
 - **Burn justo después de otro burn**: HPA cooldown de 5min — esperá o el `max-replicas` puede no superar el baseline
 
-## Flujo total para la demo (~20 min)
+## Flujo total para la demo (~25 min)
 
 1. `make pipeline-check` (1 min)
-2. `git tag release/v0.10.0/dev/loadtest=true` en api01 (5 min — Blue/Green con k6 + HPA scale)
-3. `git tag release/v1.3.0/dev` en api02 (3 min — Canary limpio, sin load-test)
+2. `git tag release/v0.12.0/dev/loadtest=true` en api01 (~5 min — BG enterprise: prePromotionAnalysis → switch automático → postPromotionAnalysis)
+3. `git tag release/v1.5.0/dev/loadtest=true` en api02 (~6 min — Canary enterprise: 4 AnalysisRun, 5%→25%→50%→100%)
 4. `git tag burn/dev` o `make burn-test APP=webserver-api01 ENV=dev` (4 min — HPA capacity test independiente)
 5. Tour: Tekton Dashboard → ArgoCD → Grafana dev-cluster → Grafana pipeline → Kibana dashboard (5 min)
 
-> **Por qué cada uno con un flag distinto**: api01 muestra el path completo (k6 → HPA scale → BG switchover). api02 muestra el path "limpio" (canary sin tráfico sintético, ideal para visualizar el split por setWeight). El burn pipeline valida HPA en un escenario controlado, separado del release.
+> **Qué muestra cada uno**: api01 muestra Blue/Green enterprise — el switch atómico decidido por análisis Prometheus, con `postPromotionAnalysis` cubriendo la ventana de rollback. api02 muestra Canary enterprise — promoción genuinamente gradual donde Argo valida métricas en cada `setWeight`. El burn pipeline valida HPA en un escenario controlado, separado del release.
+>
+> Para mostrar el **modelo legacy** (el pipeline decide, no Argo): poné `analysis.enabled: false` en el values del env, o usá un env que no lo tenga habilitado. El tag `loadtest=false` ahí hace un release rápido sin k6.
