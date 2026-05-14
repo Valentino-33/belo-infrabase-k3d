@@ -80,12 +80,15 @@ analysis:
   # Prefix de las métricas que expone la app (e.g., api01_requests_total → metricPrefix: api01).
   # REQUERIDO cuando enabled=true.
   metricPrefix: ""
-  # Cuánto esperar antes del primer sample (deja que el RS reciba tráfico).
-  initialDelay: "30s"
-  # Cuánto entre samples consecutivos del análisis.
-  interval: "20s"
-  # Cuántos samples se evalúan antes de declarar success/failure.
-  count: 3
+  # Timing calibrado para que el k6 del Stage 5 (~3min) cubra pre+post analysis:
+  #   - prePromotionAnalysis:  initialDelay(60s) + count(2)*interval(15s) ≈ 90s
+  #   - postPromotionAnalysis: ídem ≈ 90s   → total ≈ 180s, dentro de la ventana del k6
+  # initialDelay 60s da margen para que el Stage 5 levante el k6 (pod scheduling +
+  # pull de grafana/k6 + ramp-up) antes del primer sample. Las queries usan rate[1m],
+  # así que aunque el k6 termine, hay ~1min de memoria de métricas como colchón.
+  initialDelay: "60s"
+  interval: "15s"
+  count: 2
   # successCondition: success-rate >= 99% (las requests con status_code !~ "5..")
   successRateThreshold: 0.99
   # successCondition: latency p95 < 1.0s

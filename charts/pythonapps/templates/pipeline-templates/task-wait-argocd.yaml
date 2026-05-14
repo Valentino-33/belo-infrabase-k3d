@@ -10,8 +10,14 @@ spec:
     sobre la versión NUEVA, no la vieja. Verifica:
       (a) ArgoCD aplicó EL commit del Stage 3 (sync.revision == commit-sha)
       (b) Rollout.spec.image-tag == tag esperado
-      (c) Rollout.status.phase == Paused (BG/Canary) o Healthy (Rolling)
-    Auto-detecta strategy del live Rollout y emite como result.
+      (c) Rollout en el estado correcto según strategy + modo:
+          - rollingupdate           → phase=Healthy
+          - BG/Canary modo LEGACY   → phase=Paused (espera promote del pipeline)
+          - BG/Canary modo ENTERPRISE → RS nuevo ready (updatedReplicas>=1).
+            NO espera Paused: con autoPromotionEnabled=true + análisis, el
+            Rollout no pausa — corre el AnalysisRun y promueve solo. El Stage 5
+            (k6) genera tráfico EN PARALELO para que el análisis tenga data.
+    Auto-detecta strategy y modo del live Rollout y emite strategy como result.
   params:
   - name: app-name
     type: string
@@ -132,17 +138,37 @@ spec:
       printf "%s" "$STRATEGY" > "$(results.strategy.path)"
       echo "  ✓ Strategy detectada: $STRATEGY"
 
+      # Detección de modo: enterprise (Argo decide vía AnalysisRun) vs legacy.
+      # BG → prePromotionAnalysis definida. Canary → algún step con .analysis.
+      MODE="legacy"
+      case "$STRATEGY" in
+        bluegreen)
+          kubectl get rollout "$ROLLOUT" -n "$NS" \
+            -o jsonpath='{.spec.strategy.blueGreen.prePromotionAnalysis.templates[0].templateName}' 2>/dev/null \
+            | grep -q . && MODE="enterprise" ;;
+        canary)
+          kubectl get rollout "$ROLLOUT" -n "$NS" \
+            -o jsonpath='{.spec.strategy.canary.steps[?(@.analysis)].analysis.templates[0].templateName}' 2>/dev/null \
+            | grep -q . && MODE="enterprise" ;;
+      esac
+      echo "  ✓ Modo detectado: $MODE"
+
       IMAGE_TAG="$(params.image-tag)"
 
       echo ""
-      case "$STRATEGY" in
-        bluegreen|canary)
-          echo "→ Esperando que Rollout esté Paused con image-tag=$IMAGE_TAG..."
-          echo "  (BG/Canary se quedan en Paused esperando promote — eso es lo que queremos)"
-          ;;
-        rollingupdate)
+      case "${STRATEGY}/${MODE}" in
+        rollingupdate/*)
           echo "→ Esperando que Rollout llegue a Healthy con image-tag=$IMAGE_TAG..."
           echo "  (RollingUpdate no tiene preview — completa directo)"
+          ;;
+        */legacy)
+          echo "→ Esperando que Rollout esté Paused con image-tag=$IMAGE_TAG..."
+          echo "  (modo legacy: BG/Canary se quedan en Paused esperando promote del pipeline)"
+          ;;
+        */enterprise)
+          echo "→ Esperando que el RS nuevo (image-tag=$IMAGE_TAG) esté ready..."
+          echo "  (modo enterprise: Argo Rollouts corre el AnalysisRun y promueve solo;"
+          echo "   NO esperamos Paused. El Stage 5 generará tráfico para el análisis.)"
           ;;
       esac
 
@@ -153,15 +179,16 @@ spec:
           -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's|.*:||')
         REPLICAS=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.replicas}' 2>/dev/null || echo "?")
         READY=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "?")
-        echo "  [${ELAPSED}s] phase=$PHASE spec-tag=$SPEC_TAG replicas=$REPLICAS/$READY ready"
+        UPDATED=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || echo "?")
+        echo "  [${ELAPSED}s] phase=$PHASE spec-tag=$SPEC_TAG replicas=$REPLICAS ready=$READY updated=$UPDATED"
 
         if [ -n "$IMAGE_TAG" ] && [ "$SPEC_TAG" != "$IMAGE_TAG" ]; then
           echo "    (spec aún no refleja el nuevo image-tag, esperando)"
           sleep 5; ELAPSED=$((ELAPSED + 5)); continue
         fi
 
-        case "$STRATEGY" in
-          rollingupdate)
+        case "${STRATEGY}/${MODE}" in
+          rollingupdate/*)
             if [ "$PHASE" = "Healthy" ]; then
               echo "  ✓ RollingUpdate completo: phase=Healthy image-tag=$SPEC_TAG"
               echo "================================================================"
@@ -169,11 +196,21 @@ spec:
               echo "================================================================"
               exit 0
             fi ;;
-          bluegreen|canary)
+          */legacy)
             if [ "$PHASE" = "Paused" ]; then
               echo "  ✓ Rollout Paused con image-tag=$SPEC_TAG — green/canary RS listo"
               echo "================================================================"
               echo "  Stage 4 OK — Stage 5 va a correr load test contra preview"
+              echo "================================================================"
+              exit 0
+            fi ;;
+          */enterprise)
+            # RS nuevo ready: updatedReplicas >= 1 y al menos ese RS tiene pods listos.
+            # No esperamos Paused — Argo ya está corriendo (o por correr) el análisis.
+            if [ "$UPDATED" != "?" ] && [ "$UPDATED" -ge 1 ] 2>/dev/null; then
+              echo "  ✓ RS nuevo ready (updatedReplicas=$UPDATED, image-tag=$SPEC_TAG)"
+              echo "================================================================"
+              echo "  Stage 4 OK — Stage 5 genera tráfico mientras Argo corre el AnalysisRun"
               echo "================================================================"
               exit 0
             fi ;;

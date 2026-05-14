@@ -10,10 +10,18 @@ spec:
     (RollingUpdate). El script viene del repo de la app (Stage 1 lo clonó).
     Emite outcome=passed|failed para que Stage 6 decida promote vs abort.
 
-    Gating: si enabled=false, el step skipea k6 y emite outcome=passed
-    (auto-promote downstream). El stage queda visible en la UI con un log
-    explícito "loadtest disabled by tag flag", sin ensuciar el Rollout
-    con HPA scale durante el switchover.
+    Doble rol según el modo del Rollout:
+
+      MODO LEGACY (Rollout sin AnalysisTemplate):
+        El k6 VALIDA. Gating por `enabled`: si false, skipea k6 y emite
+        outcome=passed (auto-promote). El flag loadtest del tag lo controla.
+
+      MODO ENTERPRISE (Rollout con prePromotionAnalysis / steps.analysis):
+        El k6 GENERA TRÁFICO para que el AnalysisRun de Argo Rollouts tenga
+        data en Prometheus. Acá el k6 NO es opcional — sin tráfico, el análisis
+        da NaN y el Rollout queda Degraded. Por eso en modo enterprise el k6
+        corre SIEMPRE, ignorando `enabled`. La decisión promote/abort la toma
+        Argo (no este task ni el outcome que emite).
   params:
   - name: app-name
     type: string
@@ -50,6 +58,32 @@ spec:
       seccompProfile:
         type: RuntimeDefault
   steps:
+  # Step 1: detectar si el Rollout está en modo enterprise (tiene AnalysisTemplate
+  # configurado). El step k6 no tiene kubectl, así que la introspección va acá y
+  # el resultado se escribe a un archivo del workspace que el step k6 lee.
+  - name: detect-mode
+    image: bitnami/kubectl:latest
+    script: |
+      #!/bin/sh
+      PRIMARY_ENV=$(echo "$(params.environments)" | cut -d',' -f1 | tr -d ' ')
+      APP="$(params.app-name)"
+      ROLLOUT="${APP}-${PRIMARY_ENV}"
+      NS="${APP}-${PRIMARY_ENV}"
+      STRATEGY="$(params.strategy)"
+      MODE="legacy"
+      case "$STRATEGY" in
+        bluegreen)
+          kubectl get rollout "$ROLLOUT" -n "$NS" \
+            -o jsonpath='{.spec.strategy.blueGreen.prePromotionAnalysis.templates[0].templateName}' 2>/dev/null \
+            | grep -q . && MODE="enterprise" ;;
+        canary)
+          kubectl get rollout "$ROLLOUT" -n "$NS" \
+            -o jsonpath='{.spec.strategy.canary.steps[?(@.analysis)].analysis.templates[0].templateName}' 2>/dev/null \
+            | grep -q . && MODE="enterprise" ;;
+      esac
+      printf "%s" "$MODE" > "$(workspaces.source.path)/.rollout-mode"
+      echo "Rollout mode detectado: $MODE (escrito a .rollout-mode)"
+
   - name: run-k6
     image: grafana/k6:latest
     script: |
@@ -60,8 +94,18 @@ spec:
       ENABLED="$(params.enabled)"
       NS="${APP}-${PRIMARY_ENV}"
       RELEASE="${APP}-${PRIMARY_ENV}"
+      MODE=$(cat "$(workspaces.source.path)/.rollout-mode" 2>/dev/null || echo "legacy")
 
-      # Gating: si el tag no pidió loadtest=true, skipeamos k6 y auto-promovemos.
+      # En modo enterprise el k6 GENERA TRÁFICO para el AnalysisRun de Argo —
+      # no es opcional. Forzamos enabled=true ignorando el flag del tag: sin
+      # tráfico el análisis da NaN y el Rollout queda Degraded.
+      if [ "$MODE" = "enterprise" ] && [ "$ENABLED" != "true" ]; then
+        echo "→ Rollout en modo ENTERPRISE: el k6 es generador de tráfico del"
+        echo "  AnalysisRun. Forzando enabled=true (ignorando flag loadtest del tag)."
+        ENABLED="true"
+      fi
+
+      # Gating LEGACY: si el tag no pidió loadtest=true, skipeamos k6 y auto-promovemos.
       # Releases "limpios" no fuerzan HPA scale ni dejan rastro en el Rollout.
       if [ "$ENABLED" != "true" ]; then
         echo "================================================================"
@@ -70,6 +114,7 @@ spec:
         echo "  App:      $APP"
         echo "  Env:      $PRIMARY_ENV"
         echo "  Strategy: $STRATEGY"
+        echo "  Mode:     $MODE"
         echo "  Reason:   tag flag loadtest=true no presente (enabled=$ENABLED)"
         echo "  Outcome:  passed (auto-promote en Stage 6)"
         echo ""
