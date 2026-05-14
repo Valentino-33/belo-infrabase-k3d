@@ -89,6 +89,12 @@ spec:
       # promueve al siguiente step solo si el análisis del step anterior pasa.
       # El pipeline pasa de orquestador (promote/abort) a observador (espera
       # phase=Healthy en el Stage 6). Idiomático y enterprise-grade.
+      #
+      # Nota: canary NO tiene prePromotionAnalysis/postPromotionAnalysis como
+      # campos top-level (eso es exclusivo de blueGreen — el switch BG es atómico
+      # y necesita conceptos pre/post separados). En canary, el análisis va inline
+      # en los steps. El último `analysis` step (tras setWeight: 100) cumple la
+      # función de post-promotion analysis: valida el RS nuevo sirviendo 100%.
       steps:
       - setWeight: 5
       - analysis:
@@ -119,16 +125,17 @@ spec:
             value: {{ $fullName }}-preview
           - name: namespace
             value: {{ $ns }}
-      postPromotionAnalysis:
-        templates:
-        - templateName: {{ $fullName }}-app-health
-        args:
-        - name: service
-          # Post 100%, el canary RS pasó a ser stable. Medimos sobre stable svc
-          # que ahora recibe 100% del tráfico real.
-          value: {{ $fullName }}-stable
-        - name: namespace
-          value: {{ $ns }}
+      - setWeight: 100
+      # Post-promotion analysis: el canary RS ya sirve 100%. Medimos sobre stable
+      # svc — tras la promoción completa el stableService apunta al RS nuevo.
+      - analysis:
+          templates:
+          - templateName: {{ $fullName }}-app-health
+          args:
+          - name: service
+            value: {{ $fullName }}-stable
+          - name: namespace
+            value: {{ $ns }}
       {{- else }}
       # Modo legacy (analysis.enabled=false): pause:{} en cada step. El pipeline
       # promueve con kubectl patch promoteFull=true desde el Stage 6.
