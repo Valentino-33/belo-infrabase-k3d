@@ -21,6 +21,13 @@ spec:
     type: string
     default: dev
     description: "Comma-separated list: dev,staging,production"
+  - name: run-load-test
+    type: string
+    default: "false"
+    description: |
+      "true" → corre k6 contra preview/stable y promueve según outcome.
+      "false" (default) → skipea k6 dentro del stage load-test y auto-promueve
+      (outcome=passed). Releases rápidos sin ensuciar el Rollout con HPA scale.
   - name: gitops-repo-url
     type: string
   workspaces:
@@ -88,7 +95,9 @@ spec:
     - name: image-tag
       value: $(params.image-tag)
 
-  # Stage 5: k6 load test on the PRIMARY env
+  # Stage 5: k6 load test on the PRIMARY env (gated por param run-load-test)
+  # Si run-load-test=false (default), la task corre pero emite outcome=passed
+  # sin ejecutar k6 — auto-promote downstream sin ensuciar el Rollout con HPA scale.
   - name: load-test
     taskRef:
       name: run-load-test
@@ -103,6 +112,8 @@ spec:
       value: $(params.environments)
     - name: strategy
       value: $(tasks.wait-argocd.results.strategy)
+    - name: enabled
+      value: $(params.run-load-test)
 
   # Stage 6: promote or abort based on outcome
   # Stage final del release pipeline: el promote es el "dueño de la verdad".

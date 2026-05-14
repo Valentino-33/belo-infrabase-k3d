@@ -13,6 +13,8 @@ spec:
     default: main
   - name: environments
     default: dev
+  - name: run-load-test
+    default: "false"
   resourcetemplates:
   - apiVersion: tekton.dev/v1
     kind: PipelineRun
@@ -49,6 +51,8 @@ spec:
         value: "docker.io/{{ .Values.tekton.dockerhubUser }}/$(tt.params.app-name):$(tt.params.image-tag)"
       - name: environments
         value: $(tt.params.environments)
+      - name: run-load-test
+        value: $(tt.params.run-load-test)
       - name: gitops-repo-url
         value: "{{ .Values.tekton.gitopsRepoUrl }}"
       workspaces:

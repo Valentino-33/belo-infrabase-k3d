@@ -5,6 +5,12 @@
 # Los params son los que pythonapps-pipeline declara — no más, no menos.
 # Mantener sincronizado con charts/pythonapps/templates/pipeline-templates/pipeline-pythonapps.yaml.
 #
+# Nota sobre run-load-test: este manifiesto manual NO lo declara, así que toma el
+# default "false" del Pipeline (skipea k6, auto-promote). Para correr k6 desde
+# este path manual, agregá:
+#   - name: run-load-test
+#     value: "true"
+#
 # Nombre determinístico: <app>-pipelinerun-<tag>. Re-correr con el mismo TAG
 # falla con AlreadyExists — usar otro TAG o eliminar el run anterior con:
 #   kubectl delete pipelinerun <name> -n tekton-pipelines

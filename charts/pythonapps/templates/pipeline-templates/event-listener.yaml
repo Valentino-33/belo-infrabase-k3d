@@ -7,7 +7,16 @@ metadata:
 spec:
   serviceAccountName: tekton-triggers-sa
   triggers:
-  # Trigger 1: tags `refs/tags/release/<semver>/<envs>` → pipeline de release (6 stages)
+  # Trigger 1: tags `refs/tags/release/<semver>/<envs>[/loadtest=<bool>]` → pipeline de release (6 stages)
+  #
+  # Formatos válidos:
+  #   refs/tags/release/v1.0.0/dev                   → loadtest=false (default conservador)
+  #   refs/tags/release/v1.0.0/dev/loadtest=true     → corre k6 load test + promote según resultado
+  #   refs/tags/release/v1.0.0/dev/loadtest=false    → skipea k6 + auto-promote (release rápido)
+  #
+  # El default `false` es deliberado: load-test fuerza HPA scale y "ensucia" el flujo
+  # del Rollout — sólo se activa cuando explícitamente se pide. Para validar capacidad
+  # bajo carga, usar el pipeline burn (`refs/tags/burn/<env>`) que es independiente.
   - name: github-tag-release
     interceptors:
     - ref:
@@ -15,15 +24,22 @@ spec:
         kind: ClusterInterceptor
       params:
       - name: filter
-        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/release/') && body.ref.split('/').size() >= 4"
+        # refs/tags/release/<ver>            → split = 4 elementos
+        # refs/tags/release/<ver>/<env>      → split = 5 elementos
+        # refs/tags/release/<ver>/<env>/loadtest=<bool> → split = 6 elementos
+        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/release/') && body.ref.split('/').size() >= 4 && body.ref.split('/').size() <= 6"
       - name: overlays
         value:
         - key: image_tag
-          # refs/tags/release/v1.0.0/dev → split → [refs,tags,release,v1.0.0,dev] → index 3
+          # split → [refs, tags, release, <ver>, <env>?, <loadtest>?] → index 3
           expression: "body.ref.split('/')[3]"
         - key: environments
-          # Optional 5th segment: comma-separated envs. Default to 'dev' if absent.
+          # Index 4: comma-separated envs. Default 'dev' si no presente.
           expression: "body.ref.split('/').size() > 4 ? body.ref.split('/')[4] : 'dev'"
+        - key: run_load_test
+          # Index 5 opcional con formato exacto `loadtest=true|false`. Default 'false' si ausente
+          # o si la sintaxis no matchea — fail-closed para no correr k6 por accidente.
+          expression: "body.ref.split('/').size() > 5 && body.ref.split('/')[5] == 'loadtest=true' ? 'true' : 'false'"
         - key: git_revision
           expression: "body.ref"
     bindings:

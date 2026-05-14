@@ -67,43 +67,11 @@ cluster-up: helm-repos  ## Crear cluster k3d, labeling de nodos e instalar addon
 	@echo "$(GREEN)✓ Cluster k3d listo. Siguiente: make secrets && make bootstrap$(NC)"
 
 .PHONY: cluster-down
-cluster-down:  ## Eliminar cluster k3d y volumen Docker (DESTRUCTIVO — usar cluster-stop para preservar estado)
-	@echo "$(RED)→ ATENCIÓN: este comando elimina TODO el cluster y los volúmenes.$(NC)"
-	@echo "$(RED)  Para apagar preservando estado, usá: make cluster-stop$(NC)"
+cluster-down:  ## Eliminar cluster k3d y volumen Docker
 	@echo "$(YELLOW)→ Eliminando cluster '$(K3D_CLUSTER)'...$(NC)"
 	k3d cluster delete $(K3D_CLUSTER)
 	docker volume rm belo-statefull-data 2>/dev/null || true
 	@echo "$(GREEN)✓ Cluster y volúmenes eliminados$(NC)"
-
-.PHONY: cluster-stop
-cluster-stop:  ## Apagar cluster preservando estado (etcd, PVCs, configs) — usar al final del día
-	@echo "$(YELLOW)→ Apagando cluster '$(K3D_CLUSTER)' (preserva estado)...$(NC)"
-	k3d cluster stop $(K3D_CLUSTER)
-	@echo "$(GREEN)✓ Cluster apagado. Los containers de Docker quedan parados pero existen.$(NC)"
-	@echo "$(GREEN)  Mañana: 'make cluster-start' para resumir desde donde quedaste.$(NC)"
-	@echo ""
-	@echo "$(YELLOW)Tip: si querés liberar RAM ahora, también podés salir de Docker Desktop.$(NC)"
-	@echo "     Mañana abrís Docker Desktop primero, después 'make cluster-start'."
-
-.PHONY: cluster-start
-cluster-start:  ## Reanudar cluster previamente apagado con 'cluster-stop'
-	@echo "$(YELLOW)→ Verificando que Docker Desktop esté corriendo...$(NC)"
-	@docker info >/dev/null 2>&1 || { echo "$(RED)✗ Docker no responde. Abrí Docker Desktop y reintentá.$(NC)"; exit 1; }
-	@echo "$(YELLOW)→ Reanudando cluster '$(K3D_CLUSTER)'...$(NC)"
-	k3d cluster start $(K3D_CLUSTER)
-	@echo "$(YELLOW)→ Fijando contexto kubectl...$(NC)"
-	kubectl config use-context $(K3D_CONTEXT)
-	@echo "$(YELLOW)→ Esperando a que los nodos estén Ready (timeout 2m)...$(NC)"
-	@kubectl wait --for=condition=Ready node --all --timeout=120s
-	@echo "$(YELLOW)→ Esperando a que ArgoCD, Tekton EventListener y los Rollouts estén listos (timeout 3m)...$(NC)"
-	@kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=180s 2>/dev/null || echo "  (argocd-server tardando, revisar manualmente)"
-	@kubectl -n tekton-pipelines wait --for=condition=ready pod -l eventlistener=github-tag-listener --timeout=120s 2>/dev/null || echo "  (EventListener tardando, revisar manualmente)"
-	@kubectl -n tekton-pipelines wait --for=condition=available deployment/tekton-dashboard --timeout=60s 2>/dev/null || echo "  (Dashboard tardando, revisar manualmente)"
-	@echo ""
-	@echo "$(GREEN)✓ Cluster reanudado. Próximos pasos:$(NC)"
-	@echo "  • make cluster-status     → verificar nodos y apps"
-	@echo "  • make tunnel             → re-abrir ngrok (URL nueva — re-configurar webhook en GitHub)"
-	@echo "  • make pipeline-run APP=webserver-api01 TAG=vX.Y.Z → disparar un run manual"
 
 .PHONY: cluster-status
 cluster-status:  ## Estado del cluster: nodos + apps + rollouts
@@ -155,12 +123,10 @@ addons: helm-repos  ## Instalar todos los addons en el cluster k3d
 	  --namespace argo-rollouts \
 	  --wait --timeout 2m
 
-	@echo "$(YELLOW)→ 5/8 Tekton Pipelines + Triggers + Dashboard...$(NC)"
+	@echo "$(YELLOW)→ 5/8 Tekton Pipelines + Triggers...$(NC)"
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/release.yaml
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/interceptors.yaml
-	kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
-	kubectl apply -f $(ROOT_DIR)manifests/tekton/dashboard-ingress.yaml
 	kubectl -n tekton-pipelines rollout status deployment/tekton-pipelines-controller --timeout=3m
 
 	@echo "$(YELLOW)→ 6/8 EFK stack (local-path, TLS deshabilitado para dev)...$(NC)"
@@ -203,78 +169,10 @@ addons: helm-repos  ## Instalar todos los addons en el cluster k3d
 # GitOps Bootstrap
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: bootstrap
-bootstrap: tekton-apply dashboards-apply  ## Aplicar root ArgoCD Application + Tekton + dashboards Grafana
+bootstrap: tekton-apply  ## Aplicar root ArgoCD Application + Tekton pipeline manifests
 	@echo "$(YELLOW)→ Aplicando root Application de ArgoCD...$(NC)"
 	kubectl apply -f $(ROOT_DIR)manifests/argocd/bootstrap.yaml -n argocd
 	@echo "$(GREEN)✓ Bootstrap aplicado$(NC)"
-
-.PHONY: dashboards-apply
-dashboards-apply:  ## Aplicar dashboards Grafana (ConfigMaps con label grafana_dashboard=1)
-	@echo "$(YELLOW)→ Aplicando dashboards Grafana...$(NC)"
-	kubectl create namespace monitoring 2>/dev/null || true
-	kubectl apply -f $(ROOT_DIR)manifests/grafana/
-	@echo "$(GREEN)✓ Dashboards aplicados — aparecen en Grafana en ~30s vía sidecar$(NC)"
-
-.PHONY: refresh
-refresh: tekton-apply dashboards-apply  ## Re-aplicar Tekton + dashboards sobre un cluster ya levantado (sin recrear nada)
-	@echo "$(YELLOW)→ Actualizando fluent-bit (cambios en config de logging)...$(NC)"
-	helm upgrade --install fluent-bit fluent/fluent-bit \
-	  --namespace logging \
-	  --values $(ROOT_DIR)helm/addons/fluent-bit/values.yaml \
-	  --wait --timeout 2m 2>/dev/null || echo "  (fluent-bit no instalado o helm repo no agregado — saltando)"
-	@echo "$(YELLOW)→ Forzando sync de las apps en ArgoCD...$(NC)"
-	@kubectl annotate app webserver-api01-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite 2>/dev/null || true
-	@kubectl annotate app webserver-api02-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite 2>/dev/null || true
-	@echo "$(GREEN)✓ Cluster actualizado.$(NC)"
-	@echo "$(YELLOW)Verificá con:$(NC)"
-	@echo "  make pipeline-check   → estado de Tekton (EventListener triggers, tasks, pipelines)"
-	@echo "  make rollout-status APP=webserver-api01 ENV=dev"
-
-.PHONY: pipeline-check
-pipeline-check:  ## Diagnóstico: muestra triggers, tasks, pipelines y estado del EventListener
-	@echo "$(YELLOW)========== Pipelines registrados ==========$(NC)"
-	@kubectl get pipelines -n tekton-pipelines 2>/dev/null || echo "(no pipelines)"
-	@echo ""
-	@echo "$(YELLOW)========== Tasks registrados ==========$(NC)"
-	@kubectl get tasks -n tekton-pipelines 2>/dev/null || echo "(no tasks)"
-	@echo ""
-	@echo "$(YELLOW)========== TriggerBindings ==========$(NC)"
-	@kubectl get triggerbindings -n tekton-pipelines 2>/dev/null || echo "(no bindings)"
-	@echo ""
-	@echo "$(YELLOW)========== TriggerTemplates ==========$(NC)"
-	@kubectl get triggertemplates -n tekton-pipelines 2>/dev/null || echo "(no templates)"
-	@echo ""
-	@echo "$(YELLOW)========== EventListener triggers ==========$(NC)"
-	@kubectl get eventlistener github-tag-listener -n tekton-pipelines \
-	  -o jsonpath='{range .spec.triggers[*]}  - {.name}: bindings={.bindings[*].ref} template={.template.ref}{"\n"}{end}' 2>/dev/null \
-	  || echo "(EventListener no existe — correr make tekton-apply)"
-	@echo ""
-	@echo "$(YELLOW)========== EventListener pod ==========$(NC)"
-	@kubectl get pods -n tekton-pipelines -l eventlistener=github-tag-listener 2>/dev/null
-	@echo ""
-	@echo "$(YELLOW)========== Últimos PipelineRuns (top 10) ==========$(NC)"
-	@kubectl get pipelineruns -n tekton-pipelines --sort-by='.metadata.creationTimestamp' 2>/dev/null | tail -11 || true
-	@echo ""
-	@echo "$(GREEN)Si NO ves los triggers `github-tag-release` y `github-tag-burn` arriba,$(NC)"
-	@echo "$(GREEN)correr: make tekton-apply$(NC)"
-
-.PHONY: burn-check
-burn-check:  ## Diagnóstico específico del burn pipeline + tags burn/<env>
-	@echo "$(YELLOW)========== Burn pipeline ==========$(NC)"
-	@kubectl get pipeline pythonapps-burn-pipeline -n tekton-pipelines 2>/dev/null || echo "✗ pythonapps-burn-pipeline NO existe — correr make tekton-apply"
-	@echo ""
-	@echo "$(YELLOW)========== Trigger burn ==========$(NC)"
-	@kubectl get triggertemplate pythonapps-burn-trigger-template -n tekton-pipelines 2>/dev/null || echo "✗ trigger template falta"
-	@kubectl get triggerbinding github-burn-binding -n tekton-pipelines 2>/dev/null || echo "✗ trigger binding falta"
-	@echo ""
-	@echo "$(YELLOW)========== EventListener — trigger 'github-tag-burn' ==========$(NC)"
-	@kubectl get eventlistener github-tag-listener -n tekton-pipelines -o jsonpath='{.spec.triggers[?(@.name=="github-tag-burn")]}' 2>/dev/null | head -c 200 && echo "" || echo "✗ trigger 'github-tag-burn' NO está en el EventListener"
-	@echo ""
-	@echo "$(YELLOW)========== Últimos burn PipelineRuns ==========$(NC)"
-	@kubectl get pipelinerun -n tekton-pipelines -l pipeline=burn --sort-by='.metadata.creationTimestamp' 2>/dev/null | tail -6 || echo "(ninguno aún)"
-	@echo ""
-	@echo "$(YELLOW)========== Últimos logs del EventListener ==========$(NC)"
-	@kubectl logs -n tekton-pipelines -l eventlistener=github-tag-listener --tail=20 2>/dev/null | head -50 || true
 	@echo ""
 	@echo "ArgoCD sincronizará gitops/ → crea webserver-api01-dev y webserver-api02-dev"
 	@echo "Monitoreá en: http://argocd.localhost:8888  (user: admin)"
@@ -296,10 +194,6 @@ tekton-apply:  ## Aplicar Tasks, Pipeline y Triggers de Tekton
 	  -s templates/pipeline-templates/task-wait-argocd.yaml \
 	  -s templates/pipeline-templates/task-load-test.yaml \
 	  -s templates/pipeline-templates/task-promote-rollback.yaml \
-	  -s templates/pipeline-templates/task-burn-to-scale.yaml \
-	  -s templates/pipeline-templates/pipeline-burn.yaml \
-	  -s templates/pipeline-templates/trigger-binding-burn.yaml \
-	  -s templates/pipeline-templates/trigger-template-burn.yaml \
 	  -s templates/pipeline-templates/pipeline-pythonapps.yaml \
 	  -s templates/pipeline-templates/trigger-binding.yaml \
 	  -s templates/pipeline-templates/trigger-template.yaml \
@@ -353,40 +247,23 @@ secrets-apply:  ## Crear secretos: make secrets-apply DOCKERHUB_USER=x DOCKERHUB
 pipeline-run:  ## Disparar pipeline manual: make pipeline-run APP=webserver-api01 TAG=v0.1.0
 	@echo "$(YELLOW)→ Iniciando PipelineRun para $(APP):$(TAG)...$(NC)"
 	APP=$(APP) TAG=$(TAG) DOCKERHUB_USER=$(DOCKERHUB_USER) \
-	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl create -f -
+	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl apply -f -
 	@echo "$(GREEN)✓ PipelineRun creado — monitoreá con:$(NC)"
 	@echo "   tkn pipelinerun logs -n tekton-pipelines --last -f"
 
-.PHONY: burn-test
-burn-test:  ## Disparar burn pipeline (HPA capacity test): make burn-test APP=webserver-api01 ENV=dev
-	@echo "$(YELLOW)→ Iniciando burn-to-scale pipeline para $(APP) en $(ENV)...$(NC)"
-	@echo "$(YELLOW)  El test sostiene 200 VUs ~3min — el cluster va a estar caliente.$(NC)"
-	APP=$(APP) ENV=$(ENV) \
-	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-burn-manual.yaml | kubectl create -f -
-	@echo "$(GREEN)✓ Burn pipeline disparado — observá HPA en paralelo:$(NC)"
-	@echo "   kubectl get hpa $(APP)-$(ENV) -n $(APP)-$(ENV) -w"
-	@echo "   tkn pipelinerun logs -n tekton-pipelines --last -f"
-
-.PHONY: burn-release-tag
-burn-release-tag:  ## Crear y pushear tag de burn (equivalente a make burn-test pero vía webhook): cd <app-repo> && make burn-release-tag ENV=dev (desde el infra repo solo imprime el comando)
-	@echo "$(YELLOW)→ Para disparar el burn pipeline vía webhook desde un repo de app:$(NC)"
-	@echo ""
-	@echo "  cd /ruta/al/repo/de/la/app"
-	@echo "  git tag burn/$(ENV)"
-	@echo "  git push origin burn/$(ENV)"
-	@echo ""
-	@echo "$(GREEN)El webhook gatilla el pipeline burn contra $(ENV).$(NC)"
-	@echo "$(YELLOW)Re-correr el mismo env: borrar el tag local+remoto antes:$(NC)"
-	@echo "  git tag -d burn/$(ENV) && git push --delete origin burn/$(ENV)"
-
 .PHONY: release
-release:  ## Crear y pushear tag de release: make release APP=webserver-api01 TAG=v1.0.0 ENVS=dev
+release:  ## Crear y pushear tag de release: make release APP=webserver-api01 TAG=v1.0.0 ENVS=dev [LOADTEST=true]
 	@if [ -z "$(TAG)" ]; then echo "$(RED)Falta TAG (ej: make release TAG=v1.0.0)$(NC)"; exit 1; fi
 	@echo "$(YELLOW)→ Creando tag release/$(TAG)/$(ENVS) para $(APP)...$(NC)"
 	@echo "  Repo de la app: corré esto DESDE el repo de la app, no desde el gitops repo"
 	@echo ""
+	@echo "  # Release rápido (sin k6, default):"
 	@echo "  git tag release/$(TAG)/$(ENVS)"
 	@echo "  git push origin release/$(TAG)/$(ENVS)"
+	@echo ""
+	@echo "  # O con load-test explícito (k6 ~3min + HPA scale visible):"
+	@echo "  git tag release/$(TAG)/$(ENVS)/loadtest=true"
+	@echo "  git push origin release/$(TAG)/$(ENVS)/loadtest=true"
 	@echo ""
 	@echo "$(GREEN)Eso dispara el webhook → pipeline para $(APP) en ambiente(s): $(ENVS)$(NC)"
 
@@ -477,17 +354,9 @@ rollout-abort:  ## Abortar rollout (rollback): make rollout-abort APP=webserver-
 # ──────────────────────────────────────────────────────────────────────────────
 # Build local de imágenes (sin k3d)
 # ──────────────────────────────────────────────────────────────────────────────
-# Build local — clona el repo de la app desde GitHub (single source of truth).
-# El código de las apps NO vive en este repo; vive en los repos externos:
-#   github.com/Valentino-33/webserver-api01
-#   github.com/Valentino-33/webserver-api02
-# Override APP_REPO_BASE si tus repos viven en otro org.
 .PHONY: build
-build:  ## Build local: make build APP=webserver-api01 TAG=v0.1.0 (clona repo externo)
-	@rm -rf /tmp/belo-build/$(APP) 2>/dev/null || true
-	@mkdir -p /tmp/belo-build
-	git clone --depth 1 $(APP_REPO_BASE)/$(APP) /tmp/belo-build/$(APP)
-	docker build -t $(DOCKERHUB_USER)/$(APP):$(TAG) /tmp/belo-build/$(APP)/
+build:  ## Build local: make build APP=webserver-api01 TAG=v0.1.0
+	docker build -t $(DOCKERHUB_USER)/$(APP):$(TAG) $(ROOT_DIR)apps/$(APP)/
 
 .PHONY: push
 push:  ## Push a DockerHub: make push APP=webserver-api01 TAG=v0.1.0
@@ -498,17 +367,12 @@ build-push: build push  ## Build + push en un paso
 
 .PHONY: images-initial
 images-initial:  ## Build y push de ambas apps con tag latest (requerido antes de make bootstrap)
-	@echo "$(YELLOW)→ Clonando repos externos y buildeando imágenes iniciales...$(NC)"
-	@echo "$(YELLOW)  (single source of truth: $(APP_REPO_BASE))$(NC)"
-	@rm -rf /tmp/belo-bootstrap 2>/dev/null || true
-	@mkdir -p /tmp/belo-bootstrap
-	git clone --depth 1 $(APP_REPO_BASE)/webserver-api01 /tmp/belo-bootstrap/webserver-api01
-	git clone --depth 1 $(APP_REPO_BASE)/webserver-api02 /tmp/belo-bootstrap/webserver-api02
-	docker build -t $(DOCKERHUB_USER)/webserver-api01:latest /tmp/belo-bootstrap/webserver-api01/
-	docker push $(DOCKERHUB_USER)/webserver-api01:latest
-	docker build -t $(DOCKERHUB_USER)/webserver-api02:latest /tmp/belo-bootstrap/webserver-api02/
-	docker push $(DOCKERHUB_USER)/webserver-api02:latest
-	@echo "$(GREEN)✓ Imágenes iniciales publicadas en Docker Hub (built from external repos)$(NC)"
+	@echo "$(YELLOW)→ Build y push de imágenes iniciales...$(NC)"
+	docker build -t $(DOCKERHUB_USER)/api01:latest $(ROOT_DIR)apps/webserver-api01/
+	docker push $(DOCKERHUB_USER)/api01:latest
+	docker build -t $(DOCKERHUB_USER)/api02:latest $(ROOT_DIR)apps/webserver-api02/
+	docker push $(DOCKERHUB_USER)/api02:latest
+	@echo "$(GREEN)✓ Imágenes iniciales publicadas en Docker Hub$(NC)"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Acceso a UIs
@@ -567,48 +431,23 @@ cluster-info:  ## Mostrar URLs, passwords y comandos útiles de un vistazo
 
 .PHONY: tunnel
 tunnel:  ## Exponer EventListener a internet con ngrok (requiere ngrok instalado)
-	@echo "$(YELLOW)→ Iniciando ngrok en puerto 8888 (host-header=tekton-webhook.localhost)...$(NC)"
+	@echo "$(YELLOW)→ Iniciando ngrok en puerto 8888...$(NC)"
 	@echo "$(YELLOW)  Una vez activo, copiá la URL https:// y configurala en GitHub:"$(NC)
 	@echo "  Settings → Webhooks → Payload URL: <ngrok-url>"
-	@echo "  Content type: application/json  |  Events: Push (incluye tags)"
+	@echo "  Content type: application/json  |  Events: Push"	
 	@echo ""
-	ngrok http --host-header=tekton-webhook.localhost 8888
-
-# Los scripts k6 son source-of-truth en el REPO DE CADA APP — no acá.
-# Estos targets clonan el repo de la app a /tmp y corren k6 contra el cluster.
-# Override APP_REPO_BASE si tus repos viven en otro org/usuario de GitHub.
-APP_REPO_BASE ?= https://github.com/Valentino-33
-
-LOADTEST_TMP := /tmp/belo-loadtest
-
-.PHONY: _fetch-app-repo
-_fetch-app-repo:
-	@rm -rf $(LOADTEST_TMP)/$(APP) 2>/dev/null || true
-	@mkdir -p $(LOADTEST_TMP)
-	@git clone --depth 1 $(APP_REPO_BASE)/$(APP) $(LOADTEST_TMP)/$(APP) 2>&1 | tail -1
-	@test -d $(LOADTEST_TMP)/$(APP)/loadtest || { \
-	  echo "$(RED)ERROR: $(APP_REPO_BASE)/$(APP) no tiene un directorio loadtest/ en su raíz$(NC)"; \
-	  exit 1; }
+	ngrok http 8888
 
 .PHONY: load-test-smoke
-load-test-smoke: _fetch-app-repo  ## Smoke test: make load-test-smoke APP=webserver-api01
-	@test -f $(LOADTEST_TMP)/$(APP)/loadtest/smoke.js || { \
-	  echo "$(RED)ERROR: smoke.js no existe en el repo $(APP)$(NC)"; exit 1; }
-	k6 run -e BASE_URL=http://$(subst webserver-,,$(APP)).localhost:8888 \
-	  $(LOADTEST_TMP)/$(APP)/loadtest/smoke.js
+load-test-smoke:  ## Smoke test: make load-test-smoke APP=webserver-api01
+	k6 run -e BASE_URL=http://$(APP).localhost:8888 $(ROOT_DIR)apps/$(APP)/loadtest/smoke.js
 
 .PHONY: load-test-bluegreen
-load-test-bluegreen:  ## Load test BlueGreen (contra preview-api01) — usa el repo webserver-api01
-	@$(MAKE) _fetch-app-repo APP=webserver-api01
-	@test -f $(LOADTEST_TMP)/webserver-api01/loadtest/load-bluegreen.js || { \
-	  echo "$(RED)ERROR: load-bluegreen.js no existe en el repo webserver-api01$(NC)"; exit 1; }
+load-test-bluegreen:  ## Load test BlueGreen (contra preview): make load-test-bluegreen
 	k6 run -e PREVIEW_URL=http://preview-api01.localhost:8888 \
-	  $(LOADTEST_TMP)/webserver-api01/loadtest/load-bluegreen.js
+	  $(ROOT_DIR)apps/webserver-api01/loadtest/load-bluegreen.js
 
 .PHONY: load-test-canary
-load-test-canary:  ## Load test Canary (contra stable con canary activo) — usa el repo webserver-api02
-	@$(MAKE) _fetch-app-repo APP=webserver-api02
-	@test -f $(LOADTEST_TMP)/webserver-api02/loadtest/load-canary.js || { \
-	  echo "$(RED)ERROR: load-canary.js no existe en el repo webserver-api02$(NC)"; exit 1; }
+load-test-canary:  ## Load test Canary (contra stable con canary activo): make load-test-canary
 	k6 run -e BASE_URL=http://api02.localhost:8888 \
-	  $(LOADTEST_TMP)/webserver-api02/loadtest/load-canary.js
+	  $(ROOT_DIR)apps/webserver-api02/loadtest/load-canary.js
