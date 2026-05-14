@@ -104,8 +104,14 @@ ngrok va a mostrar una URL nueva tipo `https://xyz789.ngrok-free.app`. Tenés qu
 ```bash
 # 3. Pushear un tag nuevo desde el repo de la app
 cd C:\Users\tadeo\OneDrive\Escritorio\belochallenge\webserver-api01
+
+# Release rápido (default — sin k6, sin HPA scale durante el switchover):
 git tag release/v0.5.0/dev
 git push origin release/v0.5.0/dev
+
+# O con load-test explícito (k6 contra preview + HPA scale visible):
+# git tag release/v0.5.0/dev/loadtest=true
+# git push origin release/v0.5.0/dev/loadtest=true
 ```
 
 ```bash

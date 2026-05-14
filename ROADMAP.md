@@ -38,12 +38,12 @@ Stack completo de CI/CD y deployment strategies sobre k3d (Kubernetes local). Mi
 - [x] Stage 2: `kaniko-build-push` — build sin Docker daemon + push a Docker Hub
 - [x] Stage 3: `bump-gitops-image` — actualiza `image.tag` via yq + git push autenticado
 - [x] Stage 4: `wait-argocd-sync` — poll hasta Synced y Rollout Paused/Healthy
-- [x] Stage 5: `run-load-test` — k6 in-cluster, siempre exits 0, emite result `outcome`
+- [x] Stage 5: `run-load-test` — k6 in-cluster, siempre exits 0, emite result `outcome`. Gated por param `enabled` derivado del flag `loadtest=true` del tag (default `false` → skipea k6)
 - [x] Stage 6: `promote-rollback` — actúa sobre `outcome`: promote o abort según strategy
 
 ### Fase 6 — Triggers automáticos
-- [x] EventListener con CEL interceptor (filtro: `refs/tags/release/<sha>/<envs>`)
-- [x] TriggerBinding — extrae repo-url, app-name, image-tag, environments, revision
+- [x] EventListener con CEL interceptor (filtro: `refs/tags/release/<ver>/<envs>[/loadtest=<bool>]`, 4-6 segmentos)
+- [x] TriggerBinding — extrae repo-url, app-name, image-tag, environments, run-load-test, revision
 - [x] TriggerTemplate — genera PipelineRun con SA, tolerations y computed URLs
 - [x] Ingress `tekton-webhook.localhost` para recibir webhooks de GitHub
 - [x] RBAC mínimo: SA `tekton-triggers-sa` (crear/listar PipelineRuns) + SA `tekton-pipeline-runner` (Rollouts + Applications)

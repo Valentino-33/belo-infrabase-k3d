@@ -12,7 +12,7 @@ flowchart TB
     GH[GitHub<br/>app repo + gitops repo]
     DH[Docker Hub]
 
-    Dev -->|"git tag release/v1.0.0/dev<br/>git push origin --tags"| GH
+    Dev -->|"git tag release/v1.0.0/dev[/loadtest=true]<br/>git push origin --tags"| GH
 
     subgraph HOST["Host Windows — Docker Desktop"]
         PORT["localhost:8888 → nginx:80<br/>(k3d hostPort mapping)"]
@@ -183,17 +183,17 @@ sequenceDiagram
     participant ARO as Argo Rollouts<br/>controller
     participant K6 as k6 task<br/>(in-cluster)
 
-    Dev->>GH: git tag release/v1.2.0/dev
+    Dev->>GH: git tag release/v1.2.0/dev/loadtest=true
     Dev->>GH: git push origin --tags
     GH->>NGR: webhook POST<br/>(X-Github-Event: push)
     NGR->>EL: forward con<br/>Host: tekton-webhook.localhost
-    EL->>EL: CEL filter:<br/>refs/tags/release/<sha>/<envs>
-    Note over EL: image_tag=v1.2.0<br/>environments=dev<br/>app-name=webserver-api01<br/>(de body.repository.name)
+    EL->>EL: CEL filter:<br/>refs/tags/release/<ver>/<envs>[/loadtest=bool]
+    Note over EL: image_tag=v1.2.0<br/>environments=dev<br/>run_load_test=true<br/>app-name=webserver-api01<br/>(de body.repository.name)
     EL->>TR: crea PipelineRun<br/>name=webserver-api01-pipelinerun-v1.2.0<br/>(determinístico — re-push falla con AlreadyExists)
 
     rect rgb(220,252,231)
     Note over TR: Stage 1 — clone (10s)
-    TR->>GH: git clone --depth 1<br/>refs/tags/release/v1.2.0/dev
+    TR->>GH: git clone --depth 1<br/>refs/tags/release/v1.2.0/dev/loadtest=true
     end
 
     rect rgb(220,252,231)
@@ -228,11 +228,15 @@ sequenceDiagram
     end
 
     rect rgb(220,252,231)
-    Note over TR: Stage 5 — load-test (~60-90s)
-    Note over TR: Lee script desde el repo de la app:<br/>/workspace/source/src/loadtest/<script>.js<br/>(fail-fast si no existe — no se permite verde sin tests)
-    TR->>K6: k6 run load-bluegreen.js<br/>(o canary/smoke según strategy)
-    K6->>ARO: HTTP → preview svc (BG)<br/>o stable svc (Canary/Rolling)
-    K6-->>TR: result outcome=passed|failed
+    Note over TR: Stage 5 — load-test (~60-90s si enabled, ~2s si skipped)
+    alt run-load-test=true (flag explícito en el tag)
+        Note over TR: Lee script desde el repo de la app:<br/>/workspace/source/src/loadtest/<script>.js<br/>(fail-fast si no existe — no se permite verde sin tests)
+        TR->>K6: k6 run load-bluegreen.js<br/>(o canary/smoke según strategy)
+        K6->>ARO: HTTP → preview svc (BG)<br/>o stable svc (Canary/Rolling)
+        K6-->>TR: result outcome=passed|failed
+    else run-load-test=false (default)
+        Note over TR: Skipea k6 — log "loadtest disabled by tag flag"<br/>Emite outcome=passed para auto-promote downstream.<br/>El Rollout no sufre HPA scale por carga sintética.
+    end
     end
 
     rect rgb(254,243,199)
@@ -259,7 +263,7 @@ sequenceDiagram
 ### Convención de tag (real)
 
 ```
-refs/tags/release/<semver>/<envs>
+refs/tags/release/<semver>/<envs>[/loadtest=<bool>]
 ```
 
 | Segmento | Ejemplo | Cómo se usa |
@@ -267,17 +271,22 @@ refs/tags/release/<semver>/<envs>
 | `refs/tags/release/` | literal | filtro del CEL interceptor |
 | `<semver>` | `v1.2.0` | extraído a `image_tag` (Tekton param) — usado como Docker tag y como `image.tag` del values.yaml |
 | `<envs>` | `dev` o `dev,staging` | extraído a `environments` — el bump escribe en el `values.yaml` de cada env listado |
+| `loadtest=<bool>` | `loadtest=true` | **opcional**. 5º segmento exacto. Default `false`. Activa Stage 5 k6. Cualquier otra string en este segmento → fail-closed = `false` |
 
-| Tag pusheado | `image_tag` | `environments` | Dispara |
-|--------------|-------------|----------------|---------|
-| `release/v1.2.0/dev` | `v1.2.0` | `dev` | ✅ |
-| `release/v1.2.0/dev,staging` | `v1.2.0` | `dev,staging` | ✅ |
-| `v1.2.0` | — | — | ❌ |
-| `release/v1.2.0` | — | — | ❌ falta env |
+| Tag pusheado | `image_tag` | `environments` | `run_load_test` | Dispara |
+|--------------|-------------|----------------|-----------------|---------|
+| `release/v1.2.0/dev` | `v1.2.0` | `dev` | `false` (default) | ✅ — release rápido |
+| `release/v1.2.0/dev/loadtest=true` | `v1.2.0` | `dev` | `true` | ✅ — corre k6 + HPA scale visible |
+| `release/v1.2.0/dev/loadtest=false` | `v1.2.0` | `dev` | `false` (explícito) | ✅ |
+| `release/v1.2.0/dev,staging` | `v1.2.0` | `dev,staging` | `false` | ✅ |
+| `v1.2.0` | — | — | — | ❌ |
+| `release/v1.2.0` | — | — | — | ❌ falta env |
 
 > **Importante**: el `app-name` lo extrae el TriggerBinding de `body.repository.name`. El repo de la app **debe llamarse igual que el app-name** en values de ArgoCD (`webserver-api01` / `webserver-api02`).
 >
 > La **strategy** (bluegreen / canary / rollingupdate) **NO** se pasa por el tag — viene fija del `rollout.strategy` del chart Helm de la app. El pipeline la auto-detecta inspeccionando el live Rollout.
+>
+> **Por qué `loadtest=false` es el default**: correr k6 durante el Rollout fuerza HPA scale (CPU → más replicas), lo que "ensucia" la visualización de la estrategia BG/Canary en la demo. El flag está opt-in para que el path "limpio" (canary stable sin scaling, BG sin réplicas extra) sea el comportamiento por defecto. Para validar capacidad bajo carga existe el pipeline burn (`refs/tags/burn/<env>`) que es independiente del release.
 
 ### Stages del pipeline de release (resumen)
 
@@ -289,7 +298,7 @@ El **release pipeline** (`pythonapps-pipeline`) tiene 6 stages:
 | 2 | `kaniko-build-push` | `gcr.io/kaniko-project/executor` | imagen en Docker Hub |
 | 3 | `bump-gitops-image` | `alpine/git` + `mikefarah/yq` | commit pusheado + **result `commit-sha`** |
 | 4 | `wait-argocd-sync` | `bitnami/kubectl` | sync.revision verificado + Rollout en `Paused` con el image-tag correcto |
-| 5 | `run-load-test` | `grafana/k6` | **result `outcome` = passed/failed** (1000 VUs, p95/p99 thresholds) |
+| 5 | `run-load-test` | `grafana/k6` | **result `outcome` = passed/failed** (1000 VUs, p95/p99 thresholds). Gated por param `enabled` (default `false`) → skipea k6 y emite `outcome=passed` si el flag del tag no lo activó |
 | 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout `phase=Healthy` o `Degraded` (verificado) — **dueño de la verdad del release** |
 
 El pipeline **auxiliar** (`pythonapps-burn-pipeline`) corre on-demand para validar HPA capacity:

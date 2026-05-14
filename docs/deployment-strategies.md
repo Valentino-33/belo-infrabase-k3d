@@ -32,6 +32,15 @@ El **pipeline de release** también es el mismo (6 stages: clone → build-push 
 - **Stage 4 (wait-argocd)** — auto-detecta la estrategia leyendo `rollout.spec.strategy.*` y espera el estado correcto antes de avanzar.
 - **Stage 6 (promote-rollback)** — emite el patch correcto al Rollout según la estrategia.
 
+### Sobre el flag `loadtest` en el tag
+
+El comportamiento del **Stage 5 (load-test)** lo controla un flag opt-in en el tag de release: `release/<ver>/<env>/loadtest=true|false`. Default `false`.
+
+- `loadtest=false` (o ausente) → Stage 5 corre pero skipea k6 internamente y emite `outcome=passed`. Stage 6 auto-promueve sin tráfico sintético. **Usar para releases rápidos**, hotfixes, o cuando el load-test no aporta valor sobre este release específico (e.g. solo cambió un texto).
+- `loadtest=true` → Stage 5 ejecuta k6 contra el preview svc (BG) o stable svc (Canary), aplica thresholds, decide promote/abort según outcome. **Usar para releases que tocan código de hot-path** o cuando querés validar bajo carga antes del switchover.
+
+Por qué el default es `false`: el k6 fuerza CPU → HPA scale durante el Rollout, lo que enmascara la dinámica natural de BG (2 RSes idle vs 2 RSes scaled) y Canary (split por setWeight). Para validar capacidad existe el [pipeline burn](pipeline-stages.md#pipeline-auxiliar--burn-to-scale-capacity-test) que es independiente del release.
+
 ---
 
 ## Blue/Green — api01
@@ -69,11 +78,16 @@ T+1m   Argo Rollouts crea green RS con v0.7.0 + lo escala a 3 pods
        └──────────────────────────────────────────────────────┘
        Stage 4 confirma: rollout.spec.image=v0.7.0 + phase=Paused
 
-T+3m   Stage 5 corre k6 contra preview-api01.localhost:8888
-       → enrutea al preview svc → enrutea SOLO al green RS
-       → todos los hits llegan a v0.7.0
-       Si k6 pasa (errors<20%, p95<3s, p99<5s):
-         outcome=passed
+T+3m   Stage 5 (si el tag fue release/v0.7.0/dev/loadtest=true):
+         k6 corre contra preview-api01.localhost:8888
+         → enrutea al preview svc → enrutea SOLO al green RS
+         → todos los hits llegan a v0.7.0
+         Si k6 pasa (errors<20%, p95<3s, p99<5s):
+           outcome=passed
+
+       Si el tag fue release/v0.7.0/dev (sin /loadtest=true):
+         Stage 5 skipea k6 inmediatamente (log "loadtest disabled by tag flag")
+         outcome=passed por construcción → Stage 6 auto-promueve.
 
 T+3m30s Stage 6: kubectl patch rollout webserver-api01-dev \
                   --subresource=status --type=merge \
@@ -146,12 +160,16 @@ T+1m   ArgoCD aplica image.tag=v0.2.0. Argo Rollouts crea canary RS con v0.2.0.
          curl api02.localhost:8888/api02/version × 20
          → 19 hits v0.1.0, 1 hit v0.2.0 (~aproximadamente)
 
-T+3m   Stage 5 k6 pega al stable svc → recibe TRÁFICO REAL split
-       (no al preview/canary svc — eso solo daría 100% canary, no
-       muestra el comportamiento real del split).
+T+3m   Stage 5 (si tag con /loadtest=true):
+         k6 pega al stable svc → recibe TRÁFICO REAL split
+         (no al preview/canary svc — eso solo daría 100% canary, no
+         muestra el comportamiento real del split).
 
-       k6 cuenta canary_hits (informativo) y errors.
-       Si pasa → outcome=passed.
+         k6 cuenta canary_hits (informativo) y errors.
+         Si pasa → outcome=passed.
+
+       Si tag sin flag (default): skipea k6 → outcome=passed → Stage 6
+         auto-promote (canary va directo a 100% sin esperar split-test).
 
 T+3m30s Stage 6: kubectl patch rollout webserver-api02-dev \
                   --subresource=status --type=merge \

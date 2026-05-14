@@ -56,23 +56,25 @@ Terminal B:  kubectl get pods -n webserver-api01-dev -w
 Browser:     http://tekton.localhost:8888/#/pipelineruns
 ```
 
-### Disparar release
+### Disparar release CON load-test (k6 + HPA scale visible)
 
 ```bash
 cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api01
-git tag release/v0.8.0/dev
-git push origin release/v0.8.0/dev
+git tag release/v0.10.0/dev/loadtest=true
+git push origin release/v0.10.0/dev/loadtest=true
 ```
+
+> **Sobre el flag `loadtest=true`**: el 5º segmento del tag activa Stage 5 (k6 ~3min contra preview + HPA scale). Si omitís el segmento o usás `loadtest=false`, el Stage 5 se ejecuta pero skipea k6 (log "loadtest disabled by tag flag" + outcome=passed) → Stage 6 auto-promueve sin tráfico sintético. El default conservador es `false` para no ensuciar el Rollout con HPA scale en releases normales.
 
 ### Stages esperados (~3-4 min total)
 
 | Stage | Duración | Qué hace |
 |---|---|---|
 | 1. clone | ~10s | git clone @ tag |
-| 2. build-push | ~30s | Kaniko build + push `webserver-api01:v0.8.0` |
+| 2. build-push | ~30s | Kaniko build + push `webserver-api01:v0.10.0` |
 | 3. bump-gitops | ~10s | yq image.tag + git push al gitops repo |
 | 4. wait-argocd | ~20s | force-refresh ArgoCD + esperar sync + Rollout Paused |
-| 5. load-test | ~3min | k6 ramp hasta 500 VUs contra preview svc |
+| 5. load-test | ~3min | k6 ramp hasta 500 VUs contra preview svc (gated por `loadtest=true`) |
 | 6. promote-rollback | ~10s | patch status.pauseConditions=null → switchover blue→green |
 
 ### Verificación durante Stage 4-5
@@ -93,8 +95,13 @@ Después del Stage 6, ambos URLs devuelven v0.8.0.
 
 ```bash
 cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api02
-git tag release/v0.3.0/dev
-git push origin release/v0.3.0/dev
+# Release rápido sin load-test (default, ideal para mostrar el canary "limpio"):
+git tag release/v1.3.0/dev
+git push origin release/v1.3.0/dev
+
+# O con load-test explícito (k6 contra stable mientras el canary está en setWeight):
+# git tag release/v1.3.0/dev/loadtest=true
+# git push origin release/v1.3.0/dev/loadtest=true
 ```
 
 Durante el canary paused (setWeight 5 o 25), mostrar el split de tráfico:
@@ -324,7 +331,9 @@ make refresh
 ## Flujo total para la demo (~20 min)
 
 1. `make pipeline-check` (1 min)
-2. `git tag release/v0.8.0/dev` en api01 (5 min — pipeline corre solo)
-3. `git tag release/v0.3.0/dev` en api02 (5 min)
-4. `git tag burn/dev` o `make burn-test APP=webserver-api01 ENV=dev` (4 min)
+2. `git tag release/v0.10.0/dev/loadtest=true` en api01 (5 min — Blue/Green con k6 + HPA scale)
+3. `git tag release/v1.3.0/dev` en api02 (3 min — Canary limpio, sin load-test)
+4. `git tag burn/dev` o `make burn-test APP=webserver-api01 ENV=dev` (4 min — HPA capacity test independiente)
 5. Tour: Tekton Dashboard → ArgoCD → Grafana dev-cluster → Grafana pipeline → Kibana dashboard (5 min)
+
+> **Por qué cada uno con un flag distinto**: api01 muestra el path completo (k6 → HPA scale → BG switchover). api02 muestra el path "limpio" (canary sin tráfico sintético, ideal para visualizar el split por setWeight). El burn pipeline valida HPA en un escenario controlado, separado del release.

@@ -35,7 +35,7 @@ Todos los archivos viven en `charts/pythonapps/templates/pipeline-templates/`.
 | Name | Type | Default | Descripción |
 |------|------|---------|-------------|
 | `url` | string | — | URL del repo de la app (lo pasa el TriggerBinding desde `body.repository.clone_url`) |
-| `revision` | string | `main` | Ref a clonar. El TriggerBinding lo setea a `refs/tags/release/<sha>/<envs>` |
+| `revision` | string | `main` | Ref a clonar. El TriggerBinding lo setea a `refs/tags/release/<ver>/<envs>[/loadtest=<bool>]` |
 
 **Workspaces**: `output` (compartido con `kaniko-build-push`).
 
@@ -526,13 +526,17 @@ spec:
     - ref: { name: cel, kind: ClusterInterceptor }
       params:
       - name: filter
-        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/release/') && body.ref.split('/').size() >= 4"
+        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/release/') && body.ref.split('/').size() >= 4 && body.ref.split('/').size() <= 6"
       - name: overlays
         value:
         - key: image_tag
           expression: "body.ref.split('/')[3]"
         - key: environments
           expression: "body.ref.split('/').size() > 4 ? body.ref.split('/')[4] : 'dev'"
+        - key: run_load_test
+          # 5º segmento opcional. Default 'false' fail-closed: cualquier string distinta
+          # de exactamente "loadtest=true" → 'false'. Para activar k6 hay que ser explícito.
+          expression: "body.ref.split('/').size() > 5 && body.ref.split('/')[5] == 'loadtest=true' ? 'true' : 'false'"
         - key: git_revision
           expression: "body.ref"
     bindings:
@@ -552,6 +556,7 @@ spec:
   - { name: app-name, value: $(body.repository.name) }        # ← debe coincidir con app-name ArgoCD
   - { name: image-tag, value: $(extensions.image_tag) }       # ← del CEL overlay
   - { name: environments, value: $(extensions.environments) } # ← del CEL overlay
+  - { name: run-load-test, value: $(extensions.run_load_test) } # ← del CEL overlay (true/false)
   - { name: revision, value: $(extensions.git_revision) }     # ← refs/tags/release/...
 ```
 

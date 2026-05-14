@@ -162,21 +162,29 @@ kubectl -n tekton-pipelines logs -l eventlistener=github-tag-listener -f
 El CEL filter solo acepta tags con formato:
 
 ```
-refs/tags/release/<semver>/<envs>
+refs/tags/release/<semver>/<envs>[/loadtest=<bool>]
 ```
 
-Donde `<envs>` puede ser un solo env (`dev`) o varios separados por coma (`dev,staging`).
+Donde:
+- `<envs>` puede ser un solo env (`dev`) o varios separados por coma (`dev,staging`)
+- El 5º segmento `loadtest=true|false` es **opcional**. Default `false` (no correr k6)
 
-| Tag pusheado | Dispara pipeline | Motivo |
-|--------------|-----------------|--------|
-| `release/v1.0.0/dev` | ✅ Sí | formato correcto |
-| `release/v1.0.0/dev,staging` | ✅ Sí | multi-env soportado |
-| `release/v0.0.1/test` | ✅ Sí | cualquier env name |
-| `v1.0.0` | ❌ No | no empieza con `release/` |
-| `release/v1.0.0` | ❌ No | falta segmento de env |
-| `release/dev/v1.0.0` | ❌ No | orden invertido (env antes que version) |
+| Tag pusheado | Dispara | `run_load_test` | Motivo |
+|--------------|---------|-----------------|--------|
+| `release/v1.0.0/dev` | ✅ | `false` (default) | formato correcto, release rápido |
+| `release/v1.0.0/dev/loadtest=true` | ✅ | `true` | activa Stage 5 k6 |
+| `release/v1.0.0/dev/loadtest=false` | ✅ | `false` (explícito) | igual al default |
+| `release/v1.0.0/dev/loadtest=yes` | ✅ | `false` (fail-closed) | sintaxis inválida → default |
+| `release/v1.0.0/dev,staging` | ✅ | `false` | multi-env soportado |
+| `release/v0.0.1/test` | ✅ | `false` | cualquier env name |
+| `v1.0.0` | ❌ | — | no empieza con `release/` |
+| `release/v1.0.0` | ❌ | — | falta segmento de env |
+| `release/dev/v1.0.0` | ❌ | — | orden invertido (env antes que version) |
+| `release/v1.0.0/dev/loadtest=true/extra` | ❌ | — | más de 5 segmentos = inválido |
 
-> **Nota**: la **strategy** (bluegreen/canary/rollingupdate) **NO** se especifica en el tag. Viene fija del `rollout.strategy` del chart Helm de cada app y la `task-wait-argocd` la auto-detecta en vivo.
+> **Notas**:
+> - La **strategy** (bluegreen/canary/rollingupdate) **NO** se especifica en el tag. Viene fija del `rollout.strategy` del chart Helm de cada app y la `task-wait-argocd` la auto-detecta en vivo.
+> - El flag `loadtest=true` debe matchear **exactamente** ese string. Cualquier otra variante (`loadtest=1`, `loadtest`, `LOADTEST=TRUE`) cae al default `false`. Esto es deliberadamente fail-closed para evitar que typos disparen k6 por accidente.
 
 ---
 
@@ -224,8 +232,8 @@ interceptors:
     kind: ClusterInterceptor
   params:
   - name: filter
-    value: "body.ref.startsWith('refs/tags/release/') && body.ref.split('/').size() >= 4"
-  # ...resto del CEL filter actual
+    value: "body.ref.startsWith('refs/tags/release/') && body.ref.split('/').size() >= 4 && body.ref.split('/').size() <= 6"
+  # ...resto del CEL filter actual (overlays image_tag, environments, run_load_test, git_revision)
 ```
 
 Re-aplicar:

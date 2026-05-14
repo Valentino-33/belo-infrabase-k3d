@@ -333,29 +333,37 @@ Ver la [guía completa de webhook](docs/webhook-setup.md) para otras opciones (s
 
 ### Automático (vía webhook + git tag)
 
-El formato del tag que dispara el pipeline es **`refs/tags/release/<semver>/<envs>`**:
+El formato del tag que dispara el pipeline es **`refs/tags/release/<semver>/<envs>[/loadtest=<bool>]`**:
 
 ```bash
 # Ir al repo de la app (debe llamarse igual que el app-name en ArgoCD)
 cd /ruta/a/webserver-api01
 
-# Tag estándar — un env
+# Release rápido (sin load-test, default conservador)
 git tag release/v1.2.0/dev
 git push origin release/v1.2.0/dev
+
+# Release con load-test k6 explícito (corre ~3min de carga, deja HPA scale visible)
+git tag release/v1.2.0/dev/loadtest=true
+git push origin release/v1.2.0/dev/loadtest=true
 
 # Tag multi-env (envs separados por coma)
 git tag release/v1.2.0/dev,staging
 git push origin release/v1.2.0/dev,staging
 ```
 
-El CEL interceptor del EventListener filtra el push, extrae `image_tag` y `environments`, y crea el PipelineRun. La estrategia (bluegreen/canary/rollingupdate) **NO** se pasa por el tag — viene del valor `rollout.strategy` del chart Helm de la app, y el pipeline la auto-detecta inspeccionando el Rollout en vivo.
+El CEL interceptor del EventListener filtra el push, extrae `image_tag`, `environments` y `run_load_test`, y crea el PipelineRun. La estrategia (bluegreen/canary/rollingupdate) **NO** se pasa por el tag — viene del valor `rollout.strategy` del chart Helm de la app, y el pipeline la auto-detecta inspeccionando el Rollout en vivo.
 
-| Tag pusheado | `image_tag` | `environments` | Dispara pipeline |
-|--------------|-------------|----------------|------------------|
-| `release/v1.0.0/dev` | `v1.0.0` | `dev` | ✅ |
-| `release/v1.0.0/dev,staging` | `v1.0.0` | `dev,staging` | ✅ |
-| `v1.0.0` | — | — | ❌ formato inválido |
-| `release/v1.0.0` | — | — | ❌ falta env |
+| Tag pusheado | `image_tag` | `environments` | `run_load_test` | Dispara pipeline |
+|--------------|-------------|----------------|-----------------|------------------|
+| `release/v1.0.0/dev` | `v1.0.0` | `dev` | `false` (default) | ✅ — release rápido |
+| `release/v1.0.0/dev/loadtest=true` | `v1.0.0` | `dev` | `true` | ✅ — corre k6 |
+| `release/v1.0.0/dev/loadtest=false` | `v1.0.0` | `dev` | `false` (explícito) | ✅ — release rápido |
+| `release/v1.0.0/dev,staging` | `v1.0.0` | `dev,staging` | `false` | ✅ |
+| `v1.0.0` | — | — | — | ❌ formato inválido |
+| `release/v1.0.0` | — | — | — | ❌ falta env |
+
+> **Sobre el flag `loadtest`**: el default es `false` deliberadamente — el load-test fuerza HPA scale durante el Rollout, lo que "ensucia" la visualización de la estrategia (BG/Canary) en la demo. Para validar capacidad bajo carga existe un pipeline aparte (`refs/tags/burn/<env>`) que es independiente del release.
 
 > **Importante**: el nombre del repo de la app en GitHub debe coincidir con el `app-name` en ArgoCD (`webserver-api01` / `webserver-api02`) — el TriggerBinding lo extrae de `body.repository.name`.
 

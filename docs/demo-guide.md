@@ -50,14 +50,16 @@ cd /ruta/a/webserver-api01
 
 ### Paso 2 — Crear y pushear el tag
 
-El formato del tag es `release/<semver>/<env>`:
+El formato del tag es `release/<semver>/<env>[/loadtest=<bool>]`. Para esta demo queremos **mostrar el k6 corriendo contra el preview**, así que activamos el flag:
 
 ```bash
-git tag release/v1.2.0/dev
-git push origin release/v1.2.0/dev
+git tag release/v1.2.0/dev/loadtest=true
+git push origin release/v1.2.0/dev/loadtest=true
 ```
 
-> El tag dispara el webhook → EventListener filtra con CEL → extrae `image_tag=v1.2.0`, `environments=dev` → crea PipelineRun **`webserver-api01-pipelinerun-v1.2.0`** automáticamente.
+> El tag dispara el webhook → EventListener filtra con CEL → extrae `image_tag=v1.2.0`, `environments=dev`, `run_load_test=true` → crea PipelineRun **`webserver-api01-pipelinerun-v1.2.0`** automáticamente.
+>
+> Si quisieras un release rápido (sin tráfico sintético, switchover directo después de wait-argocd), usás el tag sin el flag: `git tag release/v1.2.0/dev`. El default `loadtest=false` skipea k6 en Stage 5 y auto-promueve en Stage 6 — útil para hotfixes o cuando el load-test no aporta valor sobre esta release específica.
 >
 > La **strategy** (bluegreen) no viene del tag — está fija en `rollout.strategy: bluegreen` del `values.yaml` del chart. La task `wait-argocd` la auto-detecta inspeccionando el live Rollout.
 
@@ -163,11 +165,18 @@ make demo-bluegreen
 
 ### Paso 1 — Crear y pushear el tag
 
+Para esta demo conviene el formato **sin** `loadtest=true`: la visualización del split de tráfico (5/25/50%) es más clara sin carga sintética encima, y el HPA no scalea durante los pauses del canary.
+
 ```bash
 cd /ruta/a/webserver-api02
 
+# Release rápido (canary "limpio") — default loadtest=false
 git tag release/v1.2.0/dev
 git push origin release/v1.2.0/dev
+
+# Si querés activar k6 contra el stable durante los setWeight pauses:
+# git tag release/v1.2.0/dev/loadtest=true
+# git push origin release/v1.2.0/dev/loadtest=true
 ```
 
 ### Paso 2 — Monitorear el pipeline y el Rollout

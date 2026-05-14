@@ -557,9 +557,12 @@ event 12345 didn't pass interceptor cel (filter)
 
 Solución: usar uno de los formatos válidos:
 ```bash
-git tag release/v1.0.0/dev && git push origin release/v1.0.0/dev   # release
-git tag burn/dev && git push origin burn/dev                       # burn (HPA test)
+git tag release/v1.0.0/dev && git push origin release/v1.0.0/dev                # release rápido (sin k6)
+git tag release/v1.0.0/dev/loadtest=true && git push origin release/v1.0.0/dev/loadtest=true  # release + k6
+git tag burn/dev && git push origin burn/dev                                    # burn (HPA test, pipeline aparte)
 ```
+
+> El 5º segmento del tag de release debe matchear **exactamente** `loadtest=true` para activar k6. Cualquier otra variante (`loadtest=1`, `loadtest`, `LOADTEST=TRUE`) cae al default `false` (fail-closed). Más de 5 segmentos hace que el filtro CEL rechace el tag.
 
 ---
 

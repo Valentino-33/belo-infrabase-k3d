@@ -30,7 +30,7 @@ Cada stage **bloquea** los siguientes hasta cumplir su contrato. Si cualquiera f
 | 2 | `kaniko-build-push` | `kaniko-project/executor` | imagen Docker | imagen pusheada a Docker Hub con tag `<semver>` |
 | 3 | `bump-gitops-image` | `alpine/git` + `mikefarah/yq` | gitops repo (`values.yaml` de cada env) | commit pusheado + result `commit-sha` |
 | 4 | `wait-argocd-sync` | `bitnami/kubectl` | ArgoCD Application + Rollout (cluster) | Rollout en `Paused` con `image-tag` correcto + result `strategy` |
-| 5 | `run-load-test` | `grafana/k6` | preview svc (BG/Canary) o stable svc (Rolling) | result `outcome` ∈ {passed, failed} |
+| 5 | `run-load-test` | `grafana/k6` | preview svc (BG/Canary) o stable svc (Rolling) | result `outcome` ∈ {passed, failed}. Gated por param `enabled` derivado del tag flag `loadtest=true|false` — si `false` (default), skipea k6 y emite `outcome=passed` |
 | 6 | `promote-or-rollback` | `bitnami/kubectl` | Rollout (patch subresource) | Rollout `Healthy` (promote) o `Degraded` (abort) |
 
 **El promote (Stage 6) es el dueño de la verdad del release.** Validaciones de **capacidad** (HPA scale-up) viven en un [**pipeline separado**](#pipeline-auxiliar--burn-to-scale-capacity-test) que se dispara on-demand. Ver el final de este documento.
@@ -153,6 +153,27 @@ Esto emite el result `strategy` que consume Stage 5 (para elegir script y URL) y
 ---
 
 ## Stage 5 — Load Test (¿contra qué endpoint actúa?)
+
+### Gating por flag del tag
+
+Antes de cualquier ejecución de k6, el Task evalúa el param `enabled` (derivado del flag `loadtest=true|false` del tag de release):
+
+```sh
+if [ "$ENABLED" != "true" ]; then
+  echo "STAGE 5 — run-load-test (SKIPPED)"
+  echo "Reason: tag flag loadtest=true no presente"
+  printf "passed" > "$(results.outcome.path)"
+  exit 0
+fi
+```
+
+**Comportamiento**:
+- `loadtest=true` en el tag → corre k6 como se describe abajo, outcome refleja el resultado real (passed/failed según thresholds).
+- `loadtest=false` o ausente (default) → skipea k6, emite `outcome=passed`. Stage 6 hace auto-promote sin validación de carga.
+
+**Por qué el default es `false`**: el load-test fuerza CPU → HPA scale durante el switchover, lo que enmascara la dinámica natural del Rollout (BG con 2 RSes en paralelo, Canary con setWeight progresivo). En la demo se ve más limpio el path sin scaling sintético. Para validar capacidad existe el [**pipeline burn**](#pipeline-auxiliar--burn-to-scale-capacity-test) que es independiente del release.
+
+### Si k6 corre (loadtest=true), contra qué endpoint apunta
 
 ```sh
 BASE_URL="http://${RELEASE}-stable.${NS}.svc.cluster.local:8080"
@@ -300,10 +321,23 @@ Stage 5 load-test.results.outcome         ──→  Stage 6 promote-rollback.pa
 
 ## ¿Y si quiero saltarme stages?
 
-El pipeline `pythonapps-pipeline` está cableado en orden estricto vía `runAfter:` — no hay forma de saltarse stages para un tag puntual. Decisión consciente: si necesitás un deploy sin test (hotfix p1), corré el comando equivalente manualmente:
+El pipeline `pythonapps-pipeline` está cableado en orden estricto vía `runAfter:` — no hay forma de saltarse stages estructurales (clone/build/bump/wait/promote). Pero **Stage 5 (load-test) es opt-in vía el flag `loadtest=true` del tag**:
 
 ```bash
-# Ejemplo: hotfix sin load test
+# Release rápido — Stage 5 corre pero skipea k6 internamente (~2s)
+git tag release/v1.2.0/dev
+git push origin release/v1.2.0/dev
+
+# Release con load-test — Stage 5 ejecuta k6 completo (~60-90s)
+git tag release/v1.2.0/dev/loadtest=true
+git push origin release/v1.2.0/dev/loadtest=true
+```
+
+El default `loadtest=false` cubre el caso "hotfix sin tests de carga" sin necesidad de operar fuera del pipeline. El auto-promote downstream se ejecuta normal — el outcome del Stage 5 es `passed` por construcción cuando el k6 fue skipeado.
+
+Si necesitás bypassear el pipeline entero (e.g. el cluster está caído y solo querés tocar gitops + promover manual), corré los comandos equivalentes:
+
+```bash
 # 1. Bumpear values.yaml a mano y pushear
 # 2. ArgoCD detecta y aplica
 # 3. Promover manualmente:
@@ -318,9 +352,9 @@ Eso queda **fuera** del pipeline y deja un rastro claro de que no fue un deploy 
 
 ```mermaid
 flowchart TB
-    START([Push tag<br/>refs/tags/release/v1.2.0/dev])
-    EL[EventListener<br/>CEL filter]
-    TR[PipelineRun creado]
+    START([Push tag<br/>refs/tags/release/v1.2.0/dev<br/>opc: /loadtest=true])
+    EL[EventListener<br/>CEL filter<br/>extrae run_load_test]
+    TR[PipelineRun creado<br/>param run-load-test]
 
     START --> EL --> TR
 
@@ -329,11 +363,15 @@ flowchart TB
     S2 --> S3[3. Bump GitOps<br/>commit-sha emitido]
     S3 --> S4{4. Wait ArgoCD}
 
-    S4 -->|sync@commit-sha<br/>rollout.spec@image-tag<br/>phase=Paused| S5[5. Load Test<br/>k6 vs preview/canary]
+    S4 -->|sync@commit-sha<br/>rollout.spec@image-tag<br/>phase=Paused| S5{5. Load Test<br/>enabled=run-load-test}
     S4 -->|timeout| FAIL1[Pipeline FAILED]
 
-    S5 -->|outcome=passed| S6_OK{6. Promote}
-    S5 -->|outcome=failed| S6_KO{6. Rollback}
+    S5 -->|enabled=true<br/>k6 vs preview/canary| S5K[k6 ramp + thresholds]
+    S5 -->|enabled=false default<br/>skipea k6| S5S[outcome=passed]
+
+    S5K -->|outcome=passed| S6_OK{6. Promote}
+    S5K -->|outcome=failed| S6_KO{6. Rollback}
+    S5S --> S6_OK
 
     S6_OK -->|BG: patch pauseConditions=null| HEALTHY1[Rollout Healthy]
     S6_OK -->|Canary: patch promoteFull=true| HEALTHY1
