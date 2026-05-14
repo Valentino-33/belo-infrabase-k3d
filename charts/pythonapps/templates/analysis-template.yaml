@@ -1,0 +1,65 @@
+{{- if .Values.analysis.enabled }}
+{{- if not .Values.analysis.metricPrefix }}
+{{- fail "analysis.enabled=true requires analysis.metricPrefix (e.g. api01). See values.yaml comments." }}
+{{- end }}
+# AnalysisTemplate — métricas Prometheus consultadas por Argo Rollouts durante
+# pre/post-promotion (BG) o en cada step (Canary). Si CUALQUIER metric incumple
+# successCondition más de `failureLimit` veces, el Rollout queda Degraded y NO promueve.
+#
+# Args son inyectados desde el Rollout en cada AnalysisRun:
+#   - service:   <release>-preview (durante BG prePromotion / Canary steps) o
+#                <release>-stable (durante postPromotion, tráfico real)
+#   - namespace: <app>-<env>
+#
+# Por qué dos metrics y no una sola: error-rate y latency son ortogonales — una
+# app puede ser disponible (no 5xx) pero lenta (timeout en cliente). Ambas deben pasar.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ include "pythonapps.fullname" . }}-app-health
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+spec:
+  args:
+  - name: service
+  - name: namespace
+  metrics:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Metric 1: success-rate
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Ratio de requests sin 5xx sobre el total. > 0 en el denominador evita
+  # división por cero cuando no hay tráfico (devuelve NaN → falla la condición,
+  # que es lo correcto: no querés promover algo que no recibe tráfico).
+  - name: success-rate
+    initialDelay: {{ .Values.analysis.initialDelay | quote }}
+    interval: {{ .Values.analysis.interval | quote }}
+    count: {{ .Values.analysis.count }}
+    failureLimit: {{ .Values.analysis.failureLimit }}
+    successCondition: result[0] >= {{ .Values.analysis.successRateThreshold }}
+    provider:
+      prometheus:
+        address: {{ .Values.analysis.prometheusAddress | quote }}
+        query: |
+          sum(rate({{ .Values.analysis.metricPrefix }}_requests_total{namespace="{{`{{args.namespace}}`}}",service="{{`{{args.service}}`}}",status_code!~"5.."}[1m]))
+          /
+          (sum(rate({{ .Values.analysis.metricPrefix }}_requests_total{namespace="{{`{{args.namespace}}`}}",service="{{`{{args.service}}`}}"}[1m])) > 0)
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Metric 2: latency-p95
+  # ─────────────────────────────────────────────────────────────────────────────
+  # P95 desde histogram_quantile sobre el bucket _seconds_bucket. Threshold en
+  # segundos (e.g., 1.0 = 1 segundo). Si la app no expone histogram, este metric
+  # devuelve NaN y falla (intencional: o tenés observabilidad o no promovés).
+  - name: latency-p95
+    initialDelay: {{ .Values.analysis.initialDelay | quote }}
+    interval: {{ .Values.analysis.interval | quote }}
+    count: {{ .Values.analysis.count }}
+    failureLimit: {{ .Values.analysis.failureLimit }}
+    successCondition: result[0] < {{ .Values.analysis.latencyP95Seconds }}
+    provider:
+      prometheus:
+        address: {{ .Values.analysis.prometheusAddress | quote }}
+        query: |
+          histogram_quantile(0.95, sum(rate({{ .Values.analysis.metricPrefix }}_request_duration_seconds_bucket{namespace="{{`{{args.namespace}}`}}",service="{{`{{args.service}}`}}"}[1m])) by (le))
+{{- end }}

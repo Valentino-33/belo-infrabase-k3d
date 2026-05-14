@@ -34,21 +34,104 @@ spec:
           {{- toYaml .Values.livenessProbe | nindent 10 }}
         readinessProbe:
           {{- toYaml .Values.readinessProbe | nindent 10 }}
+  {{- $fullName := include "pythonapps.fullname" . -}}
+  {{- $ns := .Release.Namespace -}}
+  {{- $analysis := .Values.analysis -}}
   {{- if eq .Values.rollout.strategy "bluegreen" }}
   strategy:
     blueGreen:
-      activeService: {{ include "pythonapps.fullname" . }}-stable
-      previewService: {{ include "pythonapps.fullname" . }}-preview
-      autoPromotionEnabled: false
-      scaleDownDelaySeconds: 30
+      activeService: {{ $fullName }}-stable
+      previewService: {{ $fullName }}-preview
+      # Con prePromotionAnalysis configurado, autoPromotionEnabled=true delega
+      # la decisión a Argo Rollouts: si el análisis pasa, switchea solo; si falla,
+      # queda Degraded sin promover. El pipeline solo observa.
+      # Cuando analysis.enabled=false (apps sin métricas), mantenemos el modo
+      # legacy donde el pipeline patchea pauseConditions=null para promover.
+      autoPromotionEnabled: {{ $analysis.enabled }}
+      # 120s da espacio al postPromotionAnalysis (count*interval ≈ 60-90s) antes
+      # del scale-down del blue. Si postPromotion falla DURANTE estos 120s,
+      # Argo aborta y blue todavía está vivo para revertir en 0 segundos.
+      scaleDownDelaySeconds: {{ if $analysis.enabled }}120{{ else }}30{{ end }}
+      {{- if $analysis.enabled }}
+      prePromotionAnalysis:
+        templates:
+        - templateName: {{ $fullName }}-app-health
+        args:
+        - name: service
+          # El preview svc enrutea 100% al green RS. Durante el k6 del Stage 5,
+          # genera tráfico contra esta URL → las métricas de la v.nueva pueblan
+          # antes del switch.
+          value: {{ $fullName }}-preview
+        - name: namespace
+          value: {{ $ns }}
+      postPromotionAnalysis:
+        templates:
+        - templateName: {{ $fullName }}-app-health
+        args:
+        - name: service
+          # Post-switch, stable svc apunta al green RS y recibe tráfico REAL.
+          # Si los thresholds fallan acá → abort automático antes del scaleDown
+          # de los 120s → blue todavía vivo → rollback instantáneo sin pipeline.
+          value: {{ $fullName }}-stable
+        - name: namespace
+          value: {{ $ns }}
+      {{- end }}
   {{- else if eq .Values.rollout.strategy "canary" }}
   strategy:
     canary:
-      stableService: {{ include "pythonapps.fullname" . }}-stable
-      canaryService: {{ include "pythonapps.fullname" . }}-preview
+      stableService: {{ $fullName }}-stable
+      canaryService: {{ $fullName }}-preview
       trafficRouting:
         nginx:
-          stableIngress: {{ include "pythonapps.fullname" . }}-stable
+          stableIngress: {{ $fullName }}-stable
+      {{- if $analysis.enabled }}
+      # Canary multi-step con análisis automático en cada setWeight. Argo Rollouts
+      # promueve al siguiente step solo si el análisis del step anterior pasa.
+      # El pipeline pasa de orquestador (promote/abort) a observador (espera
+      # phase=Healthy en el Stage 6). Idiomático y enterprise-grade.
+      steps:
+      - setWeight: 5
+      - analysis:
+          templates:
+          - templateName: {{ $fullName }}-app-health
+          args:
+          - name: service
+            # Canary svc tiene SOLO el canary RS; las métricas son puras del
+            # canary RS aunque represente solo 5% del tráfico real.
+            value: {{ $fullName }}-preview
+          - name: namespace
+            value: {{ $ns }}
+      - setWeight: 25
+      - analysis:
+          templates:
+          - templateName: {{ $fullName }}-app-health
+          args:
+          - name: service
+            value: {{ $fullName }}-preview
+          - name: namespace
+            value: {{ $ns }}
+      - setWeight: 50
+      - analysis:
+          templates:
+          - templateName: {{ $fullName }}-app-health
+          args:
+          - name: service
+            value: {{ $fullName }}-preview
+          - name: namespace
+            value: {{ $ns }}
+      postPromotionAnalysis:
+        templates:
+        - templateName: {{ $fullName }}-app-health
+        args:
+        - name: service
+          # Post 100%, el canary RS pasó a ser stable. Medimos sobre stable svc
+          # que ahora recibe 100% del tráfico real.
+          value: {{ $fullName }}-stable
+        - name: namespace
+          value: {{ $ns }}
+      {{- else }}
+      # Modo legacy (analysis.enabled=false): pause:{} en cada step. El pipeline
+      # promueve con kubectl patch promoteFull=true desde el Stage 6.
       steps:
       - setWeight: 5
       - pause: {}
@@ -56,11 +139,12 @@ spec:
       - pause: {}
       - setWeight: 50
       - pause: {}
+      {{- end }}
   {{- else }}
   strategy:
     canary:
-      stableService: {{ include "pythonapps.fullname" . }}-stable
-      canaryService: {{ include "pythonapps.fullname" . }}-preview
+      stableService: {{ $fullName }}-stable
+      canaryService: {{ $fullName }}-preview
       steps:
       - setWeight: 100
   {{- end }}

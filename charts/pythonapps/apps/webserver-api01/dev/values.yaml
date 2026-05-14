@@ -55,3 +55,11 @@ serviceMonitor:
   interval: 30s
   pathPrefix: api01
   metricsPath: /api01/metrics
+# Argo Rollouts AnalysisTemplate — pre+postPromotion contra métricas Prometheus.
+# Habilitado en dev para ejercitar el path enterprise (autoPromotionEnabled=true,
+# scaleDownDelay=120s para dar espacio al postPromotionAnalysis). Si las queries
+# success-rate ≥ 0.99 y latency-p95 < 1s pasan → switch automático. Si fallan →
+# Rollout Degraded sin promote. El Stage 6 del pipeline solo observa.
+analysis:
+  enabled: true
+  metricPrefix: api01

@@ -64,3 +64,31 @@ tekton:
   enabled: false   # true solo via make tekton-apply — evita que ArgoCD gestione estos recursos
   dockerhubUser: valentinobruno
   gitopsRepoUrl: https://github.com/Valentino-33/belo-infrabase-k3d
+
+# Argo Rollouts AnalysisTemplate — métricas Prometheus para promote/abort automático.
+# Cuando enabled=true, el Rollout incluye prePromotionAnalysis (BG) o analysis steps (Canary)
+# que consultan Prometheus en lugar de depender solo del k6 del pipeline. Si el análisis
+# falla, Argo Rollouts marca el Rollout Degraded y NO promociona — sin intervención humana.
+#
+# El modelo es enterprise-grade: el pipeline genera carga (Stage 5 opcional), Argo Rollouts
+# observa métricas reales del servicio bajo prueba, y decide. El Stage 6 del pipeline pasa
+# de "dueño del promote" a "observador del fallo".
+analysis:
+  enabled: false
+  # URL del Prometheus accesible desde el Rollouts controller (namespace argo-rollouts).
+  prometheusAddress: "http://kube-prometheus-kube-prome-prometheus.monitoring.svc.cluster.local:9090"
+  # Prefix de las métricas que expone la app (e.g., api01_requests_total → metricPrefix: api01).
+  # REQUERIDO cuando enabled=true.
+  metricPrefix: ""
+  # Cuánto esperar antes del primer sample (deja que el RS reciba tráfico).
+  initialDelay: "30s"
+  # Cuánto entre samples consecutivos del análisis.
+  interval: "20s"
+  # Cuántos samples se evalúan antes de declarar success/failure.
+  count: 3
+  # successCondition: success-rate >= 99% (las requests con status_code !~ "5..")
+  successRateThreshold: 0.99
+  # successCondition: latency p95 < 1.0s
+  latencyP95Seconds: 1.0
+  # failureLimit: cuántos samples FAILED tolera antes de abortar el análisis.
+  failureLimit: 1

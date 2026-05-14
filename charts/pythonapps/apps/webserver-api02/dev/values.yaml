@@ -52,3 +52,10 @@ serviceMonitor:
   interval: 30s
   pathPrefix: api02
   metricsPath: /api02/metrics
+# Argo Rollouts AnalysisTemplate — análisis automático en CADA setWeight del canary.
+# steps: [5% → analysis → 25% → analysis → 50% → analysis → 100% → postAnalysis].
+# Argo Rollouts avanza al siguiente step solo si el análisis previo pasa; aborta
+# automáticamente si falla. El Stage 6 del pipeline solo observa phase=Healthy.
+analysis:
+  enabled: true
+  metricPrefix: api02
