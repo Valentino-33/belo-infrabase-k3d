@@ -6,10 +6,22 @@ metadata:
   namespace: tekton-pipelines
 spec:
   description: |
-    Stage 6 — dueño de la verdad del release. Patches directos al Rollout
-    según outcome + strategy. Sin plugin kubectl-argo-rollouts (los mismos
-    patches que el plugin emite internamente). Verifica transición a
-    Healthy (passed) o Degraded (failed).
+    Stage 6 — promote-or-rollback. Detecta automáticamente entre dos modos:
+
+      MODO ENTERPRISE (analysis.enabled=true en el chart):
+        El Rollout tiene prePromotionAnalysis (BG) o steps[*].analysis (Canary)
+        configurados → Argo Rollouts es el dueño del promote. El controller
+        consulta Prometheus, decide promote/abort, y si falla hace rollback
+        automático antes del scaleDown del blue (BG) o aborta el canary.
+        Este task solo OBSERVA: espera phase=Healthy (success) o Degraded (fail).
+
+      MODO LEGACY (analysis.enabled=false o no soportado):
+        Este task hace los patches directos (mismos que emite el plugin
+        kubectl-argo-rollouts internamente). Promote o abort según `outcome`
+        del Stage 5.
+
+    La detección es por introspección del Rollout vivo — no requiere pasar
+    params extra al pipeline.
   params:
   - name: app-name
     type: string
@@ -22,6 +34,13 @@ spec:
   - name: outcome
     type: string
     default: passed
+  - name: enterprise-timeout
+    type: string
+    default: "600"
+    description: |
+      Timeout (segundos) para esperar phase=Healthy/Degraded en MODO ENTERPRISE.
+      Default 600s (10min): canary multi-step con 3 análisis de ~60s c/u + propagación.
+      Para apps con SLOs lentos, override desde el TriggerTemplate.
   stepTemplate:
     env:
     - name: HOME
@@ -47,7 +66,28 @@ spec:
       ROLLOUT="${APP}-${PRIMARY_ENV}"
       STRATEGY="$(params.strategy)"
       OUTCOME="$(params.outcome)"
-      TIMEOUT=180
+      LEGACY_TIMEOUT=180
+      ENTERPRISE_TIMEOUT=$(params.enterprise-timeout)
+
+      # ─────────────────────────────────────────────────────────────────────
+      # Detección de modo: enterprise (Argo decide) vs legacy (pipeline decide)
+      # ─────────────────────────────────────────────────────────────────────
+      # BG → buscar prePromotionAnalysis.templates definida.
+      # Canary → buscar steps con .analysis (no solo pause:{}).
+      MODE="legacy"
+      case "$STRATEGY" in
+        bluegreen)
+          HAS_ANALYSIS=$(kubectl get rollout "$ROLLOUT" -n "$NS" \
+            -o jsonpath='{.spec.strategy.blueGreen.prePromotionAnalysis.templates[0].templateName}' 2>/dev/null || echo "")
+          [ -n "$HAS_ANALYSIS" ] && MODE="enterprise"
+          ;;
+        canary)
+          # jsonpath con filtro: contar steps que tienen analysis. Si > 0 → enterprise.
+          ANALYSIS_STEPS=$(kubectl get rollout "$ROLLOUT" -n "$NS" \
+            -o jsonpath='{.spec.strategy.canary.steps[?(@.analysis)].analysis.templates[0].templateName}' 2>/dev/null || echo "")
+          [ -n "$ANALYSIS_STEPS" ] && MODE="enterprise"
+          ;;
+      esac
 
       echo "================================================================"
       echo "  STAGE 6 — promote-or-rollback"
@@ -55,9 +95,15 @@ spec:
       echo "  Rollout:    $ROLLOUT"
       echo "  Namespace:  $NS"
       echo "  Strategy:   $STRATEGY"
-      echo "  Outcome:    $OUTCOME (de Stage 5 load test)"
-      echo "  Phase target: Healthy (si passed) o Degraded (si failed)"
-      echo "  Timeout:    ${TIMEOUT}s"
+      echo "  Mode:       $MODE"
+      if [ "$MODE" = "enterprise" ]; then
+        echo "              (Argo Rollouts AnalysisRun controla el promote;"
+        echo "               este task solo observa phase=Healthy/Degraded)"
+        echo "  Timeout:    ${ENTERPRISE_TIMEOUT}s"
+      else
+        echo "  Outcome:    $OUTCOME (de Stage 5 load test)"
+        echo "  Timeout:    ${LEGACY_TIMEOUT}s"
+      fi
       echo "================================================================"
 
       # Production gate: no auto-promote — annotate la ArgoCD app y salir.
@@ -83,10 +129,33 @@ spec:
         exit 0
       fi
 
+      # wait_terminal espera Healthy o Degraded (cualquier fase terminal) y devuelve
+      # 0/1 según corresponda. Útil en modo enterprise donde no sabemos a priori
+      # cuál fase va a llegar — Argo decide via AnalysisRun.
+      wait_terminal() {
+        TIMEOUT="$1"
+        ELAPSED=0
+        while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+          PHASE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+          MSG=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.message}' 2>/dev/null || echo "")
+          STEP=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.currentStepIndex}' 2>/dev/null || echo "")
+          echo "  [${ELAPSED}s] phase=$PHASE step=$STEP msg=$(echo "$MSG" | head -c 80)"
+          case "$PHASE" in
+            Healthy)   return 0 ;;
+            Degraded)  return 1 ;;
+          esac
+          sleep 10
+          ELAPSED=$((ELAPSED + 10))
+        done
+        echo "  ✗ TIMEOUT: rollout no llegó a fase terminal en ${TIMEOUT}s (último: $PHASE)"
+        return 1
+      }
+
+      # wait_phase: usada por el path LEGACY (sabemos qué phase esperar).
       wait_phase() {
         EXPECTED="$1"
         ELAPSED=0
-        while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+        while [ "$ELAPSED" -lt "$LEGACY_TIMEOUT" ]; do
           PHASE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
           ACTIVE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.blueGreen.activeSelector}' 2>/dev/null || echo "")
           STABLE=$(kubectl get rollout "$ROLLOUT" -n "$NS" -o jsonpath='{.status.stableRS}' 2>/dev/null || echo "")
@@ -95,10 +164,40 @@ spec:
           sleep 5
           ELAPSED=$((ELAPSED + 5))
         done
-        echo "  ✗ TIMEOUT: rollout $ROLLOUT no llegó a phase=$EXPECTED en ${TIMEOUT}s (último: $PHASE)"
+        echo "  ✗ TIMEOUT: rollout $ROLLOUT no llegó a phase=$EXPECTED en ${LEGACY_TIMEOUT}s (último: $PHASE)"
         return 1
       }
 
+      # ─────────────────────────────────────────────────────────────────────
+      # MODO ENTERPRISE — Argo Rollouts decide via AnalysisRun
+      # ─────────────────────────────────────────────────────────────────────
+      if [ "$MODE" = "enterprise" ]; then
+        echo "→ Observando Rollout (Argo Rollouts controla promote/abort via análisis)"
+        if wait_terminal "$ENTERPRISE_TIMEOUT"; then
+          echo ""
+          echo "================================================================"
+          echo "  ✓ Stage 6 OK — Rollout Healthy (análisis Prometheus pasó)"
+          echo "================================================================"
+          exit 0
+        else
+          echo ""
+          # Listar AnalysisRuns del Rollout para mostrar cuál falló y por qué.
+          echo "→ AnalysisRuns asociados al Rollout:"
+          kubectl get analysisrun -n "$NS" -l "rollouts-pod-template-hash" \
+            -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,MESSAGE:.status.message 2>/dev/null || true
+          echo ""
+          echo "================================================================"
+          echo "  ✗ Stage 6 — Rollout Degraded (análisis Prometheus FALLÓ)"
+          echo "================================================================"
+          echo "  Argo Rollouts hizo abort automático. Stable RS sigue sirviendo."
+          echo "  Para inspeccionar: kubectl describe analysisrun -n $NS"
+          exit 1
+        fi
+      fi
+
+      # ─────────────────────────────────────────────────────────────────────
+      # MODO LEGACY — el pipeline patchea según $OUTCOME del Stage 5
+      # ─────────────────────────────────────────────────────────────────────
       case "$STRATEGY" in
         rollingupdate)
           if [ "$OUTCOME" = "failed" ]; then

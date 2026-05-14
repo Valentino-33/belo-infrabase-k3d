@@ -83,6 +83,12 @@ rules:
 - apiGroups: ["argoproj.io"]
   resources: ["applications"]
   verbs: ["get", "list", "watch", "patch", "update"]
+# Stage 6 modo enterprise: leer AnalysisRuns (generados por Argo Rollouts a
+# partir de los AnalysisTemplate) para reportar cuál falló cuando el Rollout
+# queda Degraded. Solo read — la creación/eliminación la hace el controller.
+- apiGroups: ["argoproj.io"]
+  resources: ["analysisruns", "analysistemplates"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "patch"]
