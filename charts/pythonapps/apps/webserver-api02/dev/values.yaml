@@ -3,7 +3,7 @@ app:
   namespace: "webserver-api02-dev"
 image:
   repository: docker.io/valentinobruno/webserver-api02
-  tag: "v1.3.0"
+  tag: "v1.4.0"
   pullPolicy: IfNotPresent
 rollout:
   strategy: canary
