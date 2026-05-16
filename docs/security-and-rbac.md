@@ -82,20 +82,9 @@ UID/GID 65532 es la convención común de **nonroot** en distros minimal (distro
 
 Las imágenes minimal definen HOME=/root por default. Como nonroot, no se puede escribir a `/root`. Tekton monta `/tekton/home` como writable para cualquier UID y muchos scripts del pipeline necesitan HOME (e.g., git escribe `~/.gitconfig`).
 
-### Caso especial: `task-promote-rollback`
+### Nota: no overridear el `PATH` a nivel `stepTemplate`
 
-El script descargaba originalmente `kubectl-argo-rollouts` plugin y lo instalaba en `/usr/local/bin` — falla como nonroot. La fix en su momento fue:
-
-```sh
-mkdir -p "$HOME/bin"
-curl -sL ... -o "$HOME/bin/kubectl-argo-rollouts"
-chmod +x "$HOME/bin/kubectl-argo-rollouts"
-export PATH="$HOME/bin:$PATH"   # ← prepend en el script, NO override global en stepTemplate
-```
-
-Después se eliminó el plugin completo (ver [pipeline-internals.md → promote-or-rollback](pipeline-internals.md#6-promote-or-rollback)), pero el `export PATH` quedó por si una futura Task necesita binarios en $HOME/bin.
-
-> **Trampa**: setear `env: PATH=...` a nivel `stepTemplate` (global del task) **rompe** `kubectl` en la imagen `bitnami/kubectl`, cuya bin vive en `/opt/bitnami/kubectl/bin` y no está en el PATH default. Hay que hacer el override solo en el script específico que lo necesita.
+Si una Task futura necesita binarios extra (e.g. en `$HOME/bin`), el `export PATH` debe hacerse **dentro del script del step**, no como `env: PATH=...` en el `stepTemplate`. Un override global de `PATH` rompe `kubectl` en la imagen `bitnami/kubectl`, cuya binaria vive en `/opt/bitnami/kubectl/bin` y quedaría fuera del PATH.
 
 ### Kaniko sí corre como root
 
@@ -261,7 +250,7 @@ Implementación pendiente con `Cilium NetworkPolicy` o el built-in `NetworkPolic
 |------|--------------|------------|
 | PodSecurity Admission (PSA) namespace | ✅ `tekton-pipelines=baseline` | Bloquea hostPath/hostNetwork/privileged |
 | securityContext compliant con `restricted` en Tasks | ✅ 5 de 6 Tasks (no kaniko) | UID 65532, drop ALL, seccompProfile=RuntimeDefault |
-| Sin descargas externas en runtime | ✅ kubectl patch directo en lugar del plugin | Reduce attack surface y tiempo |
+| Sin descargas externas en runtime | ✅ kubectl patch directo al Rollout | Sin binarios externos — reduce attack surface |
 | Token GitHub en Secret (no en image/spec) | ✅ secret `github-token` | Montado read-only |
 | RBAC mínimo por SA | ✅ ClusterRole por uso específico | Sin `cluster-admin` ni `*` permisos |
 | Validación HMAC del webhook | ⚠️ Opcional | Documentado pero no activado por default |

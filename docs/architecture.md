@@ -1,6 +1,6 @@
 # Arquitectura — belo-infrabase-k3d
 
-Este documento contiene cuatro diagramas: la **topología del cluster k3d**, los **componentes internos**, el **flujo CI/CD completo end-to-end** (con la fix del race condition), y el **modelo de promote-rollback**. GitHub renderiza Mermaid nativamente.
+Este documento contiene cuatro diagramas: la **topología del cluster k3d**, los **componentes internos**, el **flujo CI/CD completo end-to-end**, y el **modelo de promote-rollback**. GitHub renderiza Mermaid nativamente.
 
 ---
 
@@ -165,9 +165,9 @@ Esto garantiza que las URLs de load test (`http://<app>-<env>-stable.<namespace>
 
 ---
 
-## 3. Flujo CI/CD completo (con race-condition fix)
+## 3. Flujo CI/CD completo
 
-Este diagrama refleja la implementación **actual** del pipeline profesional, incluyendo la fix del race condition ArgoCD ↔ Pipeline y el promote vía `kubectl patch` directo en lugar del plugin.
+Este diagrama refleja el flujo end-to-end del release pipeline: desde el push del tag hasta la nueva versión sirviendo tráfico, incluyendo la sincronización con ArgoCD y el promote vía `kubectl patch` directo al status subresource.
 
 ```mermaid
 sequenceDiagram
@@ -207,11 +207,11 @@ sequenceDiagram
     TR->>GR: git clone (con token<br/>de secret github-token)
     TR->>GR: yq: .image.tag = v1.2.0<br/>en values.yaml de cada env
     TR->>GR: git commit + push
-    Note over TR: 🔑 emite result:<br/>commit-sha = <full SHA>
+    Note over TR: emite result:<br/>commit-sha = <full SHA>
     end
 
     rect rgb(254,243,199)
-    Note over TR: Stage 4 — wait-argocd (~20s)<br/>RACE-CONDITION FIX
+    Note over TR: Stage 4 — wait-argocd (~20s)
     TR->>AC: kubectl annotate app<br/>argocd.argoproj.io/refresh=normal
     Note over AC: ArgoCD fuerza re-fetch<br/>del gitops (sin esperar polling 3min)
     AC->>GR: git fetch
@@ -264,7 +264,7 @@ sequenceDiagram
     end
     end
 
-    Note over Dev,K6: ✅ Legacy ~2-3 min · Enterprise ~5-6 min (incluye<br/>pre+post analysis BG / 4 AnalysisRun en canary multi-step)
+    Note over Dev,K6: Legacy ~2-3 min · Enterprise ~5-6 min (incluye<br/>pre+post analysis BG / 4 AnalysisRun en canary multi-step)
 ```
 
 ### Convención de tag (real)
@@ -344,7 +344,7 @@ kubectl delete pipelinerun webserver-api01-pipelinerun-v1.2.0 -n tekton-pipeline
 
 ---
 
-## 4. Modelo de promote-rollback (sin plugin)
+## 4. Modelo de promote-rollback
 
 Comparativa de los tres caminos del Stage 6 según strategy + outcome.
 
@@ -375,8 +375,8 @@ flowchart TB
     C_F --> VERIFY_KO
     R_F --> VERIFY_KO
 
-    VERIFY_OK --> END_OK[Pipeline ✅]
-    VERIFY_KO --> END_KO[Pipeline ✅<br/>rollback efectivo]
+    VERIFY_OK --> END_OK[Pipeline OK]
+    VERIFY_KO --> END_KO[Pipeline OK<br/>rollback efectivo]
 
     classDef patch fill:#fef9c3,stroke:#ca8a04
     classDef ok fill:#dcfce7,stroke:#16a34a
@@ -387,9 +387,9 @@ flowchart TB
     class END_KO,VERIFY_KO ko
 ```
 
-### Por qué patches directos en lugar del plugin
+### Por qué patches directos al status subresource
 
-El plugin `kubectl-argo-rollouts promote` reportaba `rollout 'X' promoted` pero el Rollout volvía a `BlueGreenPause` ~10s después — el switchover no se persistía. Los **mismos patches que el plugin emite internamente** ([código fuente](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)) aplicados directo vía `kubectl` sí persisten:
+El Stage 6 promueve y aborta con `kubectl patch` directo al Rollout — los **mismos patches que el plugin `kubectl-argo-rollouts` emite internamente** ([código fuente](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)):
 
 | Acción | Patch | Subresource |
 |--------|-------|-------------|
@@ -397,10 +397,10 @@ El plugin `kubectl-argo-rollouts promote` reportaba `rollout 'X' promoted` pero 
 | Canary promote-full | `{"status":{"promoteFull":true}}` | `status` |
 | Abort (cualquier strategy) | `{"spec":{"abort":true}}` | (default) |
 
-Ventajas adicionales:
-- Sin descarga de binarios externos (~15s ahorrados por run)
-- Sin manipular PATH (que rompía `kubectl` en la imagen `bitnami/kubectl`)
-- Sin dependencias adicionales en la SA — solo `patch` sobre `rollouts` y `rollouts/status` (que ya tenía)
+Ventajas:
+- Sin descarga de binarios externos en runtime (~15s más rápido por run)
+- Sin manipular el `PATH` de la imagen `bitnami/kubectl`
+- RBAC mínimo en la SA — solo `patch` sobre `rollouts` y `rollouts/status`
 
 ---
 

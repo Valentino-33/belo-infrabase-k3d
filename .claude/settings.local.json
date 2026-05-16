@@ -87,7 +87,12 @@
       "Bash(curl -s http://api01.localhost:8888/api01/version)",
       "Bash(curl -s http://api01.localhost:8888/api01/hello)",
       "Bash(curl -s http://api02.localhost:8888/api02/version)",
-      "Bash(curl -s http://api02.localhost:8888/api02/items)"
+      "Bash(curl -s http://api02.localhost:8888/api02/items)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('Conditions:'\\); [print\\(' -', c.get\\('type'\\),':',c.get\\('message',''\\)[:200]\\) for c in d['status'].get\\('conditions',[]\\)]\")",
+      "Bash(python -c \"import sys,yaml; d=yaml.safe_load\\(sys.stdin\\); r=[x for x in d['status'].get\\('resources',[]\\) if x.get\\('status'\\)=='OutOfSync']; print\\(r\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(shutdown /s /t 20 /c \"Apagado solicitado via Claude Code - cluster k3d detenido OK\")",
+      "PowerShell(shutdown.exe /s /t 25 /c \"Apagado solicitado - cluster k3d detenido OK, trabajo pusheado\"; Write-Output \"Apagado programado en 25s. Para cancelar a tiempo: shutdown /a\")"
     ]
   }
 }

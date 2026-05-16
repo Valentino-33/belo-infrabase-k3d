@@ -39,14 +39,10 @@ make cluster-down   # elimina cluster y volúmenes Docker
 make cluster-up     # levanta de cero — los addons (incluyendo Tekton Dashboard) se reinstalan automáticamente
 make secrets-apply DOCKERHUB_USER=<user> DOCKERHUB_TOKEN=<token> GITHUB_TOKEN=<token>
 make images-initial DOCKERHUB_USER=<user>
-make bootstrap      # ArgoCD root app + Tekton pipeline + dashboards Grafana
+make bootstrap      # ArgoCD root app + Tekton pipelines + ingress + dashboards Grafana
 ```
 
-> **Importante después de cualquier reinstalación de Tekton**: el namespace `tekton-pipelines` vuelve a `pod-security.kubernetes.io/enforce=restricted`. Hay que bajarlo a `baseline` para que kaniko funcione:
-> ```bash
-> kubectl label namespace tekton-pipelines \
->   pod-security.kubernetes.io/enforce=baseline --overwrite
-> ```
+> `make tekton-apply` (que corren tanto `make bootstrap` como `make refresh`) deja el namespace `tekton-pipelines` en `pod-security.kubernetes.io/enforce=baseline` — necesario para que kaniko pueda correr como root. No hay paso manual extra.
 
 ---
 
@@ -64,11 +60,13 @@ make bootstrap      # ArgoCD root app + Tekton pipeline + dashboards Grafana
 | `make cluster-info` | URLs de UIs, passwords, comandos útiles | Quick reference |
 | `make addons` | Instala/actualiza todos los addons Helm | Re-instalar addons sin recrear el cluster |
 | `make helm-repos` | Agrega y actualiza repos Helm | Lo hace automáticamente cluster-up |
-| `make bootstrap` | Aplica root ArgoCD App + pipeline Tekton | Después de cluster-up |
-| `make tekton-apply` | Aplica Tasks, Pipeline y Triggers | Re-aplicar si cambian los templates |
+| `make bootstrap` | Aplica root ArgoCD App + Tekton pipelines + ingress del Dashboard + dashboards Grafana | Después de cluster-up |
+| `make tekton-apply` | Aplica Tasks, Pipelines y Triggers (release + burn) y deja el PSA en baseline | Re-aplicar si cambian los templates |
+| `make pipeline-check` | Verifica pipelines, triggers y EventListener registrados | Antes de una demo |
 | `make secrets` | Muestra instrucciones para crear secretos | Referencia |
 | `make secrets-apply` | Crea secretos de DockerHub y GitHub | Antes del primer pipeline-run |
-| `make pipeline-run` | Dispara pipeline manual | Testing del CI/CD sin webhook |
+| `make pipeline-run` | Dispara el release pipeline manual | Testing del CI/CD sin webhook |
+| `make release` | Imprime las instrucciones del tag git de release | Referencia |
 | `make tunnel` | ngrok con `--host-header=tekton-webhook.localhost` | Exponer EventListener a internet |
 | `make images-initial` | Build + push de api01:latest y api02:latest | Antes del bootstrap |
 | `make port-forward` | Port-forward a todas las UIs | Acceso local de fallback (si nginx no anda) |

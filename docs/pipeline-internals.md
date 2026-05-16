@@ -161,18 +161,9 @@ SHA=$(git rev-parse HEAD)
 printf "%s" "$SHA" > "$(results.commit-sha.path)"
 ```
 
-**Bug fixed: token doble en URL del remote**:
+**Por qué el push URL se construye desde el param y no desde el remote del clone**:
 
-El step `clone-gitops` clona con `https://x-access-token:TOKEN@github.com/...` como URL del remote `origin`. La versión anterior del `commit-and-push` hacía:
-
-```sh
-# ANTERIOR (roto):
-AUTH_URL=$(git remote get-url origin | sed "s|https://|https://x-access-token:${TOKEN}@|")
-```
-
-Eso produce `https://x-access-token:NEW@x-access-token:OLD@github.com/...` — dos `@`. curl parsea el **primer** `@` como fin de userinfo, entonces interpreta `x-access-token` como host y `OLD@github.com/...` como port → falla con `URL rejected: Port number was not a decimal number`.
-
-Fix: construir el push URL desde `$(params.gitops-repo-url)` (que es la URL pristine del Pipeline param, sin auth).
+El step `clone-gitops` deja el remote `origin` con el token embebido (`https://x-access-token:TOKEN@github.com/...`). Si `commit-and-push` reusara ese remote y le volviera a inyectar el token, la URL resultante tendría dos `@` y `curl` la rechazaría (`URL rejected: Port number was not a decimal number`). Por eso el push URL se computa desde `$(params.gitops-repo-url)` — la URL pristine del Pipeline param, sin auth — y se le inyecta el token una sola vez.
 
 ---
 
@@ -202,7 +193,7 @@ Fix: construir el push URL desde `$(params.gitops-repo-url)` (que es la URL pris
 ```sh
 APP_CR="${APP}-${PRIMARY_ENV}"   # ej: webserver-api01-dev
 
-# 🔑 Force refresh — sin esto, ArgoCD podría tardar hasta 3min en detectar el commit
+# Force refresh — sin esto, ArgoCD podría tardar hasta 3min en detectar el commit
 if [ -n "$EXPECTED_SHA" ]; then
   kubectl annotate application "$APP_CR" -n argocd \
     argocd.argoproj.io/refresh=normal --overwrite
@@ -216,7 +207,7 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
 
   if [ "$SYNC" = "Synced" ]; then
     if [ -z "$EXPECTED_SHA" ] || [ "$REVISION" = "$EXPECTED_SHA" ]; then
-      break  # ✅ Synced en el commit correcto
+      break  # Synced en el commit correcto
     fi
     echo "  (synced pero en revision vieja, esperando $EXPECTED_SHA)"
   fi
@@ -429,16 +420,12 @@ case "$STRATEGY" in
 esac
 ```
 
-**Por qué no usar el plugin `kubectl argo rollouts promote`**:
+**Por qué `kubectl patch` directo y no el plugin `kubectl argo rollouts promote`**:
 
-El plugin reportaba `rollout 'X' promoted` y exit 0, pero el Rollout volvía a `BlueGreenPause` ~10s después. Causa exacta no aislada (posiblemente race con ArgoCD reaplicando el spec; posiblemente el plugin patcheaba un campo distinto al subresource correcto).
-
-Los patches directos al status subresource son los mismos que el plugin emite internamente (según [`promote.go` del repo argo-rollouts](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)) y persisten correctamente.
-
-Ventajas:
-- Sin descarga de binarios externos (~15s ahorrados por run)
-- Sin override del `PATH` (que rompía `kubectl` en la imagen `bitnami/kubectl` cuya bin está en `/opt/bitnami/kubectl/bin`)
-- Menos superficie de fallo
+El task aplica directamente al status subresource los mismos patches que el plugin emite internamente (según [`promote.go` del repo argo-rollouts](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)). Ventajas:
+- Sin descarga de binarios externos en runtime (~15s más rápido por run)
+- Sin override del `PATH` de la imagen `bitnami/kubectl` (cuya bin vive en `/opt/bitnami/kubectl/bin`)
+- Menos superficie de fallo y RBAC mínimo
 
 ---
 
@@ -534,8 +521,8 @@ spec:
     params:
     - { name: app-name, value: $(params.app-name) }
     - { name: environments, value: $(params.environments) }
-    - { name: expected-commit-sha, value: $(tasks.bump-gitops.results.commit-sha) }  # 🔑
-    - { name: image-tag, value: $(params.image-tag) }                                 # 🔑
+    - { name: expected-commit-sha, value: $(tasks.bump-gitops.results.commit-sha) }
+    - { name: image-tag, value: $(params.image-tag) }
 
   - name: load-test
     taskRef: { name: run-load-test }

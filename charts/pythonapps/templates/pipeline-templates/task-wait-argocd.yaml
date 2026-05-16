@@ -6,8 +6,8 @@ metadata:
   namespace: tekton-pipelines
 spec:
   description: |
-    Stage 4 — race condition fix. Garantiza que el Stage 5 (load test) corra
-    sobre la versión NUEVA, no la vieja. Verifica:
+    Stage 4 — garantiza que el Stage 5 (load test) corra sobre la versión
+    NUEVA, no la vieja. Verifica:
       (a) ArgoCD aplicó EL commit del Stage 3 (sync.revision == commit-sha)
       (b) Rollout.spec.image-tag == tag esperado
       (c) Rollout en el estado correcto según strategy + modo:

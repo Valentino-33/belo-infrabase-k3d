@@ -122,7 +122,7 @@ spec:
 
 El `postPromotionAnalysis` es la pieza clave del rollback automático: corre durante los 120s de `scaleDownDelaySeconds`, **mientras el blue RS todavía está vivo**. Si las métricas del green (ya sirviendo tráfico real) fallan, Argo Rollouts aborta → el blue sigue ahí → rollback instantáneo, cero downtime, sin intervención humana.
 
-### Flujo de un release — modo ENTERPRISE (api01-dev, validado E2E)
+### Flujo de un release — modo ENTERPRISE (api01-dev)
 
 ```
 T=0     Estado inicial — solo blue (v0.10.0) está vivo
@@ -153,7 +153,7 @@ T+4m    postPromotionAnalysis → Successful (el k6 sigue generando tráfico que
 T+4m    Pasados los 120s de scaleDownDelay, blue eliminado. Pipeline termina.
 ```
 
-> **Timeline real del E2E v0.11.0**: RS nuevo @T+75s · prePromotionAnalysis @T+90s · `Successful` + switch @T+165s · postPromotionAnalysis `Successful` @T+240s · pipeline `Succeeded` @T+285s.
+> **Timeline de ejemplo**: RS nuevo @T+75s · prePromotionAnalysis @T+90s · `Successful` + switch @T+165s · postPromotionAnalysis `Successful` @T+240s · pipeline `Succeeded` @T+285s.
 
 ### Si el análisis falla (modo enterprise)
 
@@ -211,7 +211,7 @@ canary:
 
 > Canary **no tiene** `prePromotionAnalysis`/`postPromotionAnalysis` como campos top-level (eso es exclusivo de BlueGreen — su switch es atómico). En canary el análisis va **inline en los steps**. El último `analysis` (tras `setWeight: 100`) cumple la función de post-promotion. Argo Rollouts avanza al siguiente step **solo si** el `AnalysisRun` del step anterior pasa; aborta automáticamente si falla.
 
-### Flujo de un release — modo ENTERPRISE (api02-dev, validado E2E)
+### Flujo de un release — modo ENTERPRISE (api02-dev)
 
 ```
 T=0     Solo stable (v1.3.0). canary RS no existe.
@@ -231,7 +231,7 @@ T+5m45s phase=Healthy. stable svc → canary RS (v1.4.0) = 100%.
         Stage 6 — que solo observaba — ve Healthy y reporta OK.
 ```
 
-> **Timeline real del E2E v1.4.0**: 4 AnalysisRuns (`-1`, `-3`, `-5`, `-7`), todos `Successful`, canary avanzó 5%→25%→50%→100% sin intervención del pipeline. Pipeline `Succeeded` @T+345s.
+> **Timeline de ejemplo**: 4 AnalysisRuns (`-1`, `-3`, `-5`, `-7`), todos `Successful`, canary avanza 5%→25%→50%→100% sin intervención del pipeline. Pipeline `Succeeded` @T+345s.
 
 Si **cualquier** `AnalysisRun` falla, Argo Rollouts aborta el canary automáticamente: el `canary RS` se destruye, el `stable RS` (versión vieja) sigue sirviendo 100%. El Stage 6 ve `phase=Degraded` y marca el pipeline `Failed`.
 

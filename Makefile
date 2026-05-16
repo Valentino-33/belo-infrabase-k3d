@@ -7,19 +7,20 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 SHELL := /bin/bash
-# Fijar contexto k3d para evitar interferencia con sesión EKS
 export KUBECONFIG := $(HOME)/.kube/config
 K3D_CONTEXT := k3d-belo-challenge
 .DEFAULT_GOAL := help
 
-K3D_CLUSTER   := belo-challenge
+K3D_CLUSTER    := belo-challenge
 DOCKERHUB_USER ?= valentinobruno
 APP            ?= webserver-api01
 TAG            ?= latest
-ENVS          ?= dev
+ENVS           ?= dev
 # Namespace = app + env (e.g. webserver-api01-dev). Override: make rollout-status APP=webserver-api02 ENV=staging
-ENV           ?= dev
-NAMESPACE     := $(APP)-$(ENV)
+ENV            ?= dev
+NAMESPACE      := $(APP)-$(ENV)
+# Base de los repos de las apps (cada app vive en su propio repo, no en este).
+APP_REPO_BASE  ?= https://github.com/Valentino-33
 
 GREEN  := \033[0;32m
 YELLOW := \033[0;33m
@@ -66,8 +67,27 @@ cluster-up: helm-repos  ## Crear cluster k3d, labeling de nodos e instalar addon
 	@echo ""
 	@echo "$(GREEN)✓ Cluster k3d listo. Siguiente: make secrets && make bootstrap$(NC)"
 
+.PHONY: cluster-stop
+cluster-stop:  ## Apagar el cluster preservando estado (etcd, PVCs, configs)
+	@echo "$(YELLOW)→ Apagando cluster '$(K3D_CLUSTER)' (preserva estado)...$(NC)"
+	k3d cluster stop $(K3D_CLUSTER)
+	@echo "$(GREEN)✓ Cluster apagado. Reanudar con: make cluster-start$(NC)"
+
+.PHONY: cluster-start
+cluster-start:  ## Reanudar un cluster apagado con cluster-stop
+	@docker info >/dev/null 2>&1 || { echo "$(RED)Docker no responde — abrí Docker Desktop y reintentá$(NC)"; exit 1; }
+	@echo "$(YELLOW)→ Reanudando cluster '$(K3D_CLUSTER)'...$(NC)"
+	k3d cluster start $(K3D_CLUSTER)
+	kubectl config use-context $(K3D_CONTEXT)
+	@echo "$(YELLOW)→ Esperando a que los nodos estén Ready...$(NC)"
+	kubectl wait --for=condition=Ready nodes --all --timeout=180s
+	@echo "$(YELLOW)→ Esperando a ArgoCD y al EventListener...$(NC)"
+	kubectl -n argocd rollout status deployment/argocd-server --timeout=180s 2>/dev/null || true
+	kubectl -n tekton-pipelines rollout status deployment/el-github-tag-listener --timeout=120s 2>/dev/null || true
+	@echo "$(GREEN)✓ Cluster reanudado en el mismo estado que cuando se apagó$(NC)"
+
 .PHONY: cluster-down
-cluster-down:  ## Eliminar cluster k3d y volumen Docker
+cluster-down:  ## Eliminar cluster k3d y volumen Docker (destructivo)
 	@echo "$(YELLOW)→ Eliminando cluster '$(K3D_CLUSTER)'...$(NC)"
 	k3d cluster delete $(K3D_CLUSTER)
 	docker volume rm belo-statefull-data 2>/dev/null || true
@@ -123,10 +143,11 @@ addons: helm-repos  ## Instalar todos los addons en el cluster k3d
 	  --namespace argo-rollouts \
 	  --wait --timeout 2m
 
-	@echo "$(YELLOW)→ 5/8 Tekton Pipelines + Triggers...$(NC)"
+	@echo "$(YELLOW)→ 5/8 Tekton Pipelines + Triggers + Dashboard...$(NC)"
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/release.yaml
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/interceptors.yaml
+	kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
 	kubectl -n tekton-pipelines rollout status deployment/tekton-pipelines-controller --timeout=3m
 
 	@echo "$(YELLOW)→ 6/8 EFK stack (local-path, TLS deshabilitado para dev)...$(NC)"
@@ -169,19 +190,25 @@ addons: helm-repos  ## Instalar todos los addons en el cluster k3d
 # GitOps Bootstrap
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: bootstrap
-bootstrap: tekton-apply  ## Aplicar root ArgoCD Application + Tekton pipeline manifests
+bootstrap: tekton-apply dashboards-apply  ## Aplicar root ArgoCD App + Tekton pipeline + ingress + dashboards
+	@echo "$(YELLOW)→ Aplicando ingress del Tekton Dashboard y los ServiceMonitors...$(NC)"
+	kubectl apply -f $(ROOT_DIR)manifests/tekton/dashboard-ingress.yaml
+	kubectl apply -f $(ROOT_DIR)manifests/tekton/servicemonitor.yaml
+	kubectl apply -f $(ROOT_DIR)manifests/argo-rollouts/servicemonitor.yaml
 	@echo "$(YELLOW)→ Aplicando root Application de ArgoCD...$(NC)"
 	kubectl apply -f $(ROOT_DIR)manifests/argocd/bootstrap.yaml -n argocd
 	@echo "$(GREEN)✓ Bootstrap aplicado$(NC)"
 	@echo ""
 	@echo "ArgoCD sincronizará gitops/ → crea webserver-api01-dev y webserver-api02-dev"
 	@echo "Monitoreá en: http://argocd.localhost:8888  (user: admin)"
-	@echo "Password:     $$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d 2>/dev/null || echo 'ver: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath={.data.password} | base64 -d')"
+	@echo "Password:     $$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d 2>/dev/null || echo 'ver: make argocd-password')"
 
 .PHONY: tekton-apply
-tekton-apply:  ## Aplicar Tasks, Pipeline y Triggers de Tekton
+tekton-apply:  ## Aplicar Tasks, Pipelines y Triggers de Tekton (release + burn)
 	@echo "$(YELLOW)→ Aplicando manifests de Tekton desde el chart...$(NC)"
 	kubectl create namespace tekton-pipelines 2>/dev/null || true
+	@echo "$(YELLOW)→ PSA del namespace tekton-pipelines a baseline (kaniko requiere root)...$(NC)"
+	kubectl label namespace tekton-pipelines pod-security.kubernetes.io/enforce=baseline --overwrite
 	helm template tekton-pipeline $(ROOT_DIR)charts/pythonapps \
 	  -f $(ROOT_DIR)charts/pythonapps/apps/webserver-api01/build-time/app.yaml \
 	  --set tekton.enabled=true \
@@ -194,12 +221,45 @@ tekton-apply:  ## Aplicar Tasks, Pipeline y Triggers de Tekton
 	  -s templates/pipeline-templates/task-wait-argocd.yaml \
 	  -s templates/pipeline-templates/task-load-test.yaml \
 	  -s templates/pipeline-templates/task-promote-rollback.yaml \
+	  -s templates/pipeline-templates/task-burn-to-scale.yaml \
 	  -s templates/pipeline-templates/pipeline-pythonapps.yaml \
+	  -s templates/pipeline-templates/pipeline-burn.yaml \
 	  -s templates/pipeline-templates/trigger-binding.yaml \
 	  -s templates/pipeline-templates/trigger-template.yaml \
+	  -s templates/pipeline-templates/trigger-binding-burn.yaml \
+	  -s templates/pipeline-templates/trigger-template-burn.yaml \
 	  -s templates/pipeline-templates/event-listener.yaml \
 	  | kubectl apply -f -
-	@echo "$(GREEN)✓ Tekton pipeline aplicado$(NC)"
+	@echo "$(GREEN)✓ Tekton pipelines (release + burn) aplicados$(NC)"
+
+.PHONY: dashboards-apply
+dashboards-apply:  ## Aplicar/recargar los ConfigMaps de dashboards de Grafana
+	@echo "$(YELLOW)→ Aplicando dashboards de Grafana...$(NC)"
+	kubectl apply -f $(ROOT_DIR)manifests/grafana/
+	@echo "$(GREEN)✓ Dashboards aplicados (el sidecar de Grafana los carga en ~30s)$(NC)"
+
+.PHONY: refresh
+refresh: tekton-apply dashboards-apply  ## Re-aplicar Tekton + dashboards + fluent-bit sobre un cluster ya levantado
+	@echo "$(YELLOW)→ Actualizando fluent-bit...$(NC)"
+	helm upgrade --install fluent-bit fluent/fluent-bit \
+	  --namespace logging \
+	  --values $(ROOT_DIR)helm/addons/fluent-bit/values.yaml \
+	  --wait --timeout 2m
+	@echo "$(YELLOW)→ Forzando refresh de las ArgoCD apps...$(NC)"
+	kubectl annotate application webserver-api01-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite 2>/dev/null || true
+	kubectl annotate application webserver-api02-dev -n argocd argocd.argoproj.io/refresh=normal --overwrite 2>/dev/null || true
+	@echo "$(GREEN)✓ Refresh completo$(NC)"
+
+.PHONY: pipeline-check
+pipeline-check:  ## Verificar pipelines, triggers y EventListener registrados
+	@echo "$(YELLOW)→ Pipelines:$(NC)"
+	@kubectl -n tekton-pipelines get pipeline 2>/dev/null || echo "  (ninguno — corré make tekton-apply)"
+	@echo "$(YELLOW)→ Triggers del EventListener:$(NC)"
+	@kubectl -n tekton-pipelines get eventlistener github-tag-listener \
+	  -o jsonpath='{range .spec.triggers[*]}  - {.name}{"\n"}{end}' 2>/dev/null || echo "  (EventListener no encontrado)"
+	@echo ""
+	@echo "$(YELLOW)→ EventListener pod:$(NC)"
+	@kubectl -n tekton-pipelines get pods -l eventlistener=github-tag-listener 2>/dev/null || echo "  (sin pods)"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Secretos requeridos
@@ -241,15 +301,33 @@ secrets-apply:  ## Crear secretos: make secrets-apply DOCKERHUB_USER=x DOCKERHUB
 	@echo "$(GREEN)✓ Secretos creados$(NC)"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline manual
+# Pipelines
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: pipeline-run
-pipeline-run:  ## Disparar pipeline manual: make pipeline-run APP=webserver-api01 TAG=v0.1.0
+pipeline-run:  ## Disparar release pipeline manual: make pipeline-run APP=webserver-api01 TAG=v0.1.0
 	@echo "$(YELLOW)→ Iniciando PipelineRun para $(APP):$(TAG)...$(NC)"
 	APP=$(APP) TAG=$(TAG) DOCKERHUB_USER=$(DOCKERHUB_USER) \
-	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl apply -f -
+	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-manual.yaml | kubectl create -f -
 	@echo "$(GREEN)✓ PipelineRun creado — monitoreá con:$(NC)"
 	@echo "   tkn pipelinerun logs -n tekton-pipelines --last -f"
+
+.PHONY: burn-test
+burn-test:  ## Disparar burn pipeline (HPA capacity test): make burn-test APP=webserver-api01 ENV=dev
+	@echo "$(YELLOW)→ Iniciando burn pipeline para $(APP) en $(ENV)...$(NC)"
+	APP=$(APP) ENV=$(ENV) \
+	  envsubst < $(ROOT_DIR)manifests/tekton/pipelinerun-burn-manual.yaml | kubectl create -f -
+	@echo "$(GREEN)✓ Burn PipelineRun creado — observá el HPA con:$(NC)"
+	@echo "   kubectl get hpa $(APP)-$(ENV) -n $(APP)-$(ENV) -w"
+
+.PHONY: burn-release-tag
+burn-release-tag:  ## Imprime las instrucciones del tag git para disparar el burn vía webhook
+	@echo ""
+	@echo "$(YELLOW)→ Disparar el burn pipeline vía webhook (desde el repo de la app):$(NC)"
+	@echo ""
+	@echo "  git tag burn/$(ENV)"
+	@echo "  git push origin burn/$(ENV)"
+	@echo ""
+	@echo "$(GREEN)El EventListener (trigger github-tag-burn) crea el PipelineRun automáticamente.$(NC)"
 
 .PHONY: release
 release:  ## Crear y pushear tag de release: make release APP=webserver-api01 TAG=v1.0.0 ENVS=dev [LOADTEST=true]
@@ -352,11 +430,14 @@ rollout-abort:  ## Abortar rollout (rollback): make rollout-abort APP=webserver-
 	kubectl argo rollouts abort $(APP)-$(ENV) -n $(NAMESPACE)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Build local de imágenes (sin k3d)
+# Build local de imágenes (clona el repo de la app a /tmp)
 # ──────────────────────────────────────────────────────────────────────────────
 .PHONY: build
-build:  ## Build local: make build APP=webserver-api01 TAG=v0.1.0
-	docker build -t $(DOCKERHUB_USER)/$(APP):$(TAG) $(ROOT_DIR)apps/$(APP)/
+build:  ## Build local: clona el repo de la app y buildea — make build APP=webserver-api01 TAG=v0.1.0
+	@echo "$(YELLOW)→ Clonando $(APP_REPO_BASE)/$(APP) y buildeando $(DOCKERHUB_USER)/$(APP):$(TAG)...$(NC)"
+	rm -rf /tmp/belo-build-$(APP)
+	git clone --depth 1 $(APP_REPO_BASE)/$(APP) /tmp/belo-build-$(APP)
+	docker build -t $(DOCKERHUB_USER)/$(APP):$(TAG) /tmp/belo-build-$(APP)
 
 .PHONY: push
 push:  ## Push a DockerHub: make push APP=webserver-api01 TAG=v0.1.0
@@ -366,12 +447,10 @@ push:  ## Push a DockerHub: make push APP=webserver-api01 TAG=v0.1.0
 build-push: build push  ## Build + push en un paso
 
 .PHONY: images-initial
-images-initial:  ## Build y push de ambas apps con tag latest (requerido antes de make bootstrap)
+images-initial:  ## Build + push de webserver-api01 y webserver-api02 (tag latest) — requerido antes de make bootstrap
 	@echo "$(YELLOW)→ Build y push de imágenes iniciales...$(NC)"
-	docker build -t $(DOCKERHUB_USER)/api01:latest $(ROOT_DIR)apps/webserver-api01/
-	docker push $(DOCKERHUB_USER)/api01:latest
-	docker build -t $(DOCKERHUB_USER)/api02:latest $(ROOT_DIR)apps/webserver-api02/
-	docker push $(DOCKERHUB_USER)/api02:latest
+	"$(MAKE)" build-push APP=webserver-api01 TAG=latest
+	"$(MAKE)" build-push APP=webserver-api02 TAG=latest
 	@echo "$(GREEN)✓ Imágenes iniciales publicadas en Docker Hub$(NC)"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -405,14 +484,12 @@ argocd-password:  ## Mostrar password inicial de ArgoCD
 	  -o jsonpath='{.data.password}' | base64 -d
 	@echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Load testing
-# ──────────────────────────────────────────────────────────────────────────────
 .PHONY: cluster-info
 cluster-info:  ## Mostrar URLs, passwords y comandos útiles de un vistazo
 	@echo ""
 	@echo "$(GREEN)=== Acceso a dashboards (agregar al archivo hosts primero) ===$(NC)"
 	@echo "  ArgoCD   → http://argocd.localhost:8888   (admin / $$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || echo 'ver: make argocd-password'))"
+	@echo "  Tekton   → http://tekton.localhost:8888"
 	@echo "  Grafana  → http://grafana.localhost:8888  (admin / belo-challenge)"
 	@echo "  Kibana   → http://kibana.localhost:8888"
 	@echo "  Headlamp → http://headlamp.localhost:8888 (token: kubectl create token headlamp -n kube-system)"
@@ -420,7 +497,7 @@ cluster-info:  ## Mostrar URLs, passwords y comandos útiles de un vistazo
 	@echo "  api02    → http://api02.localhost:8888"
 	@echo ""
 	@echo "$(GREEN)=== Hosts que deben estar en C:\\Windows\\System32\\drivers\\etc\\hosts ===$(NC)"
-	@echo "  127.0.0.1 argocd.localhost grafana.localhost kibana.localhost headlamp.localhost"
+	@echo "  127.0.0.1 argocd.localhost tekton.localhost grafana.localhost kibana.localhost headlamp.localhost"
 	@echo "  127.0.0.1 api01.localhost preview-api01.localhost"
 	@echo "  127.0.0.1 api02.localhost preview-api02.localhost"
 	@echo "  127.0.0.1 tekton-webhook.localhost"
@@ -432,22 +509,31 @@ cluster-info:  ## Mostrar URLs, passwords y comandos útiles de un vistazo
 .PHONY: tunnel
 tunnel:  ## Exponer EventListener a internet con ngrok (requiere ngrok instalado)
 	@echo "$(YELLOW)→ Iniciando ngrok en puerto 8888...$(NC)"
-	@echo "$(YELLOW)  Una vez activo, copiá la URL https:// y configurala en GitHub:"$(NC)
+	@echo "$(YELLOW)  Una vez activo, copiá la URL https:// y configurala en GitHub:$(NC)"
 	@echo "  Settings → Webhooks → Payload URL: <ngrok-url>"
-	@echo "  Content type: application/json  |  Events: Push"	
+	@echo "  Content type: application/json  |  Events: Push"
 	@echo ""
-	ngrok http 8888
+	ngrok http --host-header=tekton-webhook.localhost 8888
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Load testing local (clona el repo de la app a /tmp y corre k6)
+# ──────────────────────────────────────────────────────────────────────────────
 .PHONY: load-test-smoke
-load-test-smoke:  ## Smoke test: make load-test-smoke APP=webserver-api01
-	k6 run -e BASE_URL=http://$(APP).localhost:8888 $(ROOT_DIR)apps/$(APP)/loadtest/smoke.js
+load-test-smoke:  ## Smoke test k6: make load-test-smoke APP=webserver-api01
+	rm -rf /tmp/belo-loadtest-$(APP)
+	git clone --depth 1 $(APP_REPO_BASE)/$(APP) /tmp/belo-loadtest-$(APP)
+	k6 run -e BASE_URL=http://$(APP).localhost:8888 /tmp/belo-loadtest-$(APP)/loadtest/smoke.js
 
 .PHONY: load-test-bluegreen
-load-test-bluegreen:  ## Load test BlueGreen (contra preview): make load-test-bluegreen
+load-test-bluegreen:  ## Load test BlueGreen 1000 VUs contra preview (api01)
+	rm -rf /tmp/belo-loadtest-webserver-api01
+	git clone --depth 1 $(APP_REPO_BASE)/webserver-api01 /tmp/belo-loadtest-webserver-api01
 	k6 run -e PREVIEW_URL=http://preview-api01.localhost:8888 \
-	  $(ROOT_DIR)apps/webserver-api01/loadtest/load-bluegreen.js
+	  /tmp/belo-loadtest-webserver-api01/loadtest/load-bluegreen.js
 
 .PHONY: load-test-canary
-load-test-canary:  ## Load test Canary (contra stable con canary activo): make load-test-canary
+load-test-canary:  ## Load test Canary 1000 VUs contra stable con canary activo (api02)
+	rm -rf /tmp/belo-loadtest-webserver-api02
+	git clone --depth 1 $(APP_REPO_BASE)/webserver-api02 /tmp/belo-loadtest-webserver-api02
 	k6 run -e BASE_URL=http://api02.localhost:8888 \
-	  $(ROOT_DIR)apps/webserver-api02/loadtest/load-canary.js
+	  /tmp/belo-loadtest-webserver-api02/loadtest/load-canary.js

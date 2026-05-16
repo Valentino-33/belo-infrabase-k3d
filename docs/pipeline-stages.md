@@ -99,7 +99,7 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
     -o jsonpath='{.status.sync.revision}')
 
   if [ "$SYNC" = "Synced" ] && [ "$REVISION" = "$EXPECTED_SHA" ]; then
-    # ✅ ArgoCD reportó que aplicó EL commit del Stage 3
+    # ArgoCD reportó que aplicó el commit del Stage 3
     break
   fi
   sleep 5

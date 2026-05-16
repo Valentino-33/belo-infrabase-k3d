@@ -41,7 +41,7 @@ Después de esto podés cerrar la PC tranquilo. El estado del cluster vive en lo
 #    (el ícono de la barra de tareas debe estar verde)
 
 # 2. Reanudar el cluster
-cd C:\Users\tadeo\OneDrive\Escritorio\bellochallenge-k3d\belo-infrabase-k3d
+cd /ruta/a/belo-infrabase-k3d
 make cluster-start
 ```
 
@@ -103,7 +103,7 @@ ngrok va a mostrar una URL nueva tipo `https://xyz789.ngrok-free.app`. Tenés qu
 
 ```bash
 # 3. Pushear un tag nuevo desde el repo de la app
-cd C:\Users\tadeo\OneDrive\Escritorio\belochallenge\webserver-api01
+cd /ruta/a/webserver-api01
 
 # Release rápido (default — sin k6, sin HPA scale durante el switchover):
 git tag release/v0.5.0/dev
@@ -159,7 +159,7 @@ kubectl annotate app webserver-api02-dev -n argocd \
 
 Eso pasa solo si re-instalaste Tekton (`kubectl apply -f .../release.yaml`). `cluster-stop`/`cluster-start` NO toca los labels del namespace.
 
-Si lo ves de nuevo:
+`make tekton-apply` (y `make refresh`) vuelven a dejar el label en `baseline`. Si querés hacerlo a mano:
 
 ```bash
 kubectl label namespace tekton-pipelines \
@@ -176,20 +176,17 @@ Solo si:
 - Cambiaste de máquina y querés un fresh start
 - Estás cerrando el proyecto completamente
 
-En esos casos:
+En esos casos, recrear desde cero (mismos pasos que [README → Levantado desde cero](../README.md#levantado-desde-cero)):
 
 ```bash
-make cluster-down       # destruye todo (pide confirm visual, no real)
-make all                # recrea desde cero
+make cluster-down       # destruye todo
+make cluster-up         # recrea cluster + addons (incluye Tekton Dashboard)
 make secrets-apply DOCKERHUB_USER=... DOCKERHUB_TOKEN=... GITHUB_TOKEN=...
 make images-initial DOCKERHUB_USER=...
-# Y re-instalar Tekton Dashboard:
-kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
-kubectl apply -f manifests/tekton/dashboard-ingress.yaml
-# Bajar el PSA del namespace tekton-pipelines a baseline (kaniko):
-kubectl label namespace tekton-pipelines \
-  pod-security.kubernetes.io/enforce=baseline --overwrite
+make bootstrap          # ArgoCD root + Tekton pipelines + ingress + dashboards
 ```
+
+> `make cluster-up` reinstala el Tekton Dashboard y `make bootstrap` (vía `tekton-apply`) deja el namespace `tekton-pipelines` en `enforce=baseline` — no hay pasos manuales extra.
 
 ---
 

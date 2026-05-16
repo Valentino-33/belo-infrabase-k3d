@@ -473,18 +473,17 @@ El Stage 5 lee los scripts k6 desde el **repo de la app**, no desde este repo. E
 
 El task pasa al script las env vars `BASE_URL` y `PREVIEW_URL` apuntando a los services internos del cluster (`<release>-stable.<ns>.svc:8080` / `<release>-preview.<ns>.svc:8080`). Los fallbacks hardcodeados en los .js solo se usan para corridas locales (`make load-test-*`).
 
-### Por qué Stage 4 es así (race condition fix)
+### Por qué Stage 4 es así
 
-ArgoCD pollea su repo gitops cada ~3 minutos por default. Sin forzar refresh, el step `wait-argocd` puede ver el sync.revision **viejo** como `Synced` y avanzar — el load test correría contra la versión anterior, y `promote-rollback` haría no-op sobre un Rollout ya `Healthy`. El pipeline reportaría todo verde sin haber desplegado nada.
+ArgoCD pollea su repo gitops cada ~3 minutos por default. Si el `wait-argocd` no forzara un refresh, podría ver el `sync.revision` **viejo** como `Synced` y avanzar — el load test correría contra la versión anterior y `promote-rollback` haría no-op sobre un Rollout ya `Healthy`. Para garantizar que el load test corre sobre la versión nueva, el Stage 4:
 
-La fix:
-1. `bump-gitops` emite el SHA del commit como Task result.
-2. `wait-argocd` recibe ese SHA como param, hace `kubectl annotate app ... argocd.argoproj.io/refresh=normal` para forzar polling inmediato, y espera que ArgoCD reporte ese SHA específico como `sync.revision`.
-3. Step 2 además verifica que el Rollout spec ya tenga el `image-tag` esperado y esté `phase=Paused` (BG/Canary) — eso garantiza que el green/canary RS está ready para el load test.
+1. Recibe el `commit-sha` que emite `bump-gitops` como Task result.
+2. Hace `kubectl annotate app ... argocd.argoproj.io/refresh=normal` para forzar el polling inmediato de ArgoCD, y espera que reporte ese SHA específico como `sync.revision`.
+3. Verifica además que el Rollout spec ya tenga el `image-tag` esperado y esté `phase=Paused` (BG/Canary) — garantía de que el green/canary RS está listo para el load test.
 
 ### Por qué Stage 6 patchea directo y no usa el plugin
 
-El plugin `kubectl argo rollouts promote` reportaba éxito pero el Rollout volvía a `BlueGreenPause` ~10s después (causa exacta sin aislar — posiblemente race con ArgoCD reaplicando el manifest). Los patches directos al `status.pauseConditions=null` o `status.promoteFull=true` (los mismos que el plugin emite internamente, según [su código fuente](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)) **son persistentes**. Además, eliminar el download del plugin reduce ~15s del pipeline y elimina una dependencia externa.
+El Stage 6 aplica directamente al status subresource los mismos patches que el plugin `kubectl argo rollouts promote` emite internamente (`status.pauseConditions=null`, `status.promoteFull=true`, `spec.abort=true` — según [su código fuente](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)). El `kubectl patch` directo es persistente incluso mientras ArgoCD reconcilia el Rollout en paralelo, evita la descarga del plugin (~15s por run) y no agrega dependencias externas.
 
 ---
 
@@ -613,13 +612,6 @@ belo-infrabase-k3d/
 
 ## Troubleshooting
 
-### Pipeline corre verde pero la imagen no se actualizó
-
-Era el bug **del race condition**, ya corregido. Si volvés a verlo:
-- Verificá que `task-bump-gitops` esté emitiendo el result `commit-sha`
-- Verificá que el Pipeline pase `tasks.bump-gitops.results.commit-sha` y `params.image-tag` a `wait-argocd`
-- Verificá que la SA `tekton-pipeline-runner` tenga verb `patch` sobre `applications` (necesario para el annotate refresh)
-
 ### kaniko falla con `PodAdmissionFailed`
 
 El namespace `tekton-pipelines` tiene `pod-security.kubernetes.io/enforce` que rechaza pods con root. Kaniko **necesita** root.
@@ -636,7 +628,7 @@ kubectl label namespace tekton-pipelines pod-security.kubernetes.io/enforce=base
 
 ### bump-gitops falla con `URL rejected: Port number was not a decimal number`
 
-Era el bug **del token-en-URL doble**, ya corregido. El step `commit-and-push` ahora usa `$(params.gitops-repo-url)` (pristine, sin auth) para construir el push URL, en vez de `git remote get-url origin` (que ya tiene el token del clone).
+Suele ser un token de GitHub con whitespace en el secret, o una URL de git con el token inyectado dos veces. Detalle y solución en [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ### Pods de la app en `ImagePullBackOff` al hacer bootstrap
 
@@ -648,14 +640,16 @@ kubectl -n webserver-api01-dev delete pod --all   # fuerza re-pull
 kubectl -n webserver-api02-dev delete pod --all
 ```
 
-### El Rollout vuelve a `Paused` después del promote
+### El Rollout vuelve a `Paused` después de promover manualmente
 
-Ver [troubleshooting.md → "Plugin promote no persiste"](docs/troubleshooting.md). Ya está mitigado en el pipeline actual (usa `kubectl patch` directo), pero si lo ves al promover manualmente desde la línea de comandos, usá el patch en vez del plugin:
+Si promovés con el plugin `kubectl argo rollouts promote` y el Rollout vuelve a `Paused`, usá `kubectl patch` directo al status subresource (es lo que hace el Stage 6 del pipeline):
 
 ```bash
 kubectl patch rollout <name> -n <ns> --subresource=status --type=merge \
   -p '{"status":{"pauseConditions":null}}'
 ```
+
+Detalle en [docs/troubleshooting.md](docs/troubleshooting.md#promover-un-rollout-con-el-plugin-no-persiste--vuelve-a-paused).
 
 ### ngrok: `Your ngrok-agent version is too old`
 
@@ -691,12 +685,12 @@ Ver [docs/troubleshooting.md](docs/troubleshooting.md) para los gotchas completo
 | [docs/logging-efk.md](docs/logging-efk.md) | **Formato de logs JSON + verificación end-to-end de EFK + queries útiles en Kibana** |
 | [docs/grafana-dashboards.md](docs/grafana-dashboards.md) | **Cómo agregar dashboards nuevos a Grafana vía ConfigMaps (sidecar auto-load) + PromQL queries útiles** |
 | [docs/security-and-rbac.md](docs/security-and-rbac.md) | PodSecurity Standards, securityContext en Tasks, ClusterRoles del pipeline runner |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Gotchas detallados (race conditions, plugin issues, token quirks) con causa raíz y fix |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Problemas operativos del cluster y del pipeline, con síntoma, causa raíz y solución |
 | [docs/demo-guide.md](docs/demo-guide.md) | Guía paso a paso para demostrar cada estrategia |
 | [docs/webhook-setup.md](docs/webhook-setup.md) | Configuración del webhook GitHub → Tekton (ngrok, smee.io, HMAC) |
 | [docs/daily-ops.md](docs/daily-ops.md) | Cómo apagar y encender el cluster cada día sin perder estado |
 | [MAKEFILE_GUIDE.md](MAKEFILE_GUIDE.md) | Referencia completa de todos los targets del Makefile |
-| [ROADMAP.md](ROADMAP.md) | Fases completadas y deuda técnica conocida |
+| [ROADMAP.md](ROADMAP.md) | Capacidades implementadas, limitaciones conocidas y trabajo futuro |
 
 ---
 

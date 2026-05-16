@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Gotchas concretos hit durante el desarrollo del pipeline. Cada entrada tiene **síntoma**, **causa raíz**, y **fix**. Ordenados aproximadamente en el orden en que aparecerían si tropezás con el sistema por primera vez.
+Problemas operativos del cluster y del pipeline, con **síntoma**, **causa raíz** y **solución**. Ordenados aproximadamente en el orden en que aparecerían al operar el sistema por primera vez.
 
 ---
 
@@ -63,19 +63,6 @@ kubectl -n webserver-api02-dev delete pod --all
 
 ## Pipeline / Tekton
 
-### `make pipeline-run` falla con `error: from ...-manual-run-: cannot use generate name with apply`
-
-**Síntoma (histórico)**:
-```
-APP=... | kubectl apply -f -
-error: from webserver-api01-manual-run-: cannot use generate name with apply
-make: *** [pipeline-run] Error 1
-```
-
-**Causa**: el manifest usaba `generateName` (que requería `kubectl create`, no `apply`).
-
-**Fix**: doble: (a) el Makefile usa `kubectl create -f -` para PipelineRuns; (b) el manifest pasó a usar `name` determinístico (`<app>-pipelinerun-<tag>`) en lugar de `generateName`. Si volvés a ver el síntoma, verificá ambas cosas.
-
 ### `make pipeline-run` falla con `error from server (AlreadyExists)`
 
 **Síntoma**:
@@ -107,18 +94,18 @@ PipelineRun in version "v1" cannot be handled as a PipelineRun:
 strict decoding error: unknown field "spec.podTemplate"
 ```
 
-**Causa**: el manifest usa la forma de v1beta1 (`spec.podTemplate`). En `tekton.dev/v1` se movió bajo `spec.taskRunTemplate.podTemplate`.
+**Causa**: el manifest usa la forma de v1beta1 (`spec.podTemplate`). En `tekton.dev/v1` el `podTemplate` vive bajo `spec.taskRunTemplate.podTemplate`.
 
-**Fix**: ya corregido en `manifests/tekton/pipelinerun-manual.yaml`. Si volvés a verlo en un manifest custom:
+**Solución**: si escribís un PipelineRun manual custom, anidá `podTemplate` dentro de `taskRunTemplate`:
 ```yaml
-# ANTES (v1beta1)
+# v1beta1 (inválido en v1)
 spec:
   taskRunTemplate:
     serviceAccountName: ...
   podTemplate:
     tolerations: ...
 
-# DESPUÉS (v1)
+# v1
 spec:
   taskRunTemplate:
     serviceAccountName: ...
@@ -185,15 +172,9 @@ fatal: unable to access 'https://x-access-token:ghp_xxx@github.com/org/repo/':
 URL rejected: Port number was not a decimal number between 0 and 65535
 ```
 
-**Causa**: el step `clone-gitops` clona con el token embebido en la URL del remote (`https://x-access-token:TOKEN@github.com/...`). La versión anterior del step `commit-and-push` hacía `git remote get-url origin | sed 's|https://|https://x-access-token:NEW@|'`, lo que producía una URL con **dos** `@`:
+**Causa**: una URL de git con el token inyectado dos veces (`https://x-access-token:NEW@x-access-token:OLD@github.com/...`). curl parsea el **primer** `@` como fin de userinfo e interpreta el resto como `host:port` no numérico. Pasa si un manifest custom reusa el remote del clone (que ya tiene token embebido) para volver a inyectar credenciales.
 
-```
-https://x-access-token:NEW@x-access-token:OLD@github.com/...
-```
-
-curl parsea el **primer** `@` como fin de userinfo → interpreta `x-access-token` como host y `OLD@github.com/...` como port (no numérico) → error.
-
-**Fix**: ya aplicado en `task-bump-gitops.yaml`. El step `commit-and-push` ahora computa la push URL desde `$(params.gitops-repo-url)` (pristine, sin token):
+**Solución**: construir el push URL desde la URL pristine del repo (sin auth) e inyectar el token una sola vez — que es lo que hace `task-bump-gitops.yaml`:
 
 ```sh
 PUSH_URL=$(echo "$(params.gitops-repo-url)" | \
@@ -220,69 +201,37 @@ kubectl create secret generic github-token \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-### Stage 4 (wait-argocd) timeout esperando Synced+Healthy
+### Promover un Rollout con el plugin no persiste — vuelve a Paused
 
-**Síntoma**: `wait-argocd` queda 10 minutos en loop con `sync=Synced health=Progressing` y termina con timeout.
+**Síntoma**: corrés `kubectl argo rollouts promote ROLLOUT -n NS`, el comando reporta `rollout 'X' promoted` y exit 0, pero `kubectl get rollout` muestra `phase=BlueGreenPause` ~10s después.
 
-**Causa (histórica)**: la versión anterior esperaba `sync=Synced AND health=Healthy`. Pero los Rollouts BlueGreen/Canary reportan `health=Progressing` mientras están `Paused`. Nunca llegaba a `Healthy` (eso solo pasa después del promote).
+**Causa**: el plugin `kubectl-argo-rollouts promote` no siempre persiste el cambio cuando ArgoCD está reconciliando el Rollout en paralelo.
 
-**Fix**: ya aplicado. La task ahora solo espera `sync=Synced` (no health). Ver [pipeline-internals.md → wait-argocd](pipeline-internals.md#4-wait-argocd-sync).
-
-### Pipeline corre verde pero la imagen no se actualizó
-
-**Síntoma**: las 6 stages terminan `Succeeded`, pero el Rollout sigue con la versión anterior. `kubectl get rollout` muestra `image=docker.io/user/app:v0.4.5` cuando el pipeline corrió con `tag=v0.4.6`.
-
-**Causa**: **race condition** entre el pipeline y ArgoCD. ArgoCD polea el gitops cada ~3 minutos por default. Sin forzar refresh, `wait-argocd` veía el `sync.revision` viejo como `Synced` y avanzaba inmediatamente. Load-test corría contra la versión vieja. `promote-rollback` patcheaba un Rollout ya `Healthy` (no-op).
-
-**Fix**: ya aplicado. El pipeline ahora:
-1. `bump-gitops` emite el SHA del commit como Task result `commit-sha`
-2. `wait-argocd` recibe ese SHA como param, hace `kubectl annotate app ... argocd.argoproj.io/refresh=normal` para forzar polling inmediato, y espera que `.status.sync.revision == commit-sha`
-3. Step 2 verifica que `.spec.template.spec.containers[0].image` ya tenga el tag esperado **Y** `phase=Paused` (BG/Canary)
-
-Si volvés a ver el síntoma, chequear:
-- `task-bump-gitops.yaml` debe tener `results: - name: commit-sha`
-- `pipeline-pythonapps.yaml` debe mapear `tasks.bump-gitops.results.commit-sha` → `wait-argocd.params.expected-commit-sha` y `params.image-tag` → `wait-argocd.params.image-tag`
-- La SA `tekton-pipeline-runner` debe tener verb `patch` sobre `applications` (necesario para el annotate)
-
-### Stage 6 (promote-rollback) reporta "promoted" pero el Rollout vuelve a Paused
-
-**Síntoma (histórico, usando el plugin)**:
-```
-BlueGreen: PASSED — promoting green to stable
-rollout 'webserver-api01-dev' promoted
-=== Done ===
-```
-Pero `kubectl get rollout` muestra `phase=BlueGreenPause` ~10s después.
-
-**Causa**: `kubectl argo rollouts promote` (el plugin oficial) reporta éxito pero no persiste. Causa exacta no aislada — posiblemente race con ArgoCD reaplicando el manifest, posiblemente patches a campos que el controller revierte.
-
-**Fix**: ya aplicado. El step `promote-rollback` ahora usa `kubectl patch` directo al status subresource:
+**Solución**: usar `kubectl patch` directo al status subresource — los mismos patches que el plugin emite internamente ([`promote.go`](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)). Es lo que hace el Stage 6 del pipeline:
 
 ```sh
-# BG passed
+# BG promote
 kubectl patch rollout NAME -n NS --subresource=status --type=merge \
   -p '{"status":{"pauseConditions":null}}'
 
-# Canary passed (full)
+# Canary promote (full)
 kubectl patch rollout NAME -n NS --subresource=status --type=merge \
   -p '{"status":{"promoteFull":true}}'
 
-# Any strategy failed
+# Abort (cualquier strategy)
 kubectl patch rollout NAME -n NS --type=merge \
   -p '{"spec":{"abort":true}}'
 ```
-
-Estos son los mismos patches que el plugin emite internamente (según [`promote.go`](https://github.com/argoproj/argo-rollouts/blob/master/cmd/kubectl-argo-rollouts/commands/promote.go)), aplicados directo. Persisten correctamente.
 
 ### Pipeline BG falla en Stage 5 — k6 reportó >5% errors
 
 **Síntoma**: Stage 5 termina con `outcome=failed`, k6 imprime algo como `WARN[xxxx] http_req_failed.....: rate=0.07` (7% errors). Stage 6 aborta el rollout. Después del run, ves los pods `stable` (blue) sirviendo bien pero el `preview` (green) destruyéndose.
 
-**Causa raíz**: 1000 VUs contra 1 sólo pod (limit 300m CPU) satura uvicorn antes de que el HPA reaccione. Mientras HPA escala (~30-40s entre detection + nuevo pod ready), el pod existente responde con 5xx por overload. Si en esa ventana se acumulan >5% de errores → Stage 5 fail.
+**Causa raíz**: 1000 VUs contra 1 solo pod (limit 300m CPU) saturan uvicorn antes de que el HPA reaccione. Mientras el HPA escala (~30-40s entre detección y nuevo pod ready), el pod existente responde con 5xx por overload. Si en esa ventana se acumulan >5% de errores → Stage 5 falla.
 
-**Fix aplicado** en `charts/pythonapps/apps/<app>/dev/values.yaml`:
-- `replicas: 2` y `hpa.minReplicas: 2` → arrancamos con 2 pods de baseline → 600m CPU combinado
-- `http_req_failed` threshold subido a `rate<0.10` en los load tests (era 0.05) — ventana de scale-up tolerada
+**Mitigación** (en `charts/pythonapps/apps/<app>/dev/values.yaml`):
+- `replicas: 2` y `hpa.minReplicas: 2` — baseline de 2 pods = 600m CPU combinado
+- `http_req_failed` threshold en `rate<0.10` en los load tests — tolera la ventana de scale-up
 
 **Verificación**:
 ```bash
@@ -366,17 +315,6 @@ kubectl get pipelinerun -n tekton-pipelines -l pipeline=burn
 kubectl -n tekton-pipelines logs -l eventlistener=github-tag-listener --tail=30
 ```
 
-### Stage 6 falla con `kubectl: command not found`
-
-**Síntoma**: el step `promote-or-abort` falla con:
-```
-/tekton/scripts/script-0-XXXXX: line N: kubectl: command not found
-```
-
-**Causa**: histórica — el `stepTemplate` setaba un override global de `PATH` (`/tekton/home/bin:/usr/local/sbin:...`) que **excluía** `/opt/bitnami/kubectl/bin` donde la imagen `bitnami/kubectl` tiene su binario.
-
-**Fix**: ya aplicado. El override de PATH se sacó del `stepTemplate` y se movió al script específico que lo necesita (con `export PATH="$HOME/bin:$PATH"` que **prepend** sin override total).
-
 ### Stage 5 (load-test) falla con `ERROR: ... no encontrado en el repo de la app`
 
 **Síntoma**:
@@ -386,7 +324,7 @@ ERROR: /workspace/source/src/loadtest/load-canary.js no encontrado en el repo de
        Agregalo al repo de la app en loadtest/load-canary.js y re-disparar.
 ```
 
-**Causa**: el Helm chart de la app declara `rollout.strategy: canary` (o `bluegreen`), pero el repo de la app no tiene el `loadtest/<script>.js` correspondiente. Antes de esta fix, el Stage 5 silenciosamente emitía `outcome=passed` y el rollout se promovía sin haber sido testeado. Ahora **fail-fast**.
+**Causa**: el Helm chart de la app declara `rollout.strategy: canary` (o `bluegreen`), pero el repo de la app no tiene el `loadtest/<script>.js` correspondiente. El Stage 5 hace **fail-fast** en ese caso: emite `outcome=failed` y `exit 1` en lugar de promover un rollout sin testear.
 
 **Fix**:
 1. En el repo de la app, agregar el script faltante en `loadtest/`. Modelo:
@@ -472,26 +410,7 @@ make tekton-apply
 
 ## Rollout / Argo Rollouts
 
-### Rollout queda en `Paused` después de promover manualmente
-
-**Síntoma**: hiciste `kubectl argo rollouts promote ROLLOUT -n NS` y el comando dice OK, pero el Rollout sigue `BlueGreenPause` 10s después.
-
-**Causa**: mismo issue del plugin que vimos en el pipeline.
-
-**Fix**: usar el patch directo:
-```bash
-# BlueGreen — clear pauseConditions
-kubectl patch rollout ROLLOUT -n NS --subresource=status --type=merge \
-  -p '{"status":{"pauseConditions":null}}'
-
-# Canary — promote-full
-kubectl patch rollout ROLLOUT -n NS --subresource=status --type=merge \
-  -p '{"status":{"promoteFull":true}}'
-
-# Abort (rollback)
-kubectl patch rollout ROLLOUT -n NS --type=merge \
-  -p '{"spec":{"abort":true}}'
-```
+> Para promover/abortar un Rollout manualmente con `kubectl patch`, ver [Promover un Rollout con el plugin no persiste](#promover-un-rollout-con-el-plugin-no-persiste--vuelve-a-paused) en la sección Pipeline / Tekton.
 
 ### Cómo determinar qué RS es stable vs preview/canary
 

@@ -8,8 +8,8 @@ spec:
   description: |
     Stage 3 — clona el gitops repo, escribe image.tag en values.yaml de
     cada env del param `environments`, commitea y pushea. Emite el SHA
-    del commit como result `commit-sha` (Stage 4 lo usa para verificar
-    que ArgoCD aplicó ESTE commit y no uno más viejo — race condition fix).
+    del commit como result `commit-sha`, que el Stage 4 usa para verificar
+    que ArgoCD sincronizó exactamente este commit.
   params:
   - name: gitops-repo-url
     type: string
@@ -136,8 +136,8 @@ spec:
       echo "→ Commiteando: 'bump $(params.app-name) a $(params.image-tag) en [${ENVS_LABEL}]'"
       git commit -m "bump $(params.app-name) a $(params.image-tag) en [${ENVS_LABEL}]"
 
-      # IMPORTANTE: usar pristine URL para evitar tokens dobles (clone-gitops
-      # ya dejó el remote con el token embebido).
+      # La push URL se construye desde el param pristine, no desde el remote
+      # del clone (que ya tiene el token embebido).
       PUSH_URL=$(echo "$(params.gitops-repo-url)" | sed "s|https://|https://x-access-token:${TOKEN}@|")
       echo "→ Pusheando a $(params.gitops-repo-url) main..."
       git push "$PUSH_URL" main

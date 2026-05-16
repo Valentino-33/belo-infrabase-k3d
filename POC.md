@@ -1,22 +1,21 @@
 # POC — Playbook completo de la demo
 
-Comandos paso a paso, validados end-to-end.
+Comandos paso a paso para correr la demo completa end-to-end.
 
-## Estado validado (2026-05-14)
+## Qué demuestra
 
-| Componente | Estado |
+| Componente | Qué muestra |
 |---|---|
-| **api01 BG enterprise v0.11.0** | ✅ prePromotionAnalysis `Successful` → switch automático → postPromotionAnalysis `Successful` → Healthy (~5min, pipeline solo observó) |
-| **api02 Canary enterprise v1.4.0** | ✅ 4 `AnalysisRun` `Successful`, canary 5%→25%→50%→100% sin intervención del pipeline (~6min) |
-| **Modelo legacy (flag loadtest)** | ✅ validado en runs previos — `loadtest=true` corre k6, `loadtest=false` skipea k6 + auto-promote |
-| **Burn pipeline** | ✅ HPA escaló api01 de 3 → 7 replicas durante el burn |
-| **Apps healthy** | api01 v0.11.0 + api02 v1.4.0 (3 replicas baseline) |
-| **AnalysisTemplate** | ✅ `<app>-app-health` en api01-dev y api02-dev — queries success-rate + latency-p95 sobre Prometheus |
-| **EFK ingestando** | ~15k+ docs/día en `k8s-YYYY.MM.DD`, JSON parseado a campos top-level |
+| **api01 — Blue/Green enterprise** | prePromotionAnalysis `Successful` → switch automático → postPromotionAnalysis `Successful` → Healthy (~5min, el pipeline solo observa) |
+| **api02 — Canary enterprise** | 4 `AnalysisRun` `Successful`, canary 5%→25%→50%→100% sin intervención del pipeline (~6min) |
+| **Modelo legacy (flag loadtest)** | `loadtest=true` corre k6 y valida; `loadtest=false` skipea k6 + auto-promote |
+| **Burn pipeline** | HPA escala el Rollout bajo carga sostenida (capacity test on-demand) |
+| **AnalysisTemplate** | `<app>-app-health` en api01-dev y api02-dev — queries success-rate + latency-p95 sobre Prometheus |
+| **EFK** | logs JSON de las apps ingestados a `k8s-YYYY.MM.DD`, parseados a campos top-level |
 | **Kibana** | 5 saved searches + dashboard `belo-cluster-overview` |
-| **Grafana** | 4 dashboards (api01, api02, dev-cluster, pipeline — todos con datos reales) |
-| **Tekton metrics** | Scrapeado por Prometheus (`tekton_pipelines_controller_*`) |
-| **Argo Rollouts metrics** | Scrapeado (`rollout_info`, `rollout_phase`, `analysis_run_*`) |
+| **Grafana** | 4 dashboards (api01, api02, dev-cluster, pipeline) |
+| **Tekton metrics** | scrapeadas por Prometheus (`tekton_pipelines_controller_*`) |
+| **Argo Rollouts metrics** | scrapeadas (`rollout_info`, `rollout_phase`, `analysis_run_*`) |
 
 > **Dos modelos de promoción** (ver [docs/deployment-strategies.md](docs/deployment-strategies.md#dos-modelos-de-promoción-legacy-y-enterprise)):
 > - **Legacy** (`analysis.enabled: false`): el pipeline decide promote/abort vía `kubectl patch` según el outcome del k6.
@@ -27,7 +26,7 @@ Comandos paso a paso, validados end-to-end.
 ## 0. Verificación previa (1 min)
 
 ```bash
-cd C:/Users/tadeo/OneDrive/Escritorio/bellochallenge-k3d/belo-infrabase-k3d
+cd /ruta/a/belo-infrabase-k3d
 make pipeline-check
 ```
 
@@ -67,7 +66,7 @@ api01-dev usa el **modelo enterprise** (`analysis.enabled: true`): Argo Rollouts
 ### Disparar release
 
 ```bash
-cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api01
+cd /ruta/a/webserver-api01
 git tag release/v0.12.0/dev/loadtest=true
 git push origin release/v0.12.0/dev/loadtest=true
 ```
@@ -110,7 +109,7 @@ Después del switch automático (cuando prePromotionAnalysis pasa), ambos URLs d
 api02-dev usa el **modelo enterprise** con canary multi-step: Argo Rollouts corre un `AnalysisRun` en cada `setWeight` y solo avanza si pasa.
 
 ```bash
-cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api02
+cd /ruta/a/webserver-api02
 git tag release/v1.5.0/dev/loadtest=true
 git push origin release/v1.5.0/dev/loadtest=true
 ```
@@ -145,7 +144,7 @@ curl "http://api02.localhost:8888/api02/echo?msg=demo"
 Pipeline **separado** del release. Demuestra que el HPA escala bajo carga.
 
 ```bash
-cd C:/Users/tadeo/OneDrive/Escritorio/belochallenge/webserver-api01
+cd /ruta/a/webserver-api01
 # Si ya pusheaste burn/dev antes, borrarlo primero:
 git tag -d burn/dev 2>/dev/null && git push --delete origin burn/dev 2>/dev/null
 git tag burn/dev
@@ -293,8 +292,7 @@ kubectl exec -n logging $KIBANA_POD -- curl -s -X POST "http://localhost:5601/ap
   -H "kbn-xsrf: true" -H "Content-Type: application/json" \
   -d '{"data_view":{"id":"'$DATA_VIEW_ID'","title":"k8s-*","name":"k8s logs","timeFieldName":"@timestamp"}}'
 
-# Re-aplicar saved searches: ver los comandos al final de esta sesion en el git log
-# o copiar de docs/logging-efk.md
+# Re-aplicar saved searches: ver docs/logging-efk.md
 ```
 
 ### Verificar end-to-end metrics flow
@@ -338,12 +336,11 @@ make refresh
 
 ---
 
-## Lo que evitar mostrar
+## Notas para la demo
 
-- **Re-pushear el mismo release tag**: falla con AlreadyExists (intencional — disciplina semver)
-- **Pipeline en producción**: tiene gate manual, no autoprueba
-- **Pipelines viejos con `generateName`**: si hay runs anteriores con nombres random, limpialos antes (`kubectl delete pipelinerun --all -n tekton-pipelines`)
-- **Burn justo después de otro burn**: HPA cooldown de 5min — esperá o el `max-replicas` puede no superar el baseline
+- **Re-pushear el mismo release tag** falla con `AlreadyExists` (intencional — disciplina semver). Para re-correr, usá un semver nuevo o borrá el PipelineRun anterior.
+- **El pipeline en producción** tiene gate manual: no auto-promueve, requiere sync manual desde ArgoCD.
+- **Burn justo después de otro burn**: el HPA tiene cooldown de ~5min — esperá o el `max-replicas` puede no superar el baseline.
 
 ## Flujo total para la demo (~25 min)
 
